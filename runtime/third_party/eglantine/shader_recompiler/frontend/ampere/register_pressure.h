@@ -52,6 +52,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         break;
     case 0x807:
     case 0x808:
+    case 0x809:   // FMNMX with an immediate B: dest and A only
     case 0x923:
     case 0x820:
     case 0xa20:
@@ -109,6 +110,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         operand(64);
         break;
     case 0x81a:
+    case 0x803:   // P2R PR: dest and the register merged into
         operand(16);
         operand(24);
         break;
@@ -224,6 +226,12 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     case 0x987: {
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
         operand(opcode == 0x983 ? 16 : 32, count);
+        operand(24);
+        break;
+    }
+    case 0xb82: {   // LDC indexed byte offset: dest by width, index register at 24
+        const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
+        operand(16, count);
         operand(24);
         break;
     }

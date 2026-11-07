@@ -621,6 +621,9 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             if (four && (want == VK_FORMAT_R32_SFLOAT || want == VK_FORMAT_R8G8B8A8_UNORM)) view_format = want;
         }
     }
+    int reformat = 0;   // a sampled RGB9E5 view of an R11G11B10F image (vk_texture.c slot_resolve)
+    if (!storage && hv && v->set_format && v->format == 0x40 && img->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+        view_format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, reformat = 1;
     ViewKey k = {img->image, view_format, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
@@ -631,7 +634,8 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                       .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (img->block_views) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views' (vk_texture.c)
+    if (img->block_views || reformat) ci.pNext = &use;   // block views: the image's COLOR_ATTACHMENT usage is theirs
+                                                           // (vk_texture.c); RGB9E5 has no storage or attachment feature
     else if (!storage && vk_srgb_store_format(view_format) != view_format && (img->usage & VK_IMAGE_USAGE_STORAGE_BIT))
         use.usage = img->usage & ~VK_IMAGE_USAGE_STORAGE_BIT, ci.pNext = &use;   // sRGB views have no storage feature
     VkImageView view;
@@ -3695,10 +3699,25 @@ static int big_compute_blit(VkExec *ex, const GfxShader *cs) {
                                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         // ponytail: an image of an earlier size is left allocated; the scene size rarely changes
-        if (vmaCreateImage(vk_ctx()->vma, &ci, &ai, &e5, &e5_mem, NULL) != VK_SUCCESS) rt_fatal("vk: RGB9E5 image");
+        // Without the image the dispatch is skipped for this frame, not the game: on an RX Vega 11 (integrated, 1.8 GiB)
+        // with the system's commit nearly used up the create failed and rt_fatal closed the game. Tried again next frame.
+        VkResult er = vmaCreateImage(vk_ctx()->vma, &ci, &ai, &e5, &e5_mem, NULL);
+        if (er != VK_SUCCESS) {
+            static volatile int32_t told;
+            if (plat_inc32(&told) <= 4)
+                rt_log("vk: RGB9E5 image %ux%u not created (%d): the upscale pass is skipped this frame", src->width,
+                       src->height, (int)er);
+            e5 = VK_NULL_HANDLE, e5_mem = NULL, e5_w = e5_h = 0;
+            return 1;
+        }
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = e5, .viewType = VK_IMAGE_VIEW_TYPE_2D,
                                     .format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-        if (vkCreateImageView(vk_ctx()->device, &vi, NULL, &e5_view) != VK_SUCCESS) rt_fatal("vk: RGB9E5 view");
+        if (vkCreateImageView(vk_ctx()->device, &vi, NULL, &e5_view) != VK_SUCCESS) {
+            rt_log("vk: RGB9E5 view not created: the upscale pass is skipped this frame");
+            vmaDestroyImage(vk_ctx()->vma, e5, e5_mem);
+            e5 = VK_NULL_HANDLE, e5_mem = NULL, e5_w = e5_h = 0;
+            return 1;
+        }
         e5_w = src->width, e5_h = src->height, fresh = 1;
     }
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,

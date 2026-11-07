@@ -2131,6 +2131,41 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+// pipeline-crash.txt next to pipeline-keys.bin: the crash note of each graphics pipeline the driver crashed in
+// (platform last-chance filter), a line per crash. An RX 6750 XT crashed in amdvlk64.dll building a mesh pipeline
+// early in play. Crashed once: built without optimization. Twice: not built, its draws are skipped. Deleting the file
+// tries them all again.
+static char *crashed;   // the file's text; written once at init (keys_open), read by the build threads
+static void crashed_open(const char *keys_path) {
+    static char path[1024];
+    snprintf(path, sizeof path, "%s", keys_path);
+    char *slash = strrchr(path, '\\'), *fslash = strrchr(path, '/');
+    if (fslash > slash) slash = fslash;
+    snprintf(slash ? slash + 1 : path, sizeof path - (size_t)(slash ? slash + 1 - path : 0), "pipeline-crash.txt");
+    plat_crash_file(path);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char *t = calloc(1, 1 << 16);
+    size_t n = t ? fread(t, 1, (1 << 16) - 1, f) : 0;
+    fclose(f);
+    if (!n) {
+        free(t);
+        return;
+    }
+    crashed = t;
+    int lines = 0;
+    for (size_t i = 0; i < n; i++) lines += t[i] == '\n';
+    rt_log("vk_pipeline: %s: %d crash%s in the driver; those pipelines are built without optimization, or skipped after "
+           "a second crash", path, lines, lines == 1 ? "" : "es");
+}
+static int crash_count(const char *note) {
+    int n = 0;
+    size_t len = strlen(note);
+    for (const char *at = crashed; at && (at = strstr(at, note)); at += len)
+        n += (at == crashed || at[-1] == '\n') && (at[len] == '\n' || at[len] == '\r');
+    return n;
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off,
                                   VkPipelineCache cache) {
     if (gfx_shader_is_task(s->vs) || (s->ts && !mesh_vs(s))) {   // a task shader needs its mesh stage (PR #29, qiyuey)
@@ -2327,6 +2362,16 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             if (c) at += snprintf(note + at, sizeof note - at, " %s %llu words %016llx", (const char *[]){"ts", "vs", "gs", "fs"}[i],
                                   (unsigned long long)w, (unsigned long long)h);
         }
+    }
+    int crashes = crash_count(note);
+    if (crashes >= 2) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 8) rt_log("vk_pipeline: not built, the driver crashed in it twice: %s", note);
+        goto out;
+    }
+    if (crashes) {
+        pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        rt_log("vk_pipeline: built without optimization, the driver crashed in it before: %s", note);
     }
     plat_crash_note(note);
     int shared = cache && cache == P.cache;
@@ -2869,6 +2914,7 @@ static void keys_flush(void) {
     plat_mutex_unlock(&K.io);
 }
 
+static void crashed_open(const char *keys_path);
 // Reads the key file into K.file and its record hashes into the set. Caller holds P.lock (ensure_init).
 static void keys_open(void) {
     if (!A.on || !P.cache_path[0]) return;
@@ -2877,6 +2923,7 @@ static void keys_open(void) {
     if (fslash > slash) slash = fslash;
     snprintf(slash ? slash + 1 : K.path, sizeof K.path - (size_t)(slash ? slash + 1 - K.path : 0), "pipeline-keys.bin");
     gfx_shader_record_at(K.path);   // shader-answers.bin next to it (gfx_shader.c)
+    crashed_open(K.path);
     FILE *f = fopen(K.path, "rb");
     if (!f) return;
     KeysHeader h;
@@ -4164,7 +4211,10 @@ void vk_pipeline_save(void) {
     size_t size = 0;
     void *data = NULL;
     cache_retry_deferred();
-    plat_mutex_lock_shared(&cache_access);
+    // Exclusive: Intel's driver (Arc 140V, 101.8991) reads a null pointer in vkGetPipelineCacheData (igvk64.dll+0x653291,
+    // the "pipe autosave" thread) while another thread builds a pipeline into the same cache. trylock, so a waiting
+    // save never holds back the replay's builds behind a compile of seconds.
+    while (!plat_mutex_trylock(&cache_access)) plat_sleep_ms(2);
     plat_mutex_lock(&deferred_access);
     VkPipelineCache snapshot = P.cache;
     // A driver compile may still be using the shared cache. Persist the
@@ -4176,7 +4226,7 @@ void vk_pipeline_save(void) {
     int got = vkGetPipelineCacheData(P.device, snapshot, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
               vkGetPipelineCacheData(P.device, snapshot, &size, data) == VK_SUCCESS;
     plat_mutex_unlock(&deferred_access);
-    plat_mutex_unlock_shared(&cache_access);
+    plat_mutex_unlock(&cache_access);
     if (got) {
         if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
     }

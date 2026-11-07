@@ -234,7 +234,8 @@ function Exec([string]$exe, [string[]]$argumentos, [switch]$PodeFalhar, [string]
     $destino = if ($Saida) { "> `"$Saida`"" } else { ">> `"$LOG`"" }
     Registrar "> $exe $q"
     $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = "$env:ComSpec"
+    # ComSpec can be missing from the environment (issue #102: "nao foi fornecido um nome de arquivo")
+    $psi.FileName = if ($env:ComSpec -and (Test-Path -LiteralPath $env:ComSpec)) { $env:ComSpec } else { Join-Path $env:SystemRoot 'System32\cmd.exe' }
     $psi.Arguments = "/d /s /c `"`"$exe`" $q $destino 2>&1`""
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     if (Test-Path $script:pasta) { $psi.WorkingDirectory = $script:pasta }
@@ -263,10 +264,24 @@ function AtualizarPath() {
 }
 # ---- os passos: nome, minutos estimados e o que fazem
 function P-Copiar() {
+    # Ninja compares dates: every ZIP gives runtime\cpu.h a new one, and an update recompiled all 660 objects of the game
+    # (about an hour on a slow PC) with no header changed. A runtime file the update leaves byte-identical gets its old
+    # date back; a changed one gets now, since the ZIP's date can be older than the last build.
+    $rt = Join-Path $script:pasta 'runtime'
+    $antes = @{}
+    if (Test-Path -LiteralPath $rt) {
+        Get-ChildItem -LiteralPath $rt -Recurse -File | ForEach-Object { $antes[$_.FullName] = @((Get-FileHash -LiteralPath $_.FullName -Algorithm MD5).Hash, $_.LastWriteTimeUtc) }
+    }
     # robocopy: fewer than 8 is success. /MIR on the project would delete the game's build output, so it only adds and replaces.
     foreach ($par in @(@('projeto', $script:pasta), @('ferramentas', (Join-Path $script:pasta 'ferramentas')))) {
         $cod = Exec 'robocopy.exe' @((Join-Path $SETUP $par[0]), $par[1], '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:2', '/W:2') -PodeFalhar
         if ($cod -ge 8) { throw (L "Não consegui copiar os arquivos para $($script:pasta)." "Could not copy the files to $($script:pasta).") }
+    }
+    $agora = [DateTime]::UtcNow
+    foreach ($k in $antes.Keys) {
+        if (-not (Test-Path -LiteralPath $k)) { continue }
+        $f = Get-Item -LiteralPath $k
+        $f.LastWriteTimeUtc = if ((Get-FileHash -LiteralPath $k -Algorithm MD5).Hash -eq $antes[$k][0]) { $antes[$k][1] } else { $agora }
     }
     AtualizarPath
     $script:py = Ferramenta 'python\python.exe'

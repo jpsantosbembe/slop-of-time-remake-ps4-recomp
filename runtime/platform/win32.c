@@ -617,6 +617,8 @@ static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wc
 // it is never to be shared publicly.
 static _Thread_local const char *crash_note;
 void plat_crash_note(const char *note) { crash_note = note; }
+static char crash_path[1024];
+void plat_crash_file(const char *path) { snprintf(crash_path, sizeof crash_path, "%s", path); }
 
 static LONG WINAPI last_chance(EXCEPTION_POINTERS *ep) {
     uintptr_t rip = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
@@ -637,6 +639,8 @@ static LONG WINAPI last_chance(EXCEPTION_POINTERS *ep) {
     }
     fprintf(stderr, ", working on: %s", crash_note ? crash_note : "(nothing noted)");
     fputc('\n', stderr);
+    FILE *cf = crash_note && crash_path[0] ? fopen(crash_path, "a") : NULL;   // the next start avoids this work (vk_pipeline.c)
+    if (cf) fprintf(cf, "%s\n", crash_note), fclose(cf);
     // A driver that runs out of memory may crash on a null pointer instead of failing: the commit numbers tell
     MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
     PROCESS_MEMORY_COUNTERS_EX pc = {.cb = sizeof pc};

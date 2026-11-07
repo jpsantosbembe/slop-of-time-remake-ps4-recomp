@@ -986,6 +986,7 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 // The note is for the Windows last-chance filter (win32.c), which names a crash inside a driver; here a driver crash
 // reaches the signal handler above without it.
 void plat_crash_note(const char *note) { (void)note; }
+void plat_crash_file(const char *path) { (void)path; }
 
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
