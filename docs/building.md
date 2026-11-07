@@ -140,6 +140,19 @@ files (`*_win.c`); `runtime/platform/linux.c` implements `platform.h`. Status: t
 plays at 60 fps on RADV (RX 7800 XT) and NVIDIA (RTX 3060); 1.4.3 builds, probes and plays on RADV (RX 6600, and the
 Vega 7 of a Ryzen 5 4600G at about 34 fps). Long play sessions and the Steam Deck itself are not verified yet.
 
+Ocarina 1.1.1 uses the same runtime: the library and the executable link, `--selftest` and the graphics probes
+(`--probe-gfx-abi`, `--probe-astc`, `--probe-vkmem`, `--probe-window`) pass on NVIDIA (RTX 4050 Laptop, Vulkan 1.4),
+and the shader translator builds for `linux-x64` (tested 2026-11-06). In-game play still has to be confirmed with a
+real copy of the game.
+
+`compilar.sh` runs the Ocarina steps of this guide (extract, lift, pack, build), with `--simular` to show the
+commands and `--sem-perguntar` to skip the questions:
+
+```sh
+./compilar.sh --jogo /path/your-game.nup        # or a folder with exefs and romfs
+./jogar/jogar-ocarina.sh
+```
+
 Requirements:
 
 - Linux 6.7 or later: the write watch uses userfaultfd write protection with `PAGEMAP_SCAN`. SteamOS 3.8 qualifies.
@@ -147,9 +160,13 @@ Requirements:
 - Packages on Arch:
 
   ```sh
-  pacman -S --needed clang lld ninja make sdl3 opus libvpx zstd vulkan-headers vulkan-icd-loader \
+  pacman -S --needed clang lld ninja make pkgconf sdl3 opus dav1d libvpx zstd vulkan-headers vulkan-icd-loader \
       vulkan-validation-layers shaderc spirv-tools dotnet-sdk uv git
   ```
+
+  On Debian and Ubuntu the development packages are named `libsdl3-dev`, `libopus-dev`, `libdav1d-dev`, `libvpx-dev`,
+  `libzstd-dev`, `libvulkan-dev` and `dotnet-sdk-10.0`. `ov_codec.c` decodes AV1 with dav1d, so the link needs
+  `-ldav1d`; without it, `build_game.py` stops at `undefined symbol: dav1d_get_picture`.
 
   Vulkan Memory Allocator is a single header (AUR `vulkan-memory-allocator`). Without it, `build_game.py` fetches the
   version the Windows release pins (3.4.0) into `toolchain/vma/` on first use and checks its hash.

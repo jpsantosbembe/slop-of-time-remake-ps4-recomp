@@ -71,7 +71,7 @@ To open the game, use `jogar\jogar-ocarina.ps1`.
 | `runtime/third_party/eglantine/.../ampere/` | Ampere to Maxwell shader lowering |
 | `tools/xlate/patches/` | Shader translator patches. The expected count is in `tools/build_xlate.py` |
 | `tools/oot/` | Parts specific to Ocarina |
-| `instalador/` | The windowed installer and the executable's code (`build_exe.sh`) |
+| `instalador/`, `tools/oot/make_setup.py` | The windowed installer and the script that builds the ZIP |
 | `jogar/` | The launcher and the initial settings |
 | `verificar.ps1`, `compilar.ps1` | The build scripts. When you change a command, change the installer and the guides in `docs/` too |
 

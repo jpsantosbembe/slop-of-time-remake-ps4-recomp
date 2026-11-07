@@ -115,7 +115,8 @@ else:
     # $ORIGIN: a libSDL3.so.0 next to totk comes before the system's (the release's portable folder).
     LINK_FLAGS = ['-fuse-ld=lld', '-no-pie', '-Wl,-z,noexecstack', "'-Wl,-rpath,$$ORIGIN'",
                   '"-Wl,-Map=$builddir/totk.map"']
-    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-l:libstdc++.a', '-lm', '-lpthread', '-ldl']
+    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-ldav1d', '-lvpx', '-lzstd', '-l:libstdc++.a', '-lm', '-lpthread',
+                 '-ldl']   # dav1d: the AV1 decoder ov_codec.c uses (Windows links it statically)
     VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h; Arch (AUR) vulkan-memory-allocator, Debian libvulkan-memory-allocator-dev
 # Without a system vk_mem_alloc.h, the header the Windows release pins (tools/make_release.py, VMA 3.4.0) is fetched once
 # into toolchain/vma: one MIT header (THIRD_PARTY_NOTICES.md), checked against its hash.
@@ -146,7 +147,7 @@ def vma_include():
 
 # --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
 LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-limm32', '-lwinmm', '-lvulkan-1', '-lSDL3', '-lopus',
-                  '-l:libvpx.a', '-l:libzstd.a', '-l:libc++.a', '-l:libc++abi.a', '-l:libunwind.a', '-l:libwinpthread.a']
+                  '-l:libdav1d.a', '-l:libvpx.a', '-l:libzstd.a', '-l:libc++.a', '-l:libc++abi.a', '-l:libunwind.a', '-l:libwinpthread.a']
 DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 # Runtime sources compiled per install, not in the library: romfs.c includes romfs_config.h, patches.c and ov_zstd.c
 # the patches.h of the player's game version (its patch page is the page after that version's main; ov_zstd.c's host
@@ -159,7 +160,7 @@ TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 ORBIS = None           # --target orbis: os caminhos do bundle e das dependências (orbis_setup)
 DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
-DISPLAY_VERSIONS = {'v0': '1.0.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3'}
+DISPLAY_VERSIONS = {'v0': '1.0.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3'}   # TotK's; not oot111, whose 1.1.1 is another game
 
 GiB = 1 << 30
 # Peak commit of one compile, 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
@@ -843,6 +844,8 @@ def main():
     ap.add_argument('--modules', help='comma-separated subset of the layout modules (default all)')
     ap.add_argument('--jobs', type=int, help='parallel compiles (default: by memory budget and CPU count)')
     ap.add_argument('--compile-only', action='store_true', help='compile, do not link')
+    ap.add_argument('--pdb', action='store_true', help='Windows: CodeView line tables in every object and <out>/ocarina.pdb, for '
+                    'Windows profilers and debuggers (Visual Studio, Superluminal, VTune). The generated code compiles again')
     ap.add_argument('--runtime', type=Path, help='runtime source directory (default runtime)')
     ap.add_argument('--full-build', action='store_true',
                     help="compile the generated C even where build/<version>'s objects could be reused")
@@ -893,9 +896,14 @@ def main():
                                                            else f'profile-{args.version}')).resolve()}
     expected = args.expected
     if not expected:
-        if args.version not in DISPLAY_VERSIONS:
+        # expected-<version>.json first: two games can share a display version (Ocarina and TotK are both 1.1.1).
+        own = ROOT / 'tools' / 'data' / f'expected-{args.version}.json'
+        if own.is_file():
+            expected = own
+        elif args.version not in DISPLAY_VERSIONS:
             sys.exit(f'no expected hashes known for {args.version}; pass --expected')
-        expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
+        else:
+            expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
     hashes = json.loads(Path(expected).read_text())['exefs_sha256']
     global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
     if args.ninja:
@@ -923,12 +931,17 @@ def main():
         GEN_FLAGS[:0] = sysroot
         RT_FLAGS[:0] = sysroot
         LINK_FLAGS[:0] = sysroot
+    if args.pdb and WIN:
+        # Line tables keep the objects small; the functions are named after their guest addresses in the PDB
+        RT_FLAGS.append('-gcodeview')
+        GEN_FLAGS[:0] = ['-gcodeview', '-gline-tables-only']
+        LINK_FLAGS.extend(['-Xlinker', '"--pdb=$builddir/ocarina.pdb"'])
     for tool in (CLANG, NINJA):
         if not tool.is_file():
             sys.exit(f'{tool} not found: install ' + ('MSYS2 UCRT64 clang, lld and ninja' if WIN else 'clang, lld and ninja')
                      + ' (docs/building.md)')
     if not (gen / 'layout.json').is_file():
-        sys.exit(f'{gen / "layout.json"} not found: run the generator first')
+        sys.exit(f'{gen / "layout.json"} not found: run the generator first (its layout.h is compiled into the runtime)')
 
     layout = read_layout(gen)
     names = [n for n, _, _ in layout]
@@ -937,7 +950,7 @@ def main():
     if unknown:
         sys.exit(f'unknown modules {unknown}; the layout has {names}')
     linked = [m for m in names if m in wanted]
-    mods = {m: chunk_files(gen, m) for m in linked}
+    mods = {} if args.make_runtime_lib else {m: chunk_files(gen, m) for m in linked}
 
     cpus = os.cpu_count() or 1
     budget = min(MEM_BUDGET, int(total_ram() * 0.8))
@@ -945,7 +958,8 @@ def main():
     missing = [n for n in names if n not in hashes]
     if missing:
         sys.exit(f'{expected}: no exefs_sha256 for {missing}')
-    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths, args.version))
+    if not args.make_runtime_lib:
+        write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths, args.version))
     if (paths['romfs'] / 'index.json').is_file():
         count, size, dt = romfs_index.write(paths['romfs'], out)
         print(f'romfs index: {count} files, {mib(size)}, {dt:.1f} s')

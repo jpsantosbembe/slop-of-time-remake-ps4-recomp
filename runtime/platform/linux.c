@@ -112,6 +112,9 @@ PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name) {
     return plat_thread_new_ex(fn, arg, name, 0);
 }
 
+// force_align_arg_pointer: the caller can be generated code whose stack is 8 bytes off 16; glibc's create_thread then
+// faults on a movaps (SIGSEGV at address 0 on the 98th guest thread). Realign the stack in this function.
+__attribute__((force_align_arg_pointer))
 PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
     PlatThread *t = calloc(1, sizeof *t);
     if (!t) return NULL;
@@ -332,6 +335,23 @@ PlatFiber *plat_fiber_self(void) {
 
 void plat_fiber_unself(void) { fiber_cur = NULL; }
 
+// The top of the stack the caller runs on: its fiber's mapped stack, else the thread's own (glibc's bounds, read once).
+char *plat_stack_top(void) {
+    PlatFiber *f = fiber_cur;
+    if (f && f->stack) return (char *)f->stack + f->size;
+    static __thread char *top;
+    if (!top) {
+        pthread_attr_t a;
+        void *addr = NULL;
+        size_t size = 0;
+        if (pthread_getattr_np(pthread_self(), &a)) return NULL;
+        pthread_attr_getstack(&a, &addr, &size);
+        pthread_attr_destroy(&a);
+        top = (char *)addr + size;
+    }
+    return top;
+}
+
 PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     PlatFiber *f = calloc(1, sizeof *f);
     if (!f) return NULL;
@@ -344,7 +364,8 @@ PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     mprotect(m, 4096, PROT_NONE);
     f->stack = m, f->size = stack;
     uint64_t *top = (uint64_t *)(((uintptr_t)m + stack) & ~(uintptr_t)15);
-    uint64_t *sp = top - 10;   // fpu state (2 words), r15, r14, r13, r12, rbx, rbp, return address, padding
+    // plat_fiber_entry starts at top - 16, so rsp is 16-aligned at its call, as the System V ABI wants.
+    uint64_t *sp = top - 11;   // fpu state (2 words), r15, r14, r13, r12, rbx, rbp, return address, padding (2)
     sp[0] = 0x037f;            // x87 control word: the default
     sp[1] = 0x1f80;            // MXCSR: the default
     sp[2] = sp[3] = 0;         // r15, r14
@@ -961,6 +982,10 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
     fault_install();
 }
+
+// The note is for the Windows last-chance filter (win32.c), which names a crash inside a driver; here a driver crash
+// reaches the signal handler above without it.
+void plat_crash_note(const char *note) { (void)note; }
 
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;

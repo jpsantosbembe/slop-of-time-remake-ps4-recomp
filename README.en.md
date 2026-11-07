@@ -15,6 +15,7 @@ Experimental. It has only been tested on **one PC** (Ryzen 9 9950X3D, RTX 5090),
 
 | What | Status |
 |---|---|
+| Opening and new game, up to the Great Deku Tree | ✅ Works |
 | Kokiri village: trees, plants, houses, lighting | ✅ Works |
 | Sound, controller, saves and videos | ✅ Works |
 | Performance on an RTX 5090 | ✅ About 59 fps standing still, 51 to 55 fps walking |
@@ -27,14 +28,18 @@ Experimental. It has only been tested on **one PC** (Ryzen 9 9950X3D, RTX 5090),
 
 The game does not come ready-made: it is built on your PC from your copy. Choose one of these three ways.
 
-**1. With the installer, the easiest:**
+**1. With the ZIP installer, the easiest:** it installs nothing in Windows and asks for no administrator.
 
-1. Download **[Instalar-Ocarina.exe](https://github.com/sostenesfreitas/ocarina-recomp/releases/latest/download/Instalar-Ocarina.exe)** and double-click it.
-2. The executable has no digital signature, so Windows may warn you. Click **More info** and then **Run anyway**.
-3. In the window, choose your game's `.nup` (or a folder with `exefs` and `romfs`) and click **Install**.
-4. If Windows asks for permission to install the tools, click **Yes**.
+1. Download **`Ocarina-Setup-...-windows.zip`** from the [releases page](https://github.com/sostenesfreitas/ocarina-recomp/releases/latest).
+2. **Unpack the whole ZIP** to a folder and open the `Instalar-Ocarina.exe` inside it.
+3. The executable has no digital signature, so Windows may warn you. Click **More info** and then **Run anyway**.
+4. In the window, choose your game's `.nup` (or a folder with `exefs` and `romfs`) and click **Install**.
+5. At the end, click **Play**, or use the **Ocarina Recomp** shortcut on your desktop.
 
-Want to check first? The executable only opens the [installer script](instalador/Instalar-Ocarina.ps1), and [its code](instalador/launcher.c) is a few lines long. The release lists the file's SHA-256. Antivirus programs sometimes complain about unsigned programs.
+To uninstall, delete the install folder. Want to check first? The executable only opens the script `instalador\Instalar-Ocarina.ps1`, beside it in the ZIP and readable in any editor. [The executable's code](instalador/launcher.c) is a few lines long. Some antivirus programs complain about new unsigned programs and PowerShell scripts: a false alarm is possible, and all the code is here for anyone to check. The releases page lists the file's SHA-256.
+
+> [!NOTE]
+> The "Prepare the game files" step is slow, especially on a hard drive: while the clock in the window moves, it is working.
 
 **2. With the scripts, which you can read before running** (first install the tools from step 1 of the [guide](docs/build-by-hand.md)):
 
@@ -54,9 +59,33 @@ powershell -ExecutionPolicy Bypass -File .\compilar.ps1 -Jogo "C:\path\your-game
 
 **3. Fully by hand:** follow the **[step-by-step build guide](docs/build-by-hand.md)**.
 
+**On Linux:** `compilar.sh` runs the same steps and `jogar/jogar-ocarina.sh` opens the game. Packages and the port's
+status are in [docs/building.md](docs/building.md#linux-in-progress).
+
+```sh
+git clone https://github.com/sostenesfreitas/ocarina-recomp
+cd ocarina-recomp
+./compilar.sh --jogo /path/your-game.nup
+./jogar/jogar-ocarina.sh
+```
+
+### Bring a save from an emulator
+
+Saves from Lichii, Eden and similar emulators work here. At the end of the installation, click **Import emulator save**, or run later:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File jogar\importar-save.ps1
+```
+
+It finds the save by itself or asks for the folder, keeps a copy of your current save and does not change the emulator.
+
+### Language
+
+The game follows the language of Windows, including Brazilian Portuguese. To change it, press **F1** and go to **Game → Language**.
+
 ### What this does on your PC
 
-- The scripts do not ask for administrator. Installing the tools may: the installer does that for you, and in the other ways you run it yourself.
+- The ZIP installer and the scripts do not ask for administrator. Only the tools for ways 2 and 3 may, and you install those yourself.
 - It writes only inside the project folder, and never changes your game file.
 - It downloads the Python packages (`tools\requirements-build.txt`), the shader translator's .NET packages and, if the game's executable is compressed, [zbic](https://github.com/kinnay/zbic).
 - To uninstall, delete the project folder. The tools from step 1 are removed through Windows' apps panel.
@@ -71,7 +100,8 @@ It takes 30 minutes to 2 hours, and you can use your PC in the meantime. To upda
 - 64-bit Windows 10 or 11, with an AVX2-capable processor.
 - A graphics card with Vulkan 1.3 and mesh shaders, with an up-to-date driver. We recommend NVIDIA.
 - We recommend 16 GB of RAM or more. We never tested with less: the build or the game may fail.
-- 60 GB free, plus about 15 GB on C: if the tools are not installed yet.
+- With 16 GB of RAM, enlarge the Windows page file before playing (initial 16384 MB, maximum 32768 MB): the first time, the game may reach about 24 GB of memory, and Windows closes it past the limit. The installer warns when the limit is low.
+- 40 GB free with the ZIP installer. For the other two ways, 60 GB, plus about 15 GB on C: for the tools.
 - Internet access during installation.
 - **Your copy of the game at version 1.1.1.** Other versions do not work.
 
@@ -81,6 +111,7 @@ It takes 30 minutes to 2 hours, and you can use your PC in the meantime. To upda
 |---|---|
 | "This game is not version 1.1.1" | Check that you chose the right, updated game |
 | The game opens and closes | Update your graphics driver and look at `ultima-partida-erros.log` in the install folder |
+| The game closed mid-play | Each run's log is kept in `logs\` (the last 10). `jogar\medir-partida.ps1` shows the crash and the performance. |
 | Stutter the first time | This is normal: shaders are being prepared. It gets better when you pass through the same place again |
 
 If the problem continues, [open an issue](https://github.com/sostenesfreitas/ocarina-recomp/issues) with the error message and your graphics card model. Never send game files.

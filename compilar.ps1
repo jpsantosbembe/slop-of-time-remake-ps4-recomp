@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $PT = (Get-UICulture).TwoLetterISOLanguageName -eq 'pt'
-function L($pt, $en) { if ($PT) { return $pt } return $en }
+function L($textoPt, $textoEn) { if ($PT) { return $textoPt } return $textoEn }   # not $pt: names are case-insensitive, it would hide $PT
 
 $raiz = $PSScriptRoot
 Set-Location -LiteralPath $raiz
