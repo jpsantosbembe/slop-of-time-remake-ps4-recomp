@@ -310,6 +310,9 @@ __asm__(".text\n"
         ".p2align 4\n"
         "plat_fiber_entry:\n"
         "    movq %r13, %rdi\n"
+        /* entra por ret (rsp = 8 mod 16): realinha antes do call, senão fn começa desalinhada e o primeiro movaps
+           da glibc (malloc numa fibra do OoT) cai. ocarina-ps4 */
+        "    andq $-16, %rsp\n"
         "    callq *%r12\n"
         "    ud2\n"
         ".size plat_fiber_entry, .-plat_fiber_entry\n");
