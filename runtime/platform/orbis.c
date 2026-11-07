@@ -47,6 +47,7 @@ extern uint64_t sceKernelGetProcessTime(void);                    // us desde o 
 extern uint64_t sceKernelGetProcessTimeCounter(void);             // contador monotônico do processo
 extern uint64_t sceKernelGetProcessTimeCounterFrequency(void);
 extern int32_t sceKernelIsNeoMode(void);
+extern int64_t sceKernelPread(int32_t fd, void *buf, size_t n, int64_t off);
 extern void rt_log(const char *fmt, ...);   // dispatch.c: o totk.log
 // O pool interno da libkernel (~14 MiB; alimenta threads, mutexes, condvars e attrs: orbis-compat orbis_mem.h). Não
 // está em header nenhum; a chamada com um ponteiro zerado cobre as duas formas plausíveis (como o orbis_mem.cpp).
@@ -1734,6 +1735,18 @@ int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     ssize_t k;
     do k = pread(fd_of(f), buf, n, (off_t)off);
     while (k < 0 && errno == EINTR);
+    if (k <= 0 && n) {
+        // Diagnóstico (2026-11-07: "RomFS read failure" a 8,3 GB do início do romfs.bin, sem dizer o motivo) e uma
+        // segunda via pela chamada da Sony, que devolve o código de erro dela.
+        int err = k < 0 ? errno : 0;
+        int64_t k2 = sceKernelPread(fd_of(f), buf, n, (int64_t)off);
+        static int said;
+        if (said++ < 8)
+            rt_log("orbis: pread de %u bytes em %#llx (buffer %p) deu %lld, errno %d; sceKernelPread deu %lld (%#llx)", n,
+                   (unsigned long long)off, buf, (long long)k, err, (long long)k2, (unsigned long long)k2);
+        if (k2 > 0) return k2;
+        if (k < 0) errno = err;
+    }
     return k >= 0 ? k : errno == EFAULT ? -2 : -1;
 }
 
