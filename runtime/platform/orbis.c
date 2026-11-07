@@ -925,11 +925,45 @@ static int map_window(Resv *r, uint64_t a) {
 // marca as subpáginas; a janela de 2 MiB é mapeada no primeiro toque da CPU (lazy_fault, no tratador de SIGSEGV) ou
 // antes de o kernel ou a GPU escreverem nela (orbis_mem_prefault: pread e importação de pool). O console só gasta o que
 // o jogo usa. OCARINA_EAGER_COMMIT=1 volta ao commit imediato.
+// Monitor de memória (ocarina-ps4): a cada 2 s, se a memória direta mapeada mudou 64 MiB ou mais, uma linha no log
+// com o mapeado, o livre e o total da memória direta e a flexível livre. É o dado para a dieta de memória do OoT.
+extern void rt_log(const char *fmt, ...);
+extern int32_t sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t align, int64_t *out_start,
+                                                  size_t *out_size);
+extern int32_t sceKernelAvailableFlexibleMemorySize(size_t *size);
+static void mem_report(const char *why) {
+    int64_t st = 0;
+    size_t dfree = 0, ffree = 0;
+    // o maior trecho livre contíguo, não a soma: um limite inferior do livre
+    sceKernelAvailableDirectMemorySize(0, (int64_t)sceKernelGetDirectMemorySize(), 0x200000, &st, &dfree);
+    sceKernelAvailableFlexibleMemorySize(&ffree);
+    rt_log("orbis mem (%s): jogo mapeou %llu MiB; memória direta: maior trecho livre %llu MiB de %llu MiB; flexível "
+           "livre %llu MiB", why, (unsigned long long)(__atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) >> 20),
+           (unsigned long long)(dfree >> 20), (unsigned long long)(sceKernelGetDirectMemorySize() >> 20),
+           (unsigned long long)(ffree >> 20));
+}
+static void *mem_monitor(void *arg) {
+    (void)arg;
+    uint64_t last = 0;
+    for (;;) {
+        usleep(2000000);
+        uint64_t m = __atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED);
+        if (m > last + (64ull << 20) || m + (64ull << 20) < last) {
+            mem_report("mudou");
+            last = m;
+        }
+    }
+    return NULL;
+}
+
 static int lazy_commit(void) {
     static int on = -1;
     if (on < 0) {
         char v[8];
         on = !(plat_getenv("OCARINA_EAGER_COMMIT", v, sizeof v) && v[0] == '1');
+        mem_report(on ? "início, commit preguiçoso" : "início, commit imediato");
+        pthread_t t;
+        if (!pthread_create(&t, NULL, mem_monitor, NULL)) pthread_detach(t);
     }
     return on;
 }
@@ -1666,6 +1700,7 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
 
 // proc: memória direta mapeada nas reservas do runtime; limit: a memória direta do processo.
 void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
+    mem_report("fatal");
     *proc_mb = (double)__atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) / (1 << 20);
     *used_mb = -1;
     *limit_mb = (double)sceKernelGetDirectMemorySize() / (1 << 20);
