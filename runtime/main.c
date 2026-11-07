@@ -494,6 +494,9 @@ int orbis_boot_args(int *argc, char ***argv);   // platform/orbis.c: /data/ocari
 int probe_orbis(void);                          // probe_orbis.c: --probe-orbis, o runtime no console sem o jogo
 #endif
 
+#ifdef __ORBIS__
+#define main rt_main   // platform/orbis.c tem o main de verdade: o PS4 não pode retornar do main (SIGSYS)
+#endif
 int main(int argc, char **argv) {
 #ifdef __ORBIS__
     orbis_boot_args(&argc, &argv);   // antes de tudo: as variáveis do args.txt valem para o mem_init e o totk.ini

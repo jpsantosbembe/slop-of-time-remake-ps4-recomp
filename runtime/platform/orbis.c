@@ -1467,11 +1467,26 @@ int plat_stderr_path(char *out, size_t cap) {
 
 // ---- processo
 
-void plat_exit(int code) {
+// Um app do PS4 não sai sozinho: o _exit/exit do musl faz a chamada de sistema do Linux (exit_group), que o kernel do
+// PS4 não tem, e o processo morre com SIGSYS e o relatório de erro (medido em 2026-11-07, no fim do --probe-orbis; o
+// galaxy-recomp já tinha anotado "retornar do main = SIGSYS"). Então registra o código e fica ocioso até o usuário
+// fechar pelo botão PS, chamando sceGnmSubmitDone para a suspensão do fechamento não estourar (0xa0d0c00a).
+extern int32_t sceGnmSubmitDone(void);
+_Noreturn void orbis_idle_exit(int code) {
+    fprintf(stderr, "[host] orbis: fim (código %d); o app fica parado até ser fechado pelo botão PS\n", code);
     fflush(stdout);
     fflush(stderr);
-    _exit(code);
+    for (;;) {
+        sceGnmSubmitDone();
+        usleep(100000);
+    }
 }
+
+void plat_exit(int code) { orbis_idle_exit(code); }
+
+// O main do runtime (main.c, renomeado para rt_main no PS4) volta por vários caminhos; aqui ele nunca retorna.
+int rt_main(int argc, char **argv);
+int main(int argc, char **argv) { orbis_idle_exit(rt_main(argc, argv)); }
 
 int plat_setenv(const char *name, const char *value) {
     return (value ? setenv(name, value, 1) : unsetenv(name)) == 0;
