@@ -10,7 +10,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef __ORBIS__
+#include "input_pad_orbis.h"   // ocarina-ps4: a mesma API de gamepad, sobre o scePad (input_orbis.c)
+#else
 #include <SDL3/SDL.h>
+#endif
 
 #include "cfg.h"
 #include "host.h"
