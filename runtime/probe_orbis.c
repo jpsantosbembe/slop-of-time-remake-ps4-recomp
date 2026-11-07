@@ -6,13 +6,13 @@
 //   2. threads: N threads com a pilha padrão (memória direta, platform/orbis.c), cada uma tocando o fundo da pilha;
 //   3. fibra: ida e volta entre a thread e uma fibra nova, com a pilha alinhada (um movaps na fibra);
 //   4. tempo: plat_now_ns contra plat_sleep_ms, e a monotonicidade;
-//   5. arquivo em /data/ocarina: grava, lê e apaga;
+//   5. arquivo na pasta de dados (orbis_data_dir): grava, lê e apaga;
 //   6. Vulkan e a saída de vídeo: gfx_window_start (instância com VK_EXT_headless_surface, device, swapchain) e
 //      OCARINA_PROBE_FRAMES quadros (padrão 600, 10 s a 60 Hz) de uma cor por vez — vermelho, verde, azul, branco, um
 //      segundo cada — pelo vk_present_image do jogo; o primeiro quadro é lido de volta e conferido.
-// Cada etapa escreve uma linha em /data/ocarina/probe.txt (e no log); a última linha é "probe-orbis: OK" ou
+// Cada etapa escreve uma linha em <pasta de dados>/probe.txt (e no log); a última linha é "probe-orbis: OK" ou
 // "probe-orbis: FALHOU (<etapas>)". Uma falha numa etapa não impede as seguintes, exceto as do Vulkan entre si.
-// Para rodar: /data/ocarina/args.txt com a linha --probe-orbis.
+// Para rodar: <pasta de dados>/args.txt com a linha --probe-orbis.
 #ifdef __ORBIS__
 #include <stdarg.h>
 #include <stdio.h>
@@ -24,7 +24,7 @@
 #include "vk.h"
 #include "platform/platform.h"
 
-#define REPORT "/data/ocarina/probe.txt"
+const char *orbis_data_dir(void);   // platform/orbis.c: /data/slop/<title id>
 #define SRC_W 640
 #define SRC_H 360
 
@@ -203,7 +203,8 @@ static void step_time(void) {
 
 // ---- 5. arquivo
 static void step_file(void) {
-    const char *path = "/data/ocarina/probe-file.tmp";
+    char path[300];
+    snprintf(path, sizeof path, "%s/probe-file.tmp", orbis_data_dir());
     static uint8_t data[1 << 20];
     for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 131 + 7);
     int w = plat_file_write(path, data, sizeof data);
@@ -212,7 +213,8 @@ static void step_file(void) {
     int same = back && size == sizeof data && !memcmp(back, data, sizeof data);
     free(back);
     plat_file_delete(path);
-    check(w && same && !plat_file_exists(path), "arquivo", "1 MiB gravado, lido igual e apagado em /data/ocarina");
+    check(w && same && !plat_file_exists(path), "arquivo", "1 MiB gravado, lido igual e apagado em %s",
+          orbis_data_dir());
 }
 
 // ---- 6. Vulkan e a saída de vídeo
@@ -329,8 +331,10 @@ static void step_vulkan(void) {
 }
 
 int probe_orbis(void) {
-    plat_file_mkdir_p("/data/ocarina");
-    rep = fopen(REPORT, "w");
+    char report[300];
+    snprintf(report, sizeof report, "%s/probe.txt", orbis_data_dir());
+    plat_file_mkdir_p(orbis_data_dir());
+    rep = fopen(report, "w");
     say("probe-orbis: o runtime no PS4 sem o jogo (%s)", rt_port_version);
     step_memory();
     step_threads();

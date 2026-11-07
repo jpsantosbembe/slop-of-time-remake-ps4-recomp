@@ -519,7 +519,7 @@ static void game_defaults(void) {
 }
 
 #ifdef __ORBIS__
-int orbis_boot_args(int *argc, char ***argv);   // platform/orbis.c: /data/ocarina/args.txt
+int orbis_boot_args(int *argc, char ***argv);   // platform/orbis.c: <pasta de dados>/args.txt
 int probe_orbis(void);                          // probe_orbis.c: --probe-orbis, o runtime no console sem o jogo
 #endif
 
@@ -575,7 +575,7 @@ int main(int argc, char **argv) {
     if (cfg.shot && !cfg.seconds) return usage(argv[0]);
     if (cfg.seconds && mode) return usage(argv[0]);
 #ifdef __ORBIS__
-    log_open(1);   // PS4: sem terminal, o log de todo modo vai para /data/ocarina/logs/totk.log
+    log_open(1);   // PS4: sem terminal, o log de todo modo vai para <pasta de dados>/logs/totk.log (orbis.c)
 #else
     log_open(!mode);
 #endif

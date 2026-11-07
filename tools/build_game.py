@@ -308,10 +308,13 @@ def module_glue(layout, linked, hashes, paths, version):
     out += ['const RtFileHash rt_exefs_sha256[] = {']
     out += [f'    {{{c_string(f)}, {c_string(h)}}},' for f, h in sorted(hashes.items())]
     out += ['};', f'const int rt_exefs_sha256_count = {len(hashes)};', '']
+    data = orbis_data_dir(paths['exefs']) if ORBIS else None
     for name in ('exefs', 'romfs', 'profile'):
         # PS4: o caminho no console, não o da máquina do build (que só serve para montar o romfs-index.bin)
-        where = f'{ORBIS_DATA}/{name}' if ORBIS else paths[name].as_posix()
+        where = f'{data}/{name}' if ORBIS else paths[name].as_posix()
         out.append(f'const char rt_default_{name}[] = {c_string(where)};')
+    if ORBIS:   # a pasta de dados quando o carregador não a passa no argv[0] (runtime/platform/orbis.c)
+        out.append(f'const char rt_orbis_data_dir[] = {c_string(data)};')
     number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
     out += [f'const int rt_game_version = {number};', f'const char rt_port_version[] = {c_string(port_version())};', '']
     return '\n'.join(out)
@@ -735,7 +738,20 @@ def mib(n):
 
 
 # ---- PS4 (--target orbis)
-ORBIS_DATA = '/data/ocarina'   # a pasta gravável do app no console (runtime/platform/orbis.c ORBIS_DATA_DIR)
+ORBIS_DATA_ROOT = '/data/slop'   # a pasta gravável do port no console: <raiz>/<title id do Switch> (orbis_data_dir)
+
+
+def orbis_data_dir(exefs):
+    """A pasta de dados do jogo no console, /data/slop/<title id>, com o title ID (16 dígitos hexadecimais minúsculos)
+    tirado do Program ID do main.npdm (ACI0 + 0x10): nada do jogo fixo no código. É a mesma convenção do
+    ~/ocarina-ps4/game_info.py (campo ps4_data_dir), que o carregador de dev recebe na compilação."""
+    npdm = (Path(exefs) / 'main.npdm').read_bytes()
+    if npdm[:4] != b'META':
+        sys.exit(f'build_game: {exefs}/main.npdm não é um NPDM')
+    aci0 = int.from_bytes(npdm[0x70:0x74], 'little')
+    if npdm[aci0:aci0 + 4] != b'ACI0':
+        sys.exit(f'build_game: {exefs}/main.npdm sem ACI0')
+    return f"{ORBIS_DATA_ROOT}/{int.from_bytes(npdm[aci0 + 0x10:aci0 + 0x18], 'little'):016x}"
 ORBIS_HOME = Path.home() / 'ocarina-ps4'
 # As bibliotecas de sistema do PS4 que o runtime e o RADV chamam (stubs .so do SDK).
 ORBIS_SCE_LIBS = ['-lSceGnmDriver', '-lSceVideoOut', '-lScePad', '-lSceAudioOut', '-lSceUserService', '-lSceNet',
