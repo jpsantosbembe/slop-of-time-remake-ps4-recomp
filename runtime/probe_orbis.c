@@ -132,23 +132,29 @@ static void mass_fn(void *arg) {
 }
 
 extern unsigned long long orbis_internal_free(void);
+extern int32_t sceKernelAvailableFlexibleMemorySize(size_t *size);
 static void step_threads_mass(void) {
     static PlatThread *t[NMASS];
     int made = 0;
     unsigned long long pool0 = orbis_internal_free();
+    size_t flex0 = 0, flex1 = 0;
+    sceKernelAvailableFlexibleMemorySize(&flex0);
     uint64_t t0 = plat_now_ns();
     for (int i = 0; i < NMASS; i++) {
-        if (!(t[made] = plat_thread_new_ex(mass_fn, NULL, "massa", 256 << 10))) break;
+        if (!(t[made] = plat_thread_new_ex(mass_fn, NULL, "massa", 8u << 20))) break;   // acima do piso de 2 MiB
         made++;
     }
     for (int i = 0; i < 200 && mass_alive < made; i++) plat_sleep_ms(5);
     int alive = mass_alive;
     unsigned long long pool1 = orbis_internal_free();
+    sceKernelAvailableFlexibleMemorySize(&flex1);
+    say("threads  memória flexível: %zu KiB livres antes, %zu KiB com %d threads vivas (%.1f KiB por thread)", flex0 >> 10,
+        flex1 >> 10, made, made ? ((double)flex0 - (double)flex1) / 1024.0 / made : 0.0);
     say("threads  pool interno da libkernel: %llu KiB livres antes, %llu KiB com %d threads vivas (%.1f KiB por thread)",
         pool0 >> 10, pool1 >> 10, made, made ? (double)(pool0 - pool1) / 1024.0 / made : 0.0);
     __atomic_store_n(&mass_go, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < made; i++) plat_thread_join(t[i]);
-    check(made == NMASS, "threads", "em massa: %d de %d criadas ao mesmo tempo (%d chegaram a rodar), pilha de 256 KiB "
+    check(made == NMASS, "threads", "em massa: %d de %d criadas ao mesmo tempo (%d chegaram a rodar), pilha de 8 MiB "
           "(%.1f ms); a falha, se houve, está no totk.log (\"não nasceu\")", made, NMASS, alive, (plat_now_ns() - t0) / 1e6);
 }
 
