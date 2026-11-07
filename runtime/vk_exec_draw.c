@@ -2866,18 +2866,25 @@ static int mesh_emu_dispatch(VkExec *ex, VkPipeline p, const VkPipeInfo *info) {
         e->cinfo.tpl[0] = e->cinfo.tpl[1] = VK_NULL_HANDLE;
         e->cinfo_ok = 1;
     }
-    uint32_t cap = ME.ind ? mesh_emu_default_cap() : ME.direct;
-    if (!cap) return 0;
+    int task = e->task != VK_NULL_HANDLE;
+    // Slabs: the direct group count, else OCARINA_MESH_EMU_CAP. With a task, the task groups (direct) or
+    // OCARINA_MESH_EMU_TASKS bound count[], offset[] and the payloads.
+    uint32_t cap = ME.ind || task ? mesh_emu_default_cap() : ME.direct;
+    uint32_t tmax = !task ? 1 : ME.ind ? mesh_emu_default_tasks() : ME.direct;
+    if (!cap || !tmax) return 0;
     uint32_t pw = mi->payload_words ? mi->payload_words : 1;
-    uint32_t words = MESH_EMU_CTL_ARRAYS + pw + 64;   // the payload copy can read up to a workgroup past its end
+    uint32_t words = MESH_EMU_CTL_ARRAYS + 2 * tmax + tmax * pw + 64;   // a payload copy can read a workgroup past its end
     VkBuffer cbuf;
     VkDeviceSize coff;
     uint32_t *ctl = (uint32_t *)scratch(ex, words * 4ull, &cbuf, &coff);
     memset(ctl, 0, words * 4ull);
-    ctl[MESH_EMU_CTL_DRAW + 0] = ME.ind ? 0 : cap * mi->prims * 3;   // workgroup 0 writes it too
+    ctl[MESH_EMU_CTL_DRAW + 0] = ME.ind || task ? 0 : cap * mi->prims * 3;   // workgroup 0 (or the scan) writes it too
     ctl[MESH_EMU_CTL_DRAW + 1] = 1;
     ctl[MESH_EMU_CTL_CAP] = cap;
-    ctl[MESH_EMU_CTL_TMAX] = 1;
+    ctl[MESH_EMU_CTL_TMAX] = tmax;
+    ctl[MESH_EMU_CTL_HAS_TASK] = (uint32_t)task;
+    ctl[MESH_EMU_CTL_TASKS] = ME.ind ? 0 : ME.direct;   // indirect: copied from the record below
+    ctl[MESH_EMU_CTL_SLAB_INDICES] = mi->prims * 3;
     ctl[MESH_EMU_CTL_STRIDE] = mi->stride;
     for (int i = 0; i < MESH_EMU_LOCS; i++) ctl[MESH_EMU_CTL_LOC + i] = mi->loc_off[i];
     VkDeviceSize vbytes = (VkDeviceSize)cap * mi->max_v * mi->stride * 4, ibytes = (VkDeviceSize)cap * mi->prims * 12;
@@ -2892,7 +2899,14 @@ static int mesh_emu_dispatch(VkExec *ex, VkPipeline p, const VkPipeInfo *info) {
                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
     vkUpdateDescriptorSets(vk_ctx()->device, 3, w, 0, NULL);
     vk_exec_barrier(ex);   // ends the pass; earlier writes (the indirect record too) are visible to the compute
-    bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, e->cs);
+    if (task && ME.ind) {   // the task group count into the control block
+        VkBufferCopy cp = {ME.ind_off, coff + MESH_EMU_CTL_TASKS * 4, 4};
+        vkCmdCopyBuffer(ex->cb, ME.ind, cbuf, 1, &cp);
+        ex->recorded++;
+        vk_exec_barrier(ex);
+    }
+    bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, task ? e->task : e->cs);
+    dyn_collect(ex, &e->cinfo, 3);
     dyn_collect(ex, &e->cinfo, 4);
     bindless_bind(ex, &e->cinfo);
     bind_resources(ex, &e->cinfo);
@@ -2900,12 +2914,24 @@ static int mesh_emu_dispatch(VkExec *ex, VkPipeline p, const VkPipeInfo *info) {
     if (ME.ind) vkCmdDispatchIndirect(ex->cb, ME.ind, ME.ind_off);
     else vkCmdDispatch(ex->cb, ME.direct, 1, 1);
     ex->recorded++;
+    if (task) {   // task -> scan -> mesh over {max meshes, tasks, 1}; the same layout and descriptors throughout
+        vk_exec_barrier(ex);
+        bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, e->scan);
+        vkCmdDispatch(ex->cb, 1, 1, 1);
+        ex->recorded++;
+        vk_exec_barrier(ex);
+        bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, e->cs);
+        vkCmdDispatchIndirect(ex->cb, cbuf, coff + MESH_EMU_CTL_DISPATCH * 4);
+        ex->recorded++;
+    }
     vk_exec_pass_begin(ex);   // its barrier makes the slabs and the draw record visible to the draw
     ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
     ME.layout = info->layout, ME.set = set, ME.ctl = cbuf, ME.ctl_off = coff, ME.idx = ib, ME.idx_off = io;
     static int told;
     if (!told++) rt_log("vk: mesh emulation: first draw: %s, cap %u slabs of %u vertices and %u triangles", ME.ind ? "indirect" : "direct",
                         cap, mi->max_v, mi->prims);
+    static int told_task;
+    if (task && !told_task++) rt_log("vk: mesh emulation: first draw with a task stage: %s, %u task groups at most", ME.ind ? "indirect" : "direct", tmax);
     return 1;
 }
 
@@ -3573,7 +3599,8 @@ static int mesh_args(VkExec *ex, const VkMemSpan *ip, VkDeviceSize *offset) {
     (void)ex;
     if (!mesh_ring) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = MESH_RING_N * sizeof(VkDrawMeshTasksIndirectCommandEXT),
-                                 .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                                 .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT};   // frente M copies the task count from it
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VmaAllocation mem;
         VkResult mr = vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &mesh_ring, &mem, NULL);

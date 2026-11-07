@@ -2148,17 +2148,29 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
 
 // frente M: the mesh stage of an emulated pipeline as a compute pipeline (vk_mesh_emu_spirv.c), entered for the graphics
 // pipeline gfx (vk_exec_draw.c finds it at the draw). The NaN min/max rewrite applies as it would to the mesh module.
-static int mesh_emu_compute_create(const GfxShader *ms, const Layout *l, VkPipeline gfx, VkPipelineCache cache) {
+static VkPipeline mesh_emu_one(const GfxShader *ms, uint32_t off, const Layout *l, VkPipelineCache cache, MeshEmuInfo *out) {
     uint64_t mw = 0, cw = 0;
-    const uint32_t *mc = gfx_shader_spirv(ms, &mw);
-    uint32_t *nan = mc ? spirv_nan_minmax(mc, mw) : NULL;
+    const uint32_t *mc = NULL;
+    uint32_t *cc = NULL, *rebound = NULL, *nan = NULL;
     MeshEmuInfo mi;
     const char *why = NULL;
-    uint32_t *cc = mc ? mesh_emu_spirv(nan ? nan : mc, mw, &cw, &mi, &why) : NULL;
-    free(nan);
-    if (!cc) {
-        rt_log("vk_pipeline: mesh emulation: the mesh stage could not be converted: %s", why ? why : "no SPIR-V");
-        return 0;
+    if (ms) {
+        mc = gfx_shader_spirv(ms, &mw);
+        if (mc && off) mc = rebound = spirv_rebind(mc, mw, off);   // a task stage's bindings follow the mesh stage's
+        nan = mc ? spirv_nan_minmax(mc, mw) : NULL;
+        cc = mc ? mesh_emu_spirv(nan ? nan : mc, mw, &cw, &mi, &why) : NULL;
+        free(nan), free(rebound);
+        if (!cc) {
+            rt_log("vk_pipeline: mesh emulation: a %s stage could not be converted: %s", gfx_shader_is_task(ms) ? "task" : "mesh",
+                   why ? why : "no SPIR-V");
+            return VK_NULL_HANDLE;
+        }
+    } else {   // the scan
+        const uint32_t *sc = mesh_emu_scan_cs(&cw);
+        if (!(cc = malloc(cw * 4))) return VK_NULL_HANDLE;
+        memcpy(cc, sc, cw * 4);
+        memset(&mi, 0, sizeof mi);
+        mi.threads = 1;
     }
     VkShaderModuleCreateInfo mci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)cw * 4, .pCode = cc};
     VkShaderModule m = VK_NULL_HANDLE;
@@ -2170,7 +2182,7 @@ static int mesh_emu_compute_create(const GfxShader *ms, const Layout *l, VkPipel
                                           .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                     .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
                                           .layout = l->layout};
-        pin_subgroup32(&ci.stage, &rq, cc, cw);   // as the mesh stage was: its ballots assume 32 lanes
+        if (ms) pin_subgroup32(&ci.stage, &rq, cc, cw);   // as the mesh stage was: its ballots assume 32 lanes
         if (ci.stage.pNext && mi.threads % vk_caps.sg_size == 0) ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
         int shared = cache && cache == P.cache;
         if (shared) plat_mutex_lock_shared(&cache_access);
@@ -2181,12 +2193,33 @@ static int mesh_emu_compute_create(const GfxShader *ms, const Layout *l, VkPipel
     free(cc);
     if (r != VK_SUCCESS || !pipe) {
         rt_log("vk_pipeline: mesh emulation: compute pipeline failed (%d)", (int)r);
-        return 0;
+        return VK_NULL_HANDLE;
     }
-    mesh_emu_register(gfx, pipe, &mi);
-    static int told;
+    *out = mi;
+    return pipe;
+}
+
+static int mesh_emu_compute_create(const VkPipeState *s, const Layout *l, VkPipeline gfx, VkPipelineCache cache) {
+    MeshEmuInfo mi, ti, si;
+    VkPipeline cs = mesh_emu_one(s->vs, 0, l, cache, &mi), task = VK_NULL_HANDLE, scan = VK_NULL_HANDLE;
+    if (cs && s->ts) {
+        task = mesh_emu_one(s->ts, binding_span(s->vs) - 1, l, cache, &ti);
+        scan = task ? mesh_emu_one(NULL, 0, l, cache, &si) : VK_NULL_HANDLE;
+        if (task && ti.payload_words != mi.payload_words)
+            rt_log("vk_pipeline: mesh emulation: task payload %u words, mesh payload %u", ti.payload_words, mi.payload_words);
+        if (!task || !scan || ti.payload_words != mi.payload_words) {
+            if (task) vkDestroyPipeline(P.device, task, NULL);
+            if (scan) vkDestroyPipeline(P.device, scan, NULL);
+            vkDestroyPipeline(P.device, cs, NULL);
+            return 0;
+        }
+    }
+    if (!cs) return 0;
+    mesh_emu_register(gfx, cs, task, scan, &mi);
+    static int told, told_task;
     if (!told++) rt_log("vk_pipeline: mesh emulation: first mesh stage as compute (%u threads, %u vertices, %u primitives, %u floats a vertex)",
                         mi.threads, mi.max_v, mi.max_p, mi.stride);
+    if (task && !told_task++) rt_log("vk_pipeline: mesh emulation: first task stage as compute (payload %u words)", ti.payload_words);
     return 1;
 }
 
@@ -2270,7 +2303,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     free(vpatched), free(fpatched);
     VkShaderModule tm = VK_NULL_HANDLE;   // LOCAL TEST (Ocarina): the task stage, bindings after the mesh stage's
-    if (s->ts) {
+    if (s->ts && !emu) {
         uint64_t tw = 0;
         const uint32_t *tcode = gfx_shader_spirv(s->ts, &tw);
         uint32_t off = binding_span(s->vs) - 1;
@@ -2279,11 +2312,11 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         free(patched);
     }
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (!vm || (s->fs && !fm) || (s->gs && !gm) || (s->ts && !tm)) goto out;
+    if (!vm || (s->fs && !fm) || (s->gs && !gm) || (s->ts && !emu && !tm)) goto out;
 
     VkPipelineShaderStageCreateInfo stages[4];
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq[4];
-    const GfxShader *shaders[4] = {s->vs, s->gs, s->fs, s->ts};
+    const GfxShader *shaders[4] = {s->vs, s->gs, s->fs, emu ? NULL : s->ts};
     VkShaderModule modules[4] = {vm, gm, fm, tm};
     uint32_t stage_count = 0;
     for (int i = 0; i < 4; i++) if (shaders[i]) {
@@ -2416,7 +2449,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     } else {
         perf_count(PERF_CNT_PIPE_BUILT);
     }
-    if (pipe && emu && !mesh_emu_compute_create(s->vs, l, pipe, cache)) {
+    if (pipe && emu && !mesh_emu_compute_create(s, l, pipe, cache)) {
         vkDestroyPipeline(P.device, pipe, NULL);
         pipe = VK_NULL_HANDLE;
     }
@@ -3163,7 +3196,6 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS) ||
         (s->gs && gfx_shader_stage(s->gs) != GFX_STAGE_GS)) why = "stage mismatch";
     else if (k->topo_class == 3) why = "patches need tessellation stages, which are not translated";
-    else if (B.emu && s->ts) why = "mesh emulation: task stages are not emulated yet";
     if (!why && s->gs) why = geometry_validate(s, &vk_ctx()->props.limits);
     if (!why && k->indep) {
         Bindings F = {0};

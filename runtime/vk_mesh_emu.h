@@ -22,6 +22,7 @@ enum {
     MESH_EMU_CTL_PAYLOAD = 12,   // payload words per task workgroup
     MESH_EMU_CTL_TMAX = 13,      // capacity of count[] and offset[]
     MESH_EMU_CTL_GROUPS = 14,    // written by workgroup 0: the groups dispatched (more than CAP draw nothing)
+    MESH_EMU_CTL_SLAB_INDICES = 15,   // indices per slab (3 * prims), for the scan
     MESH_EMU_CTL_STRIDE = 16,    // floats per vertex (the pull vertex shader)
     MESH_EMU_CTL_LOC = 17,       // per Location: float offset in the vertex, or MESH_EMU_NO_LOC
     MESH_EMU_CTL_ARRAYS = 64,    // count[tmax], offset[tmax], payload[tmax * payload]; without a task, a zeroed
@@ -47,6 +48,7 @@ uint32_t *mesh_emu_spirv(const uint32_t *w, uint64_t n, uint64_t *out_n, MeshEmu
 typedef struct MeshEmuPipe {
     struct MeshEmuPipe *next;
     VkPipeline gfx, cs;                 // the pull-vertex graphics pipeline and the mesh compute
+    VkPipeline task, scan;              // with a task stage: its compute and the scan (shaders/mesh_scan.comp)
     MeshEmuInfo info;
     VkPipeInfo cinfo;                   // the graphics info with the compute bind point (vk_exec_draw.c fills it)
     int cinfo_ok;
@@ -56,7 +58,9 @@ typedef struct MeshEmuPipe {
 int mesh_emu_on(void);                                   // the device takes the emulated path
 VkDescriptorSetLayout mesh_emu_set_layout(void);         // set 3: three storage buffers, compute and vertex
 const uint32_t *mesh_emu_pull_vs(uint64_t *words);
-void mesh_emu_register(VkPipeline gfx, VkPipeline cs, const MeshEmuInfo *info);
+void mesh_emu_register(VkPipeline gfx, VkPipeline cs, VkPipeline task, VkPipeline scan, const MeshEmuInfo *info);
+const uint32_t *mesh_emu_scan_cs(uint64_t *words);
+uint32_t mesh_emu_default_tasks(void);                   // task workgroups of an indirect draw (OCARINA_MESH_EMU_TASKS)
 MeshEmuPipe *mesh_emu_find(VkPipeline gfx);
 uint32_t mesh_emu_default_cap(void);                     // slabs of an indirect draw (OCARINA_MESH_EMU_CAP)
 // Device-local bytes for the command buffer of fence, freed when it completes.

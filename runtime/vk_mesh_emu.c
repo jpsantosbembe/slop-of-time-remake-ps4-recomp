@@ -4,13 +4,15 @@
 // OCARINA_MESH_EMULATE=1 takes this path on a device that has VK_EXT_mesh_shader too (testing on NVIDIA); without the
 // extension it is always taken. OCARINA_MESH_EMU_MB (default 8): size of a slab chunk; a draw that needs more gets a
 // chunk of its own. OCARINA_MESH_EMU_CAP (default 256): slabs reserved for an indirect draw whose group count the
-// CPU does not know; workgroups past it draw nothing (logged once per program).
+// CPU does not know; workgroups past it draw nothing. OCARINA_MESH_EMU_TASKS (default 256): task workgroups an indirect
+// draw with a task stage can have; the ones past it emit nothing.
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
 #include "host.h"
 #include "mesh_pull_spv.h"
+#include "mesh_scan_spv.h"
 #include "vk.h"
 #include "vk_mesh_emu.h"
 #include "platform/platform.h"
@@ -47,10 +49,24 @@ static MeshEmuPipe *reg[REG_BUCKETS];
 
 static uint32_t reg_hash(VkPipeline p) { return (uint32_t)(((uint64_t)(uintptr_t)p * 0x9e3779b97f4a7c15ull) >> 40) % REG_BUCKETS; }
 
-void mesh_emu_register(VkPipeline gfx, VkPipeline cs, const MeshEmuInfo *info) {
+const uint32_t *mesh_emu_scan_cs(uint64_t *words) {
+    *words = sizeof mesh_scan_spv / 4;
+    return mesh_scan_spv;
+}
+
+uint32_t mesh_emu_default_tasks(void) {
+    static uint32_t n;
+    if (!n) {
+        const char *e = getenv("OCARINA_MESH_EMU_TASKS");
+        n = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 256;
+    }
+    return n;
+}
+
+void mesh_emu_register(VkPipeline gfx, VkPipeline cs, VkPipeline task, VkPipeline scan, const MeshEmuInfo *info) {
     MeshEmuPipe *e = calloc(1, sizeof *e);
     if (!e) return;
-    e->gfx = gfx, e->cs = cs, e->info = *info;
+    e->gfx = gfx, e->cs = cs, e->task = task, e->scan = scan, e->info = *info;
     plat_mutex_lock(&lock);
     uint32_t h = reg_hash(gfx);
     e->next = reg[h];

@@ -1,0 +1,17 @@
+#version 450
+// Mesh shader emulation (docs/frente-M.md), between the task and the mesh computes of a draw with a task stage: the
+// first slab of each task workgroup's meshes (an exclusive prefix sum of count[]), the mesh dispatch {max meshes,
+// tasks, 1} and the indexed draw's count. One invocation: at most OCARINA_MESH_EMU_TASKS task workgroups.
+layout(local_size_x = 1) in;
+layout(set = 3, binding = 2, std430) buffer Ctl { uint c[]; };   // vk_mesh_emu.h MESH_EMU_CTL_*
+void main() {
+    uint tmax = c[13], tasks = min(c[10], tmax), sum = 0u;
+    for (uint t = 0u; t < tasks; t++) {
+        c[64u + tmax + t] = sum;
+        sum += c[64u + t];
+    }
+    c[0] = min(sum, c[8]) * c[15];
+    c[5] = c[11];
+    c[6] = tasks;
+    c[7] = 1u;
+}

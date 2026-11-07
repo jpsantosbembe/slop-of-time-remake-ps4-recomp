@@ -296,6 +296,65 @@ static int rewrite_mesh_entry(Rw *r, uint64_t i0, uint64_t i1, Buf *f, const cha
     return prologue_done ? 1 : (*why = "no prologue", 0);
 }
 
+
+// Rewrites the entry function of a task module: its payload goes to ctl[ARRAYS + 2 * tmax + t * PW + i] and
+// OpEmitMeshTasksEXT(n) becomes count[t] = n plus an atomic max of n into ctl[MAX_MESHES] (the mesh dispatch's x).
+static int rewrite_task_entry(Rw *r, uint64_t i0, uint64_t i1, Buf *f, const char **why) {
+    const uint32_t *w = r->w;
+    uint32_t c0 = cst(r, 0), first_label = 0, t = 0, pbase = 0;
+    int prologue_done = 0;
+    for (uint64_t i = i0; i < i1;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = &w[i + 1];
+        if (op == OP_LABEL && !first_label) {
+            first_label = a[0];
+            ins(f, op, (int)len - 1, a);
+            i += len;
+            continue;
+        }
+        if (first_label && !prologue_done && op != OP_VARIABLE) {
+            prologue_done = 1;
+            t = extract(r, f, r->t_uint, load(r, f, r->t_v3uint, r->v_wgid), 0);
+            uint32_t tmax = ctl_load(r, f, cst(r, MESH_EMU_CTL_TMAX));
+            uint32_t ret = new_id(r), cont = new_id(r), past = bin(r, f, OP_UGREATER_THAN_EQUAL, r->t_bool, t, tmax);
+            INS(f, OP_SELECTION_MERGE, cont, 0);
+            INS(f, OP_BRANCH_CONDITIONAL, past, ret, cont);
+            INS(f, OP_LABEL, ret);
+            INS(f, OP_RETURN);
+            INS(f, OP_LABEL, cont);
+            uint32_t arrays = cst(r, MESH_EMU_CTL_ARRAYS);
+            pbase = bin(r, f, OP_IADD, r->t_uint, bin(r, f, OP_IADD, r->t_uint, arrays, bin(r, f, OP_IMUL, r->t_uint, cst(r, 2), tmax)),
+                        bin(r, f, OP_IMUL, r->t_uint, t, cst(r, r->payload_words ? r->payload_words : 1)));
+        }
+        if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && a[2] == r->v_payload && r->v_payload) {
+            if (len != 5) return *why = "payload access chain shape", 0;
+            INS(f, OP_ACCESS_CHAIN, r->p_sb_u, a[1], r->v_ctl, c0, bin(r, f, OP_IADD, r->t_uint, a[3], pbase));
+            i += len;
+            continue;
+        }
+        if (op == OP_EMIT_MESH_TASKS) {
+            uint32_t n = a[0];
+            INS(f, OP_STORE, ctl_ptr(r, f, bin(r, f, OP_IADD, r->t_uint, cst(r, MESH_EMU_CTL_ARRAYS), t)), n);
+            uint32_t old = new_id(r);
+            INS(f, OP_ATOMIC_UMAX, r->t_uint, old, ctl_ptr(r, f, cst(r, MESH_EMU_CTL_MAX_MESHES)), cst(r, 1), c0, n);
+            INS(f, OP_RETURN);
+            i += len;
+            continue;
+        }
+        if (op == OP_PHI) {
+            put(f, w[i]);
+            for (uint32_t k = 1; k < len; k++) put(f, w[i + k]);
+            i += len;
+            continue;
+        }
+        for (uint32_t k = 1; k < len; k++)
+            if (removed(r, w[i + k]) && op != OP_FUNCTION) return *why = "other use of the payload", 0;
+        ins(f, op, (int)len - 1, a);
+        i += len;
+    }
+    return prologue_done ? 1 : (*why = "no prologue", 0);
+}
+
 uint32_t *mesh_emu_spirv(const uint32_t *w, uint64_t n, uint64_t *out_n, MeshEmuInfo *info, const char **why) {
     static const char *dummy;
     if (!why) why = &dummy;
@@ -333,9 +392,10 @@ uint32_t *mesh_emu_spirv(const uint32_t *w, uint64_t n, uint64_t *out_n, MeshEmu
         }
         i += len;
     }
-    if (r.kind != EM_MESH) return *why = r.kind == EM_TASK ? "task modules are not emulated yet" : "not a mesh module", NULL;
+    if (r.kind != EM_MESH && r.kind != EM_TASK) return *why = "not a mesh or task module", NULL;
+    int task = r.kind == EM_TASK;
     if (!r.t_uint || !r.t_float || !r.t_bool || !r.glsl || !first_fn) return *why = "missing base types", NULL;
-    if (!r.threads || r.threads > 128 || !r.max_v || r.max_v > MESH_EMU_MAX_V || !r.max_p || r.max_p > MESH_EMU_MAX_P)
+    if (!r.threads || r.threads > 128 || (!task && (!r.max_v || r.max_v > MESH_EMU_MAX_V || !r.max_p || r.max_p > MESH_EMU_MAX_P)))
         return *why = "limits", NULL;
     // Types needed by id (vectors after their component type), Locations and the payload.
     for (uint64_t i = 5; i < first_fn; i += w[i] >> 16) {
@@ -345,7 +405,7 @@ uint32_t *mesh_emu_spirv(const uint32_t *w, uint64_t n, uint64_t *out_n, MeshEmu
         if (op == OP_DECORATE && a[1] == DEC_LOCATION && a[2] < 31) r.v_gen[a[2]] = a[0];
         if (op == OP_VARIABLE && a[2] == SC_PAYLOAD) r.v_payload = a[1], r.pt_out_payload_arr = a[0];
     }
-    if (!r.t_v3uint || !r.v_lid || !r.v_pos || !r.v_idx) return *why = "missing builtins", NULL;
+    if (!r.t_v3uint || !r.v_lid || (!task && (!r.v_pos || !r.v_idx))) return *why = "missing builtins", NULL;
     // Location decorations of variables that are not Output vertex arrays (none expected) are not ours.
     for (uint64_t i = 5; i < first_fn; i += w[i] >> 16) {
         uint32_t op = w[i] & 0xffff;
@@ -384,7 +444,7 @@ uint32_t *mesh_emu_spirv(const uint32_t *w, uint64_t n, uint64_t *out_n, MeshEmu
         if (op == OP_FUNCTION_END && e0 && !e1) e1 = i + 1;
     }
     if (!e0 || !e1) return *why = "no entry function", NULL;
-    if (!rewrite_mesh_entry(&r, e0, e1, &fn, why)) goto fail;
+    if (!(task ? rewrite_task_entry(&r, e0, e1, &fn, why) : rewrite_mesh_entry(&r, e0, e1, &fn, why))) goto fail;
 
     Buf o = {0};
     int dec_done = 0;
@@ -429,9 +489,9 @@ uint32_t *mesh_emu_spirv(const uint32_t *w, uint64_t n, uint64_t *out_n, MeshEmu
     if (o.oom || r.g.oom || r.dec.oom || fn.oom) { free(o.w); *why = "out of memory"; goto fail; }
     o.w[3] = r.bound;
     free(fn.w), free(r.g.w), free(r.dec.w);
-    info->kind = MESH_EMU_MESH;
+    info->kind = task ? MESH_EMU_TASK : MESH_EMU_MESH;
     info->threads = r.threads, info->max_v = r.max_v, info->max_p = r.max_p;
-    info->prims = (r.max_p + r.threads - 1) / r.threads * r.threads;
+    info->prims = task ? 0 : (r.max_p + r.threads - 1) / r.threads * r.threads;
     info->stride = 4 * (1 + (uint32_t)nloc);
     info->payload_words = r.payload_words;
     for (int l = 0; l < MESH_EMU_LOCS; l++) info->loc_off[l] = r.v_gen[l] ? 4 * (uint32_t)r.attr_of_loc[l] : MESH_EMU_NO_LOC;
@@ -458,6 +518,7 @@ int main(int argc, char **argv) {   // mesh_emu_test in.spv out.spv
     f = fopen(argv[2], "wb");
     fwrite(o, 4, on, f);
     fclose(f);
+    if (info.kind == MESH_EMU_TASK) { printf("%s: task payload %u\n", argv[1], info.payload_words); f = fopen(argv[2], "wb"); fwrite(o, 4, on, f); fclose(f); free(o); return 0; }
     printf("%s: v %u p %u slab %u stride %u payload %u\n", argv[1], info.max_v, info.max_p, info.prims, info.stride, info.payload_words);
     free(o);
     return 0;
