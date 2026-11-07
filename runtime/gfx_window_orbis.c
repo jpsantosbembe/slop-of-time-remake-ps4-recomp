@@ -72,6 +72,13 @@ int wsys_open(void) {
     if (!plat_thread_spawn(idle_main, NULL, "gnm submitdone", 256 << 10)) rt_log("gfx: sem a thread do sceGnmSubmitDone");
     g_open = 1;
     rt_log("gfx: saída de vídeo do PS4 %dx%d (VK_EXT_headless_surface)", g_w, g_h);
+    {
+        // A splash do PKG (sce_sys/pic0/pic1) fica na frente de tudo até o app pedir para tirá-la; sem isto, o jogo desenha
+        // atrás dela e a TV só mostra a splash (a sonda nunca viu isso porque o PKG dela não tinha splash).
+        extern int32_t sceSystemServiceHideSplashScreen(void);
+        int32_t r = sceSystemServiceHideSplashScreen();
+        rt_log("gfx: splash do sistema escondida (%#x)", (unsigned)r);
+    }
     return 1;
 }
 
