@@ -26,6 +26,8 @@ layout(push_constant) uniform Params {
     uint bx;         // blocks per row
     uint bslice;     // blocks per slice
     uint srgb;
+    uint row0;       // first block row of this dispatch (vk_astc.c splits a region into bands of rows)
+    uint z0;         // slice of this dispatch: the region's slices go one dispatch each
 } pc;
 
 uint tab_byte(uint i) { return (tab[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu; }
@@ -350,10 +352,11 @@ void main() {
     int bpw = G <= 64 ? 64 / G : 1, S = G <= 64 ? G : 64;
     int l = int(gl_LocalInvocationID.x), lb = l / S, lane = l - lb * S;
     bool live = lb < bpw;
-    int bxi = int(gl_WorkGroupID.x) * bpw + lb, byi = int(gl_WorkGroupID.y);
+    int bxi = int(gl_WorkGroupID.x) * bpw + lb, byi = int(gl_WorkGroupID.y + pc.row0);
+    uint zi = gl_WorkGroupID.z + pc.z0;
     live = live && bxi < int(pc.bx);
     lb = min(lb, MAXB - 1);
-    uvec4 b = live ? blk[pc.in_base + gl_WorkGroupID.z * pc.bslice + uint(byi) * pc.bx + uint(bxi)] : uvec4(0u);
+    uvec4 b = live ? blk[pc.in_base + zi * pc.bslice + uint(byi) * pc.bx + uint(bxi)] : uvec4(0u);
     Hdr H = header(b, bw, bh);
     bool work = live && !H.solid;
 
@@ -424,6 +427,6 @@ void main() {
                 o |= uint((ch16(q0, c) * (64 - wc) + ch16(q1, c) * wc + 32) >> 14) << uint(8 * c);
             }
         }
-        px[pc.out_base + (gl_WorkGroupID.z * pc.height + gy) * pc.width + gx] = o;
+        px[pc.out_base + (zi * pc.height + gy) * pc.width + gx] = o;
     }
 }

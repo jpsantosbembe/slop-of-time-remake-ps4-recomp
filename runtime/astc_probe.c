@@ -7,10 +7,12 @@
 // the BC3 encoder (TOTK_ASTC_BC) into a BC3 image, whose blocks are decoded here and held to error bounds (bc_check).
 // Also times one 2048x2048 texture on the CPU (astc_decode_ldr_mt) and on the GPU (wall time of the upload batch).
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "platform/platform.h"
 #include "host.h"
 #include "tex.h"
@@ -352,6 +354,151 @@ static void timing(VkCtx *c, uint32_t bw, uint32_t bh) {
            "timed, %.2f M texels), batch wall %.1f ms\n", bw, bh, cpu, mtex > 0 ? (u1 - u0) / mtex : 0.0,
            (unsigned long long)(c1 - c0), mtex, wall);
     free(blk), free(out);
+}
+
+// --probe-astc-gpu: the compute ASTC decoder in steps, for a GPU where --probe-astc hangs or the game's first ASTC decode
+// does (the PS4: GCN GFX7 through mesa-ps4). Every step is its own upload batch, waited on, and writes a line before
+// and after it to the report (PROBE_GPU_REPORT, flushed) and to the log, so when the GPU hangs and the system kills the
+// process the last "start" line names the step; with TOTK_ASTC_TRACE=1 the log also names each band's breadcrumb.
+// Steps: 1. one small 4x4 decode (64x64) checked bit for bit against astc_decode_ldr; 2. the same for 8x8 and 12x12;
+// 3. BC3 encode of a small decode (when TOTK_ASTC_BC=1); 4. growing textures (valid blocks) per footprint, with the
+// GPU time of the dispatches (TOTK_ASTC_TIME timestamps) and per band (TOTK_ASTC_BAND texels per dispatch).
+#ifdef __ORBIS__
+#define PROBE_GPU_REPORT "/data/ocarina/probe-astc.txt"
+#include "gfx.h"
+#else
+#define PROBE_GPU_REPORT "probe-astc.txt"
+#endif
+
+static FILE *g_rep;
+
+static void rep(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void rep(const char *fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    rt_log("probe-astc-gpu: %s", line);
+    printf("probe-astc-gpu: %s\n", line);
+    fflush(stdout);
+    if (g_rep) fprintf(g_rep, "%s\n", line), fflush(g_rep);
+}
+
+// n valid, non-constant blocks (repeating 4096 distinct ones), as timing() makes them.
+static void valid_blocks(uint8_t *blk, size_t n, uint32_t bw, uint32_t bh) {
+    uint8_t tmp[12 * 12 * 4];
+    size_t k = 0;
+    for (; k < n && k < 4096;) {
+        uint64_t v[2] = {rnd64(), rnd64()};
+        if ((v[0] & 0x1FF) != 0x1FC && astc_decode_block((uint8_t *)v, bw, bh, false, tmp)) memcpy(blk + 16 * k++, v, 16);
+    }
+    for (; k < n; k++) memcpy(blk + 16 * k, blk + 16 * (k % 4096), 16);
+}
+
+// Bands of one w x h region, as vk_astc.c band_rows splits it (decode pass).
+static uint32_t bands_of(uint32_t w, uint32_t h, uint32_t bh) {
+    const char *e = cfg_get("TOTK_ASTC_BAND");
+    uint64_t t = e && *e ? strtoull(e, NULL, 0) : (1u << 20), by = (h + bh - 1) / bh;
+    if (!t) return 1;
+    uint64_t r = t / ((uint64_t)w * bh);
+    if (r < 1) r = 1;
+    return (uint32_t)((by + r - 1) / r);
+}
+
+// A small decode checked against the CPU decoder; 1 when it matches.
+static int small_case(VkCtx *c, uint32_t bw, uint32_t bh, uint32_t w, uint32_t h) {
+    size_t n = (size_t)((w + bw - 1) / bw) * ((h + bh - 1) / bh), t = (size_t)w * h;
+    uint8_t *blk = malloc((n + 1) * 16), *want = malloc((t + 1) * 4), *rb = malloc((t + 1) * 4), *im = malloc((t + 1) * 4);
+    make_blocks(blk, n + 1, bw, bh);
+    astc_decode_ldr(blk, w, h, bw, bh, false, want);
+    double ms = 0;
+    rep("start    decode %ux%u %ux%u", bw, bh, w, h);
+    int ok = gpu_decode(c, blk, n, 1, w, h, 1, 1, bw, bh, 0, rb, im, &ms);
+    size_t at = 0;
+    int same = ok && !first_diff(want, rb, t, &at) && !first_diff(want, im, t, &at);
+    rep("%s decode %ux%u %ux%u: %s (batch %.1f ms)", same ? "ok      " : "FALHOU  ", bw, bh, w, h,
+        !ok ? "not recorded" : same ? "bit-exact with the CPU" : "differs from the CPU", ms);
+    if (ok && !same) rep("         first difference at texel (%zu,%zu)", at % w, at / w);
+    free(blk), free(want), free(rb), free(im);
+    return same;
+}
+
+int probe_astc_gpu(void) {
+#ifdef __ORBIS__
+    plat_file_mkdir_p("/data/ocarina");
+#endif
+    g_rep = fopen(PROBE_GPU_REPORT, "w");
+    rep("start    init (TOTK_ASTC=%s, TOTK_ASTC_BC=%s, TOTK_ASTC_BAND=%s)", cfg_value("TOTK_ASTC"),
+        cfg_get("TOTK_ASTC_BC") ? cfg_get("TOTK_ASTC_BC") : "0", cfg_get("TOTK_ASTC_BAND") ? cfg_get("TOTK_ASTC_BAND") : "1048576");
+#ifdef __ORBIS__
+    gfx_window_start();   // the device the game uses (rt_fatal when there is none)
+#else
+    if (!vk_init()) { rep("FALHOU   vk_init"); return 1; }
+#endif
+    VkCtx *c = vk_ctx();
+    int gpu = c && vk_astc_gpu(), bc = c && vk_astc_bc(), bad = 0;
+    rep("%s init: GPU %s, mode %d, compute decoder %d, BC3 encoder %d", gpu ? "ok      " : "FALHOU  ",
+        c ? c->props.deviceName : "-", c ? vk_astc_mode() : -1, gpu, bc);
+    if (!gpu) {
+        rep("probe-astc-gpu: FALHOU (no compute decoder; TOTK_ASTC must be gpu or auto)");
+        if (g_rep) fclose(g_rep);
+        return 1;
+    }
+
+    bad |= !small_case(c, 4, 4, 64, 64);
+    bad |= !small_case(c, 8, 8, 64, 64);
+    bad |= !small_case(c, 12, 12, 60, 60);
+    bad |= !small_case(c, 6, 6, 300, 200);
+
+    if (bc) {
+        uint32_t w = 64, h = 64, bw = 4, bh = 4;
+        size_t n = (size_t)(w / bw) * (h / bh), t = (size_t)w * h;
+        uint8_t *blk = malloc((n + 1) * 16), *want = malloc(t * 4), *out = malloc((size_t)(w / 4) * (h / 4) * 16 + 16);
+        make_blocks(blk, n + 1, bw, bh);
+        astc_decode_ldr(blk, w, h, bw, bh, false, want);
+        rep("start    BC3 encode 4x4 %ux%u", w, h);
+        double db = 0;
+        int ok = gpu_bc(c, blk, n, 1, w, h, 1, 1, bw, bh, 0, out);
+        ok = ok && !bc_check(want, out, w, h, "probe-astc-gpu", &db);
+        rep("%s BC3 encode 4x4 %ux%u (PSNR %.1f dB)", ok ? "ok      " : "FALHOU  ", w, h, db);
+        bad |= !ok;
+        free(blk), free(want), free(out);
+    }
+
+    // growing textures: the GPU time of the dispatches, per M texel and per band
+    static const uint32_t fps[4][2] = {{4, 4}, {6, 6}, {8, 8}, {12, 12}};
+    static const uint32_t sizes[4][2] = {{256, 256}, {1024, 1024}, {2048, 2048}, {4096, 2048}};
+    vk_astc_time_enable(1);
+    for (int s = 0; s < 4; s++)
+        for (int f = 0; f < 4; f++) {
+            uint32_t w = sizes[s][0], h = sizes[s][1], bw = fps[f][0], bh = fps[f][1];
+            if (s == 3 && f) continue;   // the largest only for 4x4 (the most blocks)
+            size_t n = (size_t)((w + bw - 1) / bw) * ((h + bh - 1) / bh);
+            uint8_t *blk = malloc(n * 16);
+            valid_blocks(blk, n, bw, bh);
+            uint64_t t0, c0, t1, c1;
+            double u0, u1, wall = 0;
+            vk_astc_time_get(bw, bh, &t0, &c0, &u0);
+            rep("start    time %ux%u %ux%u (%.2f M texels, %u bands)", bw, bh, w, h, (double)w * h / 1e6, bands_of(w, h, bh));
+            int ok = gpu_decode(c, blk, n, 1, w, h, 1, 1, bw, bh, 0, NULL, NULL, &wall);
+            vk_upload_flush(1);
+            vk_astc_time_get(bw, bh, &t1, &c1, &u1);
+            uint32_t nb = bands_of(w, h, bh);
+            rep("%s time %ux%u %ux%u: dispatches %.0f us GPU (%.0f us per band of %u, %.0f us per M texel), batch wall %.1f ms",
+                ok ? "ok      " : "FALHOU  ", bw, bh, w, h, u1 - u0, (u1 - u0) / nb, nb,
+                t1 > t0 ? (u1 - u0) * 1e6 / (double)(t1 - t0) : 0.0, wall);
+            bad |= !ok;
+            free(blk);
+        }
+    vk_astc_time_enable(0);
+    rep("probe-astc-gpu: %s", bad ? "FALHOU" : "OK");
+    if (g_rep) fclose(g_rep);
+#ifndef __ORBIS__
+    vk_mem_shutdown();
+    vk_shutdown();
+#endif
+    return bad;
 }
 
 int probe_astc(void) {

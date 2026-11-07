@@ -14,6 +14,11 @@
 // blocks go from staging to a device-local scratch buffer, its dispatches write RGBA8 texels behind them, and a
 // buffer-to-image copy puts them into the image; the next chunk reuses the scratch after a barrier. The scratch
 // buffer is freed once the batch completes (vk_defer_buffer).
+//
+// Bands (TOTK_ASTC_BAND, texels per dispatch, default 1 M; 0 = one dispatch per region slice): each region slice is
+// dispatched in bands of block rows, every band behind its own GPU breadcrumb (VK_CRUMB_ASTC n), so a hang names the
+// band the GPU was in and no single dispatch runs long on a slow GPU. TOTK_ASTC_TRACE=1 logs each band with its
+// breadcrumb number as it is recorded, to read a hang's crumb back to the texture, footprint and rows.
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,7 +98,7 @@ _Static_assert(sizeof wunq_data == 142 && sizeof cunq_data == 936, "unquantizati
 enum { TAB_BYTES = 28 * 4, TAB_WUNQ = TAB_BYTES, TAB_CUNQ = TAB_BYTES + 144, TAB_SIZE = TAB_CUNQ + 936 };
 
 typedef struct {
-    uint32_t in_base, out_base, width, height, bw, bh, bx, bslice, srgb;
+    uint32_t in_base, out_base, width, height, bw, bh, bx, bslice, srgb, row0, z0;
 } Push;
 
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
@@ -414,7 +419,35 @@ static VkDeviceSize region_in(const VkAstcRegion *r, uint32_t bw, uint32_t bh) {
 }
 static VkDeviceSize region_bc(const VkAstcRegion *r) { return region_in(r, 4, 4); }   // BC3: 16 bytes per 4x4 block
 
-typedef struct { uint32_t in_base, out_base, width, height, bx, bslice; } BcPush;   // bc3_encode.comp Params
+typedef struct { uint32_t in_base, out_base, width, height, bx, bslice, row0, z0; } BcPush;   // bc3_encode.comp Params
+
+// TOTK_ASTC_BAND: texels per dispatch (whole block rows, at least one row); 0: a whole slice per dispatch.
+static uint64_t band_texels(void) {
+    static volatile int64_t v = -1;
+    if (v < 0) {
+        const char *e = cfg_get("TOTK_ASTC_BAND");
+        v = e && *e ? (int64_t)strtoull(e, NULL, 0) : (int64_t)(1u << 20);
+    }
+    return (uint64_t)v;
+}
+
+static int trace_on(void) {
+    static volatile int v = -1;
+    if (v < 0) {
+        const char *e = cfg_get("TOTK_ASTC_TRACE");
+        v = e && *e && *e != '0';
+    }
+    return v;
+}
+
+// Block rows per band for rows of row_w x rh texels; a band other than the last is a multiple of mult rows.
+static uint32_t band_rows(uint32_t rows, uint32_t row_w, uint32_t rh, uint32_t mult) {
+    uint64_t t = band_texels(), per = (uint64_t)row_w * rh;
+    if (!t || !per) return rows;
+    uint64_t r = t / per / mult * mult;
+    if (r < mult) r = mult;
+    return r >= rows ? rows : (uint32_t)r;
+}
 
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
                    uint32_t bh, int srgb, int bc, VkImage img, VkImageAspectFlags aspect, VkBuffer readback) {
@@ -535,9 +568,19 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
             uint32_t bx = (r->w + bw - 1) / bw, by = (r->h + bh - 1) / bh;
             Push pc = {.in_base = (uint32_t)(ib / 16), .out_base = (uint32_t)(ob / 4), .width = r->w, .height = r->h,
                        .bw = bw, .bh = bh, .bx = bx, .bslice = bx * by, .srgb = (uint32_t)(srgb != 0)};
-            vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
             uint32_t bpw = bw * bh <= 64 ? 64 / (bw * bh) : 1;   // blocks per workgroup, as astc_decode.comp main
-            vkCmdDispatch(cb, (bx + bpw - 1) / bpw, by, r->slices);
+            uint32_t step = band_rows(by, r->w, bh, 1);
+            for (uint32_t z = 0; z < r->slices; z++)
+                for (uint32_t y0 = 0; y0 < by; y0 += step) {
+                    uint32_t ny = by - y0 < step ? by - y0 : step;
+                    if (i > i0 || y0 || z) rec_crumb(cb, VK_CRUMB_ASTC, ++n_chunks);   // the chunk's first band has its crumb
+                    if (trace_on())
+                        rt_log("vk: ASTC band crumb %llu: %ux%u (%ux%u) level %u layer %u slice %u, block rows %u..%u of %u",
+                               (unsigned long long)n_chunks, r->w, r->h, bw, bh, r->level, r->layer, z, y0, y0 + ny - 1, by);
+                    pc.row0 = y0, pc.z0 = z;
+                    vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+                    vkCmdDispatch(cb, (bx + bpw - 1) / bpw, ny, 1);
+                }
             copies[i - i0] = (VkBufferImageCopy){.bufferOffset = cap_in + ob, .bufferRowLength = r->w,
                                                  .bufferImageHeight = r->h, .imageSubresource = {aspect, r->level, r->layer, 1},
                                                  .imageOffset = r->offset, .imageExtent = {r->w, r->h, r->slices}};
@@ -563,8 +606,18 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
                 uint32_t bx4 = (r->w + 3) / 4, by4 = (r->h + 3) / 4;
                 BcPush pc = {.in_base = (uint32_t)(to / 4), .out_base = (uint32_t)(bo / 16), .width = r->w, .height = r->h,
                              .bx = bx4, .bslice = bx4 * by4};
-                vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
-                vkCmdDispatch(cb, (bx4 + 7) / 8, (by4 + 7) / 8, r->slices);
+                uint32_t step = band_rows(by4, r->w, 4, 8);   // a workgroup row is 8 block rows
+                for (uint32_t z = 0; z < r->slices; z++)
+                    for (uint32_t y0 = 0; y0 < by4; y0 += step) {
+                        uint32_t ny = by4 - y0 < step ? by4 - y0 : step;
+                        rec_crumb(cb, VK_CRUMB_ASTC, ++n_chunks);
+                        if (trace_on())
+                            rt_log("vk: ASTC band crumb %llu: BC3 encode %ux%u level %u layer %u slice %u, block rows %u..%u of %u",
+                                   (unsigned long long)n_chunks, r->w, r->h, r->level, r->layer, z, y0, y0 + ny - 1, by4);
+                        pc.row0 = y0, pc.z0 = z;
+                        vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+                        vkCmdDispatch(cb, (bx4 + 7) / 8, (ny + 7) / 8, 1);
+                    }
                 VkBufferImageCopy *cp = &copies[i - i0];
                 cp->bufferOffset = cap_in + cap_out + bo, cp->bufferRowLength = bx4 * 4, cp->bufferImageHeight = by4 * 4;
                 to += region_out(r), bo += region_bc(r);

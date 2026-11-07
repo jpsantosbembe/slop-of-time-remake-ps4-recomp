@@ -315,7 +315,7 @@ int probe_vkgeometry(void);                                // vk_geometry_probe.
 int probe_vkgeometry_passthrough(void);                    // original portable-passthrough replay/readback
 int probe_vkgeometry_ordering(void);                       // original portable producer/barrier/indirect in one submission
 int probe_census_dir(char *dir, size_t n);                 // gfx_shader_probe.c: build/<version>/shaders for the probes
-int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // tex_probe.c, vk_exec_probe.c, astc_probe.c
+int probe_vkmem(void), probe_vkexec(void), probe_astc(void), probe_astc_gpu(void);                // tex_probe.c, vk_exec_probe.c, astc_probe.c
 int probe_vkcopy_astc(void);                              // vk_copy_probe.c: original ASTC copy replay/readback
 int probe_vkpool(void);                                   // vk_pool_probe.c: original descriptor-pool sampling
 int probe_vkreset(void);                                  // vk_reset_probe.c: original indirect reset ordering

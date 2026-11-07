@@ -21,6 +21,8 @@ layout(push_constant) uniform Params {
     uint width, height;
     uint bx;         // blocks per row
     uint bslice;     // blocks per slice
+    uint row0;       // first block row of this dispatch (a multiple of 8: vk_astc.c bands)
+    uint z0;         // slice of this dispatch
 } pc;
 
 vec4 texel(uint x, uint y, uint z) {
@@ -38,7 +40,7 @@ vec3 from565(uint v) {
 }
 
 void main() {
-    uvec3 id = gl_GlobalInvocationID;
+    uvec3 id = gl_GlobalInvocationID + uvec3(0u, pc.row0, pc.z0);
     uint by = (pc.height + 3u) / 4u;
     if (id.x >= pc.bx || id.y >= by) return;
     vec4 t[16];
