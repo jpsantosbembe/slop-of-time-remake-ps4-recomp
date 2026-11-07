@@ -123,7 +123,19 @@ void vk_caps_init(VkCtx *c) {
     // BotW and TotK on AMD). The translator biases gather coordinates by the host's sub-texel precision; NVIDIA rounds
     // as Maxwell does. TOTK_GATHER_BIAS=<bits> forces it (0: off).
     uint32_t gather = env_u32("TOTK_GATHER_BIAS", c->props.vendorID == 0x10de ? 0 : l->subTexelPrecisionBits);
-    gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather);
+    // ocarina-ps4: OCARINA_SHADER_SBUF=<n> diz ao tradutor (e às chaves do cache) o alinhamento de storage buffer n
+    // (0 ou até 4: exato, a resposta do PS4), qualquer que seja o da GPU. Com OCARINA_SHADER_SG=64 e TOTK_GATHER_BIAS=8
+    // é o que gera no PC o cache com as respostas do PS4 (f64=1 sbuf=0 sg=64 gather=8). Só para --prepare-shaders: o
+    // desenho continua usando o alinhamento real (vk_caps.sbuf_align), então jogar no PC assim sai errado.
+    uint32_t sbuf_told = vk_caps.sbuf_align;
+    const char *sbe = cfg_get("OCARINA_SHADER_SBUF");
+    if (sbe && *sbe) {
+        sbuf_told = (uint32_t)strtoul(sbe, NULL, 0);
+        if (sbuf_told <= 4) sbuf_told = 0;
+        rt_log("vk caps: OCARINA_SHADER_SBUF=%s: o tradutor ouve alinhamento de storage buffer %u (a GPU tem %u)", sbe,
+               sbuf_told, vk_caps.sbuf_align);
+    }
+    gfx_shader_set_host(vk_caps.float64, sbuf_told, told, gather);
     uint32_t geometry_told = vk_caps.sg_pin_stages & VK_SHADER_STAGE_GEOMETRY_BIT ? want : sg.subgroupSize;
     if (sg_told) geometry_told = sg_told;
     gfx_shader_set_geometry_host(geometry_told);
