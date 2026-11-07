@@ -1042,7 +1042,10 @@ static int ww_fault(uint64_t a) {
     if (!r || !r->ww || !win_mapped(r, a)) return 0;
     uint64_t pg = down(a, KPAGE);
     uint8_t *w = &r->ww[(pg - r->base) / KPAGE];
-    if (page_req(r, pg) != PLAT_PROT_RW || __atomic_load_n(w, __ATOMIC_ACQUIRE) == WW_DIRTY) return 0;
+    // Pedida RW e faltou: a proteção do hardware está atrasada em qualquer estado, inclusive DIRTY (um apply_range
+    // concorrente pode ter lido CLEAN entre o mprotect abaixo e a marca DIRTY e rearmado a página). Corrigir sempre
+    // evita o laço eterno com o gancho do runtime, que devolveria 1 para esta página RW.
+    if (page_req(r, pg) != PLAT_PROT_RW) return 0;
     if (sceKernelMprotect((void *)(uintptr_t)pg, KPAGE, K_PROT_CPU_R | K_PROT_CPU_W | K_PROT_GPU)) return 0;
     __atomic_store_n(w, WW_DIRTY, __ATOMIC_RELEASE);   // depois de liberar: ver plat_mem_written
     return 1;

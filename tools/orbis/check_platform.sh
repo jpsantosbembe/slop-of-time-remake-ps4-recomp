@@ -61,7 +61,7 @@ EXTRA=(-isystem "$B/mesa/include" -Iruntime -isystem "$shim")
 ok=0
 bad=0
 broken=()
-for f in runtime/*.c; do
+for f in runtime/*.c runtime/platform/common.c; do
     n=$(basename "$f" .c)
     case "$n" in *_win|*_sdl) continue ;; esac
     out=$("$CC" "${FLAGS[@]}" "${EXTRA[@]}" -fsyntax-only "$f" 2>&1)
