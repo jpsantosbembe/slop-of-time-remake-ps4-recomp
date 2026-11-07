@@ -54,7 +54,11 @@ void rt_fatal(const char *fmt, ...) {
     rt_log("fatal: memory commit: this process %.0f MB, the system %.0f of %.0f MB", proc, used, limit);
     fflush(stdout);
     fflush(stderr);
+#ifdef __ORBIS__
+    plat_exit(70);   // ocarina-ps4: o _Exit do musl faz exit_group, que o kernel do PS4 mata com SIGSYS
+#else
     _Exit(70);
+#endif
 }
 
 static const RtModule *module_at(uint64_t pc) {

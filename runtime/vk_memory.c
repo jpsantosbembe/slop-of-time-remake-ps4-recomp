@@ -119,6 +119,11 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->import_lo = addr & ~(al - 1);
     r->import_hi = (addr + size + al - 1) & ~(al - 1);
     uint64_t n = r->import_hi - r->import_lo;
+#ifdef __ORBIS__
+    // ocarina-ps4: com o commit preguiçoso (platform/orbis.c), páginas do pool podem ainda não estar mapeadas
+    extern void orbis_mem_prefault(uint64_t addr, uint64_t n);
+    orbis_mem_prefault(r->import_lo, n);
+#endif
     VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult res = p_host_props ? p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                (void *)(uintptr_t)r->import_lo, &hp)

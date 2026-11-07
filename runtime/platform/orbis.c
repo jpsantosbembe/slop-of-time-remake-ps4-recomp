@@ -822,10 +822,12 @@ typedef struct {
 } Resv;
 
 static void fault_install(void);   // o tratador do write-watch (abaixo)
+static int ww_fault(uint64_t a);
 
 static Resv resv[MAX_RESV];
 static volatile int32_t nresv;   // entradas só são acrescentadas; o tratador de sinal lê sem trava
 static PlatMutex vm_lock = PLAT_MUTEX_INIT;
+static uint64_t mapped_bytes;   // memória direta mapeada nas reservas (plat_commit_info)
 
 static uint64_t down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
 static uint64_t up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
@@ -914,7 +916,52 @@ static int map_window(Resv *r, uint64_t a) {
     }
     memset(va, 0, len);   // nenhuma fonte diz que a memória direta nova vem zerada
     __atomic_store_n(&r->win[(w - r->win_base) / WIN], 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&mapped_bytes, len, __ATOMIC_RELAXED);
     return 1;
+}
+
+// ---- commit preguiçoso (ocarina-ps4, 2026-11-07). O OoT pede um heap de 6,2 GiB de uma vez (nninitStartup:
+// SetHeapSize 0x18ac00000), mais do que a memória direta inteira do PS4. Com o commit preguiçoso, plat_mem_commit só
+// marca as subpáginas; a janela de 2 MiB é mapeada no primeiro toque da CPU (lazy_fault, no tratador de SIGSEGV) ou
+// antes de o kernel ou a GPU escreverem nela (orbis_mem_prefault: pread e importação de pool). O console só gasta o que
+// o jogo usa. OCARINA_EAGER_COMMIT=1 volta ao commit imediato.
+static int lazy_commit(void) {
+    static int on = -1;
+    if (on < 0) {
+        char v[8];
+        on = !(plat_getenv("OCARINA_EAGER_COMMIT", v, sizeof v) && v[0] == '1');
+    }
+    return on;
+}
+
+// Mapeia (se ainda não) a janela que contém a, numa reserva; aplica as proteções dela. vm_lock tomado aqui.
+static int map_window_locked(Resv *r, uint64_t a) {
+    plat_mutex_lock(&vm_lock);
+    int ok = win_mapped(r, a) || map_window(r, a);
+    if (ok) {
+        uint64_t w = down(a, WIN);
+        apply_range(r, w > r->base ? w : r->base, w + WIN < r->end ? w + WIN : r->end);
+    }
+    plat_mutex_unlock(&vm_lock);
+    return ok;
+}
+
+// Falta numa janela ainda não mapeada de subpágina commitada: mapeia e devolve a instrução. Subpágina não commitada é
+// uma falta de verdade (0). Nenhum código que segura vm_lock toca memória do jogo de janela não mapeada.
+static int lazy_fault(uint64_t a) {
+    Resv *r = resv_of(a);
+    if (!r || win_mapped(r, a) || __atomic_load_n(&r->sub[(a - r->base) / SUB], __ATOMIC_RELAXED) < SS_NONE) return 0;
+    return map_window_locked(r, a);
+}
+
+// Garante as janelas de [addr, addr + n) mapeadas: o kernel (pread) e a GPU (importação) não geram falta, só erro.
+void orbis_mem_prefault(uint64_t addr, uint64_t n) {
+    if (!n) return;
+    for (uint64_t w = down(addr, WIN); w < addr + n; w += WIN) {
+        uint64_t at = w < addr ? addr : w;
+        Resv *r = resv_of(at);
+        if (r && !win_mapped(r, at)) map_window_locked(r, at);
+    }
 }
 
 // A reserva exige endereço e tamanho múltiplos de 16 KiB (a página do PS4); as do runtime são (módulos alinhados a
@@ -992,7 +1039,7 @@ int plat_mem_commit(uint64_t addr, size_t n) {
     int ok = r != NULL;
     uint64_t a = down(addr, KPAGE), end = up(addr + n, KPAGE);
     uint64_t lo = a, hi = end;   // o que precisa de proteção aplicada: o pedido e as janelas novas
-    for (uint64_t w = down(a, WIN); ok && w < end; w += WIN) {
+    for (uint64_t w = down(a, WIN); ok && !lazy_commit() && w < end; w += WIN) {
         uint64_t at = w > r->base ? w : r->base;
         if (win_mapped(r, at)) continue;
         ok = map_window(r, at);
@@ -1162,6 +1209,7 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
     uint64_t a = *(uint64_t *)((char *)si + 24);
     const uint64_t *uc = ucv;
     if (sig == ORBIS_SIGSEGV || sig == ORBIS_SIGBUS) {
+        if (lazy_fault(a)) return;
         if (ww_fault(a)) return;
         if (fault_hook && fault_hook(a)) return;
     }
@@ -1217,7 +1265,7 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
 void plat_reexec(void) {
     fprintf(stderr, "FATAL: plat_reexec não existe no PS4 (uma região fixa da memória estava ocupada)\n");
     fflush(stderr);
-    _exit(70);
+    plat_exit(70);
 }
 
 // ---- leitura de memória sem falta: sceKernelVirtualQuery em cada trecho (flags 0: o mapa que contém o endereço; a
@@ -1275,6 +1323,10 @@ void plat_file_close(PlatFile *f) {
 }
 
 int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
+    // O kernel escreve direto no buffer: janela não mapeada ou página vigiada (CPU só leitura) dariam EFAULT, não falta.
+    orbis_mem_prefault((uint64_t)(uintptr_t)buf, n);
+    for (uint64_t pg = down((uint64_t)(uintptr_t)buf, KPAGE); n && pg < (uint64_t)(uintptr_t)buf + n; pg += KPAGE)
+        ww_fault(pg);
     ssize_t k;
     do k = pread(fd_of(f), buf, n, (off_t)off);
     while (k < 0 && errno == EINTR);
@@ -1392,6 +1444,7 @@ PlatFile *plat_fs_create(const char *path, int *err) {
 }
 
 int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint32_t n, uint64_t off) {
+    orbis_mem_prefault((uint64_t)(uintptr_t)buf, n);   // o kernel lê direto do buffer (commit preguiçoso)
     ssize_t k;
     do k = pwrite(fd_of(f), buf, n, (off_t)off);
     while (k < 0 && errno == EINTR);
@@ -1611,7 +1664,12 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     *total_mb = (float)(sceKernelGetDirectMemorySize() >> 20);
 }
 
-void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) { *proc_mb = *used_mb = *limit_mb = -1; }
+// proc: memória direta mapeada nas reservas do runtime; limit: a memória direta do processo.
+void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
+    *proc_mb = (double)__atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) / (1 << 20);
+    *used_mb = -1;
+    *limit_mb = (double)sceKernelGetDirectMemorySize() / (1 << 20);
+}
 
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) { *resident = *private_bytes = 0; }
 
