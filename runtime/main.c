@@ -437,11 +437,23 @@ static int selftest(void) {
     return failures ? 1 : 0;
 }
 
+// --seed-nvn2: os estágios NVN 2 crus de seed-nvn2.bin, ao lado do executável, viram a semente de --prepare-shaders
+// (gfx_shader.c gfx_shader_seed_nvn2; tools/oot/oot_shader_seed.py grava a entrada e chama este modo).
+int gfx_shader_seed_nvn2(const char *dir);
+static int seed_nvn2(void) {
+    char exe[PLAT_PATH_MAX * 2];
+    int n = plat_exe_path(exe, sizeof exe);
+    char *cut = n && n < (int)sizeof exe ? plat_last_sep(exe) : NULL;
+    if (!cut) return fprintf(stderr, "seed-nvn2: sem a pasta do executável\n"), 1;
+    *cut = 0;
+    return gfx_shader_seed_nvn2(exe);
+}
+
 static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-shader-geometry | --probe-vkmem | "
-                    "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --prepare-shaders | --seed-nvn2 | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -554,6 +566,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();
     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
+    if (!strcmp(mode, "--seed-nvn2")) return seed_nvn2();
     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
     if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
     return usage(argv[0]);
