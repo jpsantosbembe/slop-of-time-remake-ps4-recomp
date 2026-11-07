@@ -489,7 +489,15 @@ static void portable_paths(RtConfig *c) {
     c->profile = portable_path(exe, "TOTK_PROFILE_DIR", "profile", NULL, pp_profile, sizeof pp_profile, c->profile);
 }
 
+#ifdef __ORBIS__
+int orbis_boot_args(int *argc, char ***argv);   // platform/orbis.c: /data/ocarina/args.txt
+int probe_orbis(void);                          // probe_orbis.c: --probe-orbis, o runtime no console sem o jogo
+#endif
+
 int main(int argc, char **argv) {
+#ifdef __ORBIS__
+    orbis_boot_args(&argc, &argv);   // antes de tudo: as variáveis do args.txt valem para o mem_init e o totk.ini
+#endif
     mem_init();   // first: claim the guest address space before anything else can land there; reads totk.ini
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -530,13 +538,20 @@ int main(int argc, char **argv) {
     }
     if (cfg.shot && !cfg.seconds) return usage(argv[0]);
     if (cfg.seconds && mode) return usage(argv[0]);
+#ifdef __ORBIS__
+    log_open(1);   // PS4: sem terminal, o log de todo modo vai para /data/ocarina/logs/totk.log
+#else
     log_open(!mode);
+#endif
     if (!mode) {
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
         rt_boot();
         return 0;
     }
     if (!strcmp(mode, "--selftest")) return selftest();
+#ifdef __ORBIS__
+    if (!strcmp(mode, "--probe-orbis")) return probe_orbis();
+#endif
     if (!strcmp(mode, "--probe-loader")) return probe_loader();
     if (!strcmp(mode, "--probe-cfg")) return probe_cfg();
 #ifdef _WIN32

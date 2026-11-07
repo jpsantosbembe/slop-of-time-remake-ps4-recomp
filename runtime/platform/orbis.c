@@ -102,12 +102,57 @@ static void fx_wake(volatile uint32_t *w, int n) { _umtx_op((void *)w, UMTX_OP_W
 
 // ---- threads
 
+// ---- pilhas de thread e de fibra em memória direta. A memória flexível do processo (onde o pthread_create da Sony e o
+// mmap anônimo põem as pilhas) é de ~400 MiB no total e física desde a criação; a 16 MiB por thread
+// (PLAT_STACK_DEFAULT), duas dúzias de threads a esgotariam. As pilhas vêm então da memória direta (~5 GiB, a mesma do
+// guest), mapeada só para a CPU, com a página mais baixa (16 KiB) sem acesso: um estouro falta em vez de corromper.
+// OCARINA_STACK_KIB=<KiB> troca o tamanho padrão (PLAT_STACK_DEFAULT) de threads e fibras que não escolhem.
+// Sem memória direta livre, a thread volta à pilha flexível do pthread (com o tamanho pedido) e a fibra ao mmap.
+#define STACK_PAGE 0x4000ull   // página do PS4
+
+typedef struct { void *va; size_t len; int64_t off; } DStack;   // va == NULL: nenhuma (pilha do sistema ou do mmap)
+
+static size_t stack_default(void) {
+    static size_t v;
+    if (!v) {
+        const char *e = getenv("OCARINA_STACK_KIB");
+        long k = e && *e ? strtol(e, NULL, 10) : 0;
+        v = k >= 256 && k <= (1 << 20) ? (size_t)k << 10 : PLAT_STACK_DEFAULT;
+    }
+    return v;
+}
+
+// len bytes usáveis acima da página de guarda; 1 quando deu.
+static int dstack_alloc(DStack *s, size_t len) {
+    len = (len + STACK_PAGE - 1) & ~(size_t)(STACK_PAGE - 1);
+    len += STACK_PAGE;
+    int64_t off = 0;
+    void *va = NULL;
+    if (sceKernelAllocateDirectMemory(0, (int64_t)sceKernelGetDirectMemorySize(), len, STACK_PAGE, K_WB_ONION, &off))
+        return 0;
+    if (sceKernelMapDirectMemory(&va, len, K_PROT_CPU_R | K_PROT_CPU_W, 0, off, STACK_PAGE)) {
+        sceKernelReleaseDirectMemory(off, len);
+        return 0;
+    }
+    sceKernelMprotect(va, STACK_PAGE, 0);   // a guarda; se o kernel recusar, a pilha só fica sem ela
+    s->va = va, s->len = len, s->off = off;
+    return 1;
+}
+
+static void dstack_free(DStack *s) {
+    if (!s->va) return;
+    sceKernelMunmap(s->va, s->len);
+    sceKernelReleaseDirectMemory(s->off, s->len);
+    s->va = NULL;
+}
+
 struct PlatThread {
     pthread_t t;
     PlatThreadFn fn;
     void *arg;
     volatile uint32_t done;   // 1 quando fn voltou (plat_thread_join_ns espera nisto)
     char name[32];
+    DStack stk;               // a pilha em memória direta; liberada no join (de thread desanexada, nunca)
 };
 
 // Pilha de sinal da thread, para os tratadores de falta rodarem mesmo com a pilha dela esgotada. O sigaltstack é o
@@ -139,18 +184,35 @@ PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name) {
     return plat_thread_new_ex(fn, arg, name, 0);
 }
 
-// A pilha vem da memória flexível do processo (~400 MiB no total) e, ao contrário do Linux, é física desde a criação:
-// 16 MiB por thread (PLAT_STACK_DEFAULT) pesam. A medir no console antes de reduzir.
+// A pilha vem da memória direta (dstack_alloc) e entra por pthread_attr_setstack, que a libkernel exporta; com ela
+// maior que o piso do overlay (2 MiB), o interpositor do orbis-compat passa o attr adiante sem mexer. A CONFIRMAR NO
+// CONSOLE: que o pthread da Sony aceita uma pilha de memória direta. Se o pthread_create recusar, a thread nasce com
+// a pilha flexível do sistema no mesmo tamanho (o caminho antigo) e isso fica no log uma vez.
 PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
     PlatThread *t = calloc(1, sizeof *t);
     if (!t) return NULL;
     t->fn = fn;
     t->arg = arg;
     if (name) snprintf(t->name, sizeof t->name, "%s", name);
+    size_t size = stack ? stack : stack_default();
     pthread_attr_t a;
     pthread_attr_init(&a);
-    pthread_attr_setstacksize(&a, stack ? stack : PLAT_STACK_DEFAULT);
-    int e = pthread_create(&t->t, &a, thread_main, t);
+    int e = -1;
+    if (dstack_alloc(&t->stk, size)) {
+        if (!pthread_attr_setstack(&a, (char *)t->stk.va + STACK_PAGE, t->stk.len - STACK_PAGE))
+            e = pthread_create(&t->t, &a, thread_main, t);
+        if (e) {
+            static int said;
+            if (!said) said = 1, fprintf(stderr, "plat: pilha em memória direta recusada (%d): pilhas flexíveis\n", e);
+            dstack_free(&t->stk);
+            pthread_attr_destroy(&a);
+            pthread_attr_init(&a);
+        }
+    }
+    if (e) {
+        pthread_attr_setstacksize(&a, size);
+        e = pthread_create(&t->t, &a, thread_main, t);
+    }
     pthread_attr_destroy(&a);
     if (e) { free(t); return NULL; }
     return t;
@@ -164,6 +226,7 @@ int plat_thread_spawn(PlatThreadFn fn, void *arg, const char *name, size_t stack
 
 void plat_thread_join(PlatThread *t) {
     pthread_join(t->t, NULL);
+    dstack_free(&t->stk);
     free(t);
 }
 
@@ -178,11 +241,14 @@ int plat_thread_join_ns(PlatThread *t, uint64_t ns) {
         fx_wait(&t->done, 0, end - now);
     }
     pthread_join(t->t, NULL);
+    dstack_free(&t->stk);
     free(t);
     return 1;
 }
 
-// A thread continua usando t->fn e t->arg, então a struct fica alocada (alguns bytes por thread desanexada).
+// A thread continua usando t->fn e t->arg, então a struct fica alocada (alguns bytes por thread desanexada). A pilha em
+// memória direta também fica: ninguém sabe quando a thread desanexada acaba de usá-la. As threads desanexadas do
+// runtime vivem até o fim do processo, então isso não vaza na prática.
 void plat_thread_detach(PlatThread *t) { pthread_detach(t->t); }
 
 // STUB: afinidade. O caminho é scePthreadSetaffinity / sceKernelSetCpumask, ainda não medido; o runtime segue sem
@@ -238,8 +304,9 @@ int plat_intr_resume(PlatIntr *t, uint64_t to) {
 // alinhada a 16). A ABI SysV x86-64 é a mesma no PS4.
 struct PlatFiber {
     void *sp;
-    void *stack;   // pilha mapeada (NULL para o contexto da própria thread)
+    void *stack;   // pilha do mmap, a reserva quando não há memória direta (NULL: a da própria thread ou a direta)
     size_t size;
+    DStack stk;    // a pilha em memória direta (dstack_alloc)
 };
 
 void plat_fiber_swap(void **save, void *load);
@@ -298,20 +365,27 @@ void plat_fiber_unself(void) { fiber_cur = NULL; }
 
 #define KPAGE 0x4000ull   // página do PS4
 
-// A pilha é memória flexível e física desde o mmap (o PS4 não faz overcommit), não reservada como no Linux. A página
-// mais baixa (16 KiB, a página do PS4) fica inacessível: um estouro falta em vez de corromper.
+// A pilha vem da memória direta, como a das threads (dstack_alloc, com a página de guarda); sem memória direta livre,
+// do mmap (memória flexível, física desde já: o PS4 não faz overcommit), também com a página mais baixa inacessível.
 PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     PlatFiber *f = calloc(1, sizeof *f);
     if (!f) return NULL;
+    if (!stack) stack = stack_default();
     stack = (stack + KPAGE - 1) & ~(size_t)(KPAGE - 1);
     if (stack < 2 * KPAGE) stack = 2 * KPAGE;
-    void *m = mmap(NULL, stack, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (m == MAP_FAILED) {
-        free(f);
-        return NULL;
+    void *m;
+    if (dstack_alloc(&f->stk, stack)) {
+        m = f->stk.va;
+        stack = f->stk.len;
+    } else {
+        m = mmap(NULL, stack, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (m == MAP_FAILED) {
+            free(f);
+            return NULL;
+        }
+        mprotect(m, KPAGE, PROT_NONE);
+        f->stack = m, f->size = stack;
     }
-    mprotect(m, KPAGE, PROT_NONE);
-    f->stack = m, f->size = stack;
     uint64_t *top = (uint64_t *)(((uintptr_t)m + stack) & ~(uintptr_t)15);
     uint64_t *sp = top - 10;   // estado da FPU (2 palavras), r15, r14, r13, r12, rbx, rbp, retorno, enchimento
     sp[0] = 0x037f;            // palavra de controle x87: a padrão
@@ -335,6 +409,7 @@ void plat_fiber_switch(PlatFiber *to) {
 void plat_fiber_free(PlatFiber *f) {
     if (!f) return;
     if (f->stack) munmap(f->stack, f->size);
+    dstack_free(&f->stk);
     free(f);
 }
 
@@ -507,6 +582,38 @@ void plat_cond_broadcast(PlatCond *c) {
 // orbis-compat orbis_paths.h). Os dados do app estão em /app0 (somente leitura); o que o runtime grava vai para
 // /data/ocarina, que também ancora os caminhos relativos.
 #define ORBIS_DATA_DIR "/data/ocarina"
+
+// ---- argumentos: o PS4 não passa linha de comando a um app. orbis_boot_args lê ORBIS_DATA_DIR/args.txt (uma entrada
+// por linha; vazias e as começadas por # são ignoradas): NOME=valor vira variável de ambiente (setenv, valendo para o
+// cfg_get, o TOTK_* e os knobs do Mesa, todos neste executável), e o resto vira argumentos, separados por espaço
+// ("--probe-orbis", "--seconds 30"). main.c chama isto antes de tudo, antes do mem_init. Sem o arquivo, nada muda.
+int orbis_boot_args(int *argc, char ***argv) {
+    FILE *f = fopen(ORBIS_DATA_DIR "/args.txt", "r");
+    if (!f) return 0;
+    enum { MAX_ARGS = 64 };
+    static char *av[MAX_ARGS + 1];
+    int ac = 0, envs = 0;
+    av[ac++] = *argc > 0 && (*argv)[0] ? (*argv)[0] : (char *)"/app0/eboot.bin";
+    for (int i = 1; i < *argc && ac < MAX_ARGS; i++) av[ac++] = (*argv)[i];
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *p = line, *end = line + strlen(line);
+        while (end > p && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;
+        char *eq = strchr(p, '=');
+        if (*p != '-' && eq && eq > p) {
+            *eq = 0;
+            if (!setenv(p, eq + 1, 1)) envs++;
+            continue;
+        }
+        for (char *tok = strtok(p, " \t"); tok && ac < MAX_ARGS; tok = strtok(NULL, " \t")) av[ac++] = strdup(tok);
+    }
+    fclose(f);
+    av[ac] = NULL;
+    *argc = ac, *argv = av;
+    return envs + ac - 1;
+}
 
 int plat_full_path(const char *path, char *out, size_t cap) {
     if (path[0] == '/') return snprintf(out, cap, "%s", path) < (int)cap;
@@ -1305,8 +1412,12 @@ int plat_temp_dir(char *out, size_t cap) {
     return snprintf(out, cap, "%s", ORBIS_DATA_DIR "/tmp") < (int)cap;
 }
 
-// O executável é sempre /app0/eboot.bin; o diretório dele é somente leitura.
-int plat_exe_path(char *out, size_t cap) { return snprintf(out, cap, "/app0/eboot.bin") < (int)cap; }
+// O executável é /app0/eboot.bin, mas /app0 é somente leitura e o PKG só leva o eboot. O runtime usa plat_exe_path
+// apenas para achar a pasta "ao lado do executável" (totk.ini, shader-cache, pipeline-cache.bin, romfs-index.bin,
+// romfs-patches, exefs/romfs/profile portáteis, mesa-cache, logs): no PS4 essa pasta é /data/ocarina, então o caminho
+// devolvido é o de um eboot.bin que estaria lá. Ninguém lê o arquivo em si (plat_exe_base e plat_module_of não usam
+// isto). A alternativa seria um TOTK_* por caminho no args.txt.
+int plat_exe_path(char *out, size_t cap) { return snprintf(out, cap, ORBIS_DATA_DIR "/eboot.bin") < (int)cap; }
 
 // Sem dladdr: o início do .text pelo símbolo do script de ligação.
 uintptr_t plat_exe_base(void) { return (uintptr_t)__text_start; }
