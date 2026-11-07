@@ -327,12 +327,12 @@
 +
 +            // LOCAL TEST (Ocarina): the address does not come straight from a constant buffer, so it may be a pointer read
 +            // from memory, which no static search finds. The runtime lists, per dispatch, the buffers reachable from the bound
-+            // tables at c0 + 0x800 (vk_exec_draw.c dyn_collect); the range guards pick the one that holds the address.
++            // tables at c0 + 0x900 (vk_exec_draw.c dyn_collect); the range guards pick the one that holds the address.
 +            if (!FindUniqueBaseAddressCb(gtsContext, block, operation.GetSource(0), needsOffset: false).Found)
 +            {
 +                for (int index = 0; index < 32; index++)
 +                {
-+                    AddCandidate(new SearchResult(0, (0x800 + 16 * index) / 4));
++                    AddCandidate(new SearchResult(0, (0x900 + 16 * index) / 4));
 +                }
 +            }
 +

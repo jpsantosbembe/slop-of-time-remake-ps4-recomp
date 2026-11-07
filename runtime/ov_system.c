@@ -76,7 +76,7 @@ static const char *switch_language(const char *tag) {
     if (!strcmp(lang, "ja") || !strcmp(lang, "de") || !strcmp(lang, "it") || !strcmp(lang, "nl") ||
         !strcmp(lang, "ru") || !strcmp(lang, "ko") || !strcmp(lang, "pt"))
         return !strcmp(lang, "ja") ? "ja" : !strcmp(lang, "de") ? "de" : !strcmp(lang, "it") ? "it"
-             : !strcmp(lang, "nl") ? "nl" : !strcmp(lang, "ru") ? "ru" : !strcmp(lang, "ko") ? "ko" : "pt";
+             : !strcmp(lang, "nl") ? "nl" : !strcmp(lang, "ru") ? "ru" : !strcmp(lang, "ko") ? "ko" : "pt-BR";   // Ocarina ships Brazilian Portuguese only
     if (!strcmp(lang, "fr")) return !strcmp(region, "CA") ? "fr-CA" : "fr";
     if (!strcmp(lang, "es")) return *region && strcmp(region, "ES") ? "es-419" : "es";
     if (!strcmp(lang, "zh"))
@@ -918,7 +918,7 @@ HOST_OVERRIDE("_ZN2nn3aoc17CountAddOnContentEv", ov_aoc_none);
 // not copied, as with a real setjmp. Only the copy's frames must be unchanged since: frames above the caller are suspended.
 // ponytail: x86-64 Windows; a fixed number of buffers, oldest replaced; host locks held by host functions between setjmp
 // and longjmp are not released, none of the callers has any.
-#if defined(_WIN32) && defined(__x86_64__)
+#if (defined(_WIN32) || defined(__linux__)) && defined(__x86_64__)
 enum { JMP_RECORDS = 32, JMP_STACK = 64 * 1024 };
 typedef struct {
     uint64_t key;   // the guest jmp_buf
@@ -935,9 +935,13 @@ static unsigned jmp_next;
 static PlatMutex jmp_lock = PLAT_MUTEX_INIT;
 
 static char *teb_stack_base(void) {
+#if defined(_WIN32)
     char *base;
     __asm__ volatile("movq %%gs:8, %0" : "=r"(base));
     return base;
+#else
+    return plat_stack_top();   // Linux: no TEB; the platform layer knows the current stack's top
+#endif
 }
 static JmpRecord *jmp_find(uint64_t key, int make) {
     JmpRecord *r = NULL;

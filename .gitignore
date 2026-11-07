@@ -15,6 +15,7 @@ __pycache__/
 /game/
 /build/
 /generated/
+/perfil/
 *.xci
 *.xcz
 *.nsp
@@ -74,3 +75,8 @@ desktop.ini
 
 # Agent task worktrees (tools/worktree.py)
 /.worktrees/
+/logs/
+/ultima-partida*.log
+
+# the shader preparation seed: bundled into the setup ZIP by tools/oot/make_setup.py --seed, never committed
+tools/data/oot-seed/

@@ -6,7 +6,7 @@
 param([string]$Jogo)
 
 $PT = (Get-UICulture).TwoLetterISOLanguageName -eq 'pt'
-function L($pt, $en) { if ($PT) { return $pt } return $en }
+function L($textoPt, $textoEn) { if ($PT) { return $textoPt } return $textoEn }   # not $pt: names are case-insensitive, it would hide $PT
 $script:falhas = 0
 
 function Item($ok, $texto, $correcao) {

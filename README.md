@@ -15,6 +15,7 @@ Experimental. Só foi testado em **um PC** (Ryzen 9 9950X3D, RTX 5090), na regi�
 
 | O quê | Situação |
 |---|---|
+| Abertura e jogo novo, até a Árvore Deku | ✅ Funciona |
 | Vilarejo Kokiri: árvores, plantas, casas, luz | ✅ Funciona |
 | Som, controle, saves e vídeos | ✅ Funciona |
 | Desempenho na RTX 5090 | ✅ Cerca de 59 fps parado, 51 a 55 fps caminhando |
@@ -27,14 +28,18 @@ Experimental. Só foi testado em **um PC** (Ryzen 9 9950X3D, RTX 5090), na regi�
 
 O jogo não vem pronto: ele é compilado no seu PC, a partir da sua cópia. Escolha um destes três jeitos.
 
-**1. Com o instalador, o mais fácil:**
+**1. Com o instalador em ZIP, o mais fácil:** não instala nada no Windows e não pede administrador.
 
-1. Baixe o **[Instalar-Ocarina.exe](https://github.com/sostenesfreitas/ocarina-recomp/releases/latest/download/Instalar-Ocarina.exe)** e dê dois cliques.
-2. O executável não tem assinatura digital, então o Windows pode avisar. Clique em **Mais informações** e depois em **Executar assim mesmo**.
-3. Na janela, escolha o `.nup` do seu jogo (ou uma pasta com `exefs` e `romfs`) e clique em **Instalar**.
-4. Se o Windows pedir permissão para instalar as ferramentas, clique em **Sim**.
+1. Baixe o **`Ocarina-Setup-...-windows.zip`** da [página de versões](https://github.com/sostenesfreitas/ocarina-recomp/releases/latest).
+2. **Extraia o ZIP inteiro** para uma pasta e abra o `Instalar-Ocarina.exe` que está dentro dela.
+3. O executável não tem assinatura digital, então o Windows pode avisar. Clique em **Mais informações** e depois em **Executar assim mesmo**.
+4. Na janela, escolha o `.nup` do seu jogo (ou uma pasta com `exefs` e `romfs`) e clique em **Instalar**.
+5. No fim, clique em **Jogar**, ou use o atalho **Ocarina Recomp** na Área de Trabalho.
 
-Prefere conferir antes? O executável só abre o [script do instalador](instalador/Instalar-Ocarina.ps1), e o [código dele](instalador/launcher.c) tem poucas linhas. A release traz o SHA-256 do arquivo. Antivírus às vezes reclamam de programas sem assinatura.
+Para desinstalar, apague a pasta de instalação. Prefere conferir antes? O executável só abre o script `instalador\Instalar-Ocarina.ps1`, que está ao lado dele no ZIP e pode ser lido em qualquer editor. O [código do executável](instalador/launcher.c) tem poucas linhas. Alguns antivírus reclamam de programas novos sem assinatura e de scripts do PowerShell: é um alarme possível, e o código está todo aqui para quem quiser conferir. A página de versões traz o SHA-256 do arquivo.
+
+> [!NOTE]
+> A etapa "Preparar os arquivos do jogo" é lenta, principalmente em HD: enquanto o relógio da janela andar, está funcionando.
 
 **2. Com os scripts, que você pode ler antes de rodar** (instale antes as ferramentas do passo 1 do [guia](docs/compilar-manual.md)):
 
@@ -54,9 +59,33 @@ powershell -ExecutionPolicy Bypass -File .\compilar.ps1 -Jogo "C:\caminho\seu-jo
 
 **3. Totalmente à mão:** siga o **[passo a passo para compilar](docs/compilar-manual.md)**.
 
+**No Linux:** o `compilar.sh` faz os mesmos passos e o `jogar/jogar-ocarina.sh` abre o jogo. Os pacotes e o estado do
+port estão em [docs/building.md](docs/building.md#linux-in-progress).
+
+```sh
+git clone https://github.com/sostenesfreitas/ocarina-recomp
+cd ocarina-recomp
+./compilar.sh --jogo /caminho/seu-jogo.nup
+./jogar/jogar-ocarina.sh
+```
+
+### Trazer o save de um emulador
+
+O save do Lichii, do Eden e de emuladores parecidos funciona aqui. No fim da instalação, clique em **Importar save de emulador**, ou rode depois:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File jogar\importar-save.ps1
+```
+
+Ele acha o save sozinho ou pergunta a pasta, guarda uma cópia do seu save atual e não altera o emulador.
+
+### Idioma
+
+O jogo escolhe o idioma pelo do Windows, inclusive português do Brasil. Para trocar, aperte **F1** e vá em **Jogo → Idioma**.
+
 ### O que isto faz no seu PC
 
-- Os scripts não pedem administrador. Instalar as ferramentas pode pedir: o instalador faz isso por você, e nos outros jeitos é você quem roda.
+- O instalador em ZIP e os scripts não pedem administrador. Só as ferramentas dos jeitos 2 e 3 podem pedir, e é você quem as instala.
 - Escreve só dentro da pasta do projeto, e nunca altera o seu arquivo do jogo.
 - Baixa os pacotes Python (`tools\requirements-build.txt`) e .NET do tradutor de shaders e, se o executável do jogo estiver comprimido, o [zbic](https://github.com/kinnay/zbic).
 - Para desinstalar, apague a pasta do projeto. As ferramentas do passo 1 saem pelo painel de aplicativos do Windows.
@@ -71,7 +100,8 @@ Leva de 30 minutos a 2 horas, e você pode usar o PC enquanto isso. Para atualiz
 - Windows 10 ou 11 de 64 bits, com processador compatível com AVX2.
 - Placa de vídeo com Vulkan 1.3 e mesh shaders, com o driver atualizado. Recomendamos NVIDIA.
 - Recomendamos 16 GB de RAM ou mais. Com menos, nunca testamos: a compilação ou o jogo podem falhar.
-- 60 GB livres, mais uns 15 GB no disco C: se as ferramentas ainda não estiverem instaladas.
+- Com 16 GB de RAM, aumente o arquivo de paginação do Windows antes de jogar (inicial 16384 MB, máximo 32768 MB): na primeira vez o jogo pode chegar a uns 24 GB de memória, e o Windows fecha o jogo se passar do limite. O instalador avisa quando o limite é baixo.
+- 40 GB livres com o instalador em ZIP. Nos outros dois jeitos, 60 GB, mais uns 15 GB no disco C: para as ferramentas.
 - Internet durante a instalação.
 - **Sua cópia do jogo na versão 1.1.1.** Outras versões não funcionam.
 
@@ -81,6 +111,7 @@ Leva de 30 minutos a 2 horas, e você pode usar o PC enquanto isso. Para atualiz
 |---|---|
 | "Este jogo não é a versão 1.1.1" | Confira se escolheu o jogo certo e atualizado |
 | O jogo abre e fecha | Atualize o driver da placa de vídeo e veja o arquivo `ultima-partida-erros.log` na pasta de instalação |
+| O jogo fechou no meio | O log de cada partida fica guardado em `logs\` (as últimas 10). `jogar\medir-partida.ps1` mostra o crash e o desempenho. |
 | Travadinhas na primeira vez | É normal: os shaders estão sendo preparados. Melhora quando você passa de novo pelo mesmo lugar |
 
 Se continuar, [abra uma issue](https://github.com/sostenesfreitas/ocarina-recomp/issues) com a mensagem de erro e o modelo da sua placa de vídeo. Nunca envie arquivos do jogo.

@@ -4,6 +4,9 @@
 
 The game is built on your PC from your copy. These are all the steps. After step 2, `compilar.ps1` can run steps 3 to 8 for you: see the [README](../README.en.md#how-to-build).
 
+On Linux, `./compilar.sh --jogo <your game>` runs these steps with POSIX paths; see
+[building.md](building.md#linux-in-progress) for the packages.
+
 You need your own copy of the game at **version 1.1.1** and 60 GB free, plus about 15 GB on C: for the tools. We recommend 16 GB of RAM: we never tested with less, and the build or the game may fail. Use a folder with no spaces or accents. All commands are for **PowerShell**.
 
 ## 1. Install the tools

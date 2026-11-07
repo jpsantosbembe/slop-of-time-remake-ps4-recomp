@@ -19,13 +19,25 @@ static inline int romfs_path_valid_relative(const char *path) {
 }
 
 // "<mount>:/<path>" -> "<path>", or NULL. Audio stream requests join a mount root and a leading-slash resource,
-// producing "content://Sound/...": repeated root separators are skipped; traversal, backslashes and empty interior
-// components are still rejected.
+// producing "content://Sound/...": repeated root separators are skipped. Repeated separators inside the path collapse
+// too (Ocarina of Time's speech: "content://Voice/Resource//Stream/x.bwav"); the result then lives in a per-thread
+// buffer until this thread's next call. Traversal and backslashes are still rejected.
 static inline const char *romfs_path_relative(const char *mount, const char *path) {
     if (!mount || !*mount || !path) return NULL;
     size_t size = strlen(mount);
     if (strncmp(path, mount, size) || path[size] != ':' || path[size + 1] != '/') return NULL;
     path += size + 2;
     while (*path == '/') ++path;
+    if (strstr(path, "//")) {
+        static _Thread_local char collapsed[4096];
+        size_t n = 0;
+        for (const char *q = path; *q; q++) {
+            if (*q == '/' && (q[1] == '/' || !q[1])) continue;
+            if (n + 1 >= sizeof collapsed) return NULL;
+            collapsed[n++] = *q;
+        }
+        collapsed[n] = 0;
+        path = collapsed;
+    }
     return romfs_path_valid_relative(path) ? path : NULL;
 }
