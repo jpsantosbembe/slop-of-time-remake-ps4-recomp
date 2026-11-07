@@ -123,8 +123,25 @@ static size_t stack_default(void) {
     return v;
 }
 
-// len bytes usáveis acima da página de guarda; 1 quando deu.
+// Teto das pilhas em memória direta (ocarina-ps4, 2026-11-07). O kernel.c pede 256 MiB de pilha de host por thread e
+// por fibra do guest (HOST_STACK, "reservada, commitada sob demanda" no Linux e no Windows); aqui a memória direta é
+// física desde já, e oito threads levavam 2 GiB, o que derrubou o primeiro boot do OoT ("cannot start a guest thread").
+// OCARINA_STACK_CAP_MIB=<MiB> (padrão 8) limita cada pilha. TODO: pilhas preguiçosas (reserva + janelas no toque, como
+// o heap) para devolver o tamanho pedido sem gastar memória.
+static uint64_t stack_bytes, stack_count;   // pilhas em memória direta vivas (o monitor de memória mostra)
+static size_t stack_cap(void) {
+    static size_t v;
+    if (!v) {
+        const char *e = getenv("OCARINA_STACK_CAP_MIB");
+        long m = e && *e ? strtol(e, NULL, 10) : 0;
+        v = (m >= 1 && m <= 1024 ? (size_t)m : 8) << 20;
+    }
+    return v;
+}
+
+// len bytes usáveis acima da página de guarda (no máximo stack_cap()); 1 quando deu.
 static int dstack_alloc(DStack *s, size_t len) {
+    if (len > stack_cap()) len = stack_cap();
     len = (len + STACK_PAGE - 1) & ~(size_t)(STACK_PAGE - 1);
     len += STACK_PAGE;
     int64_t off = 0;
@@ -137,6 +154,8 @@ static int dstack_alloc(DStack *s, size_t len) {
     }
     sceKernelMprotect(va, STACK_PAGE, 0);   // a guarda; se o kernel recusar, a pilha só fica sem ela
     s->va = va, s->len = len, s->off = off;
+    __atomic_add_fetch(&stack_bytes, len, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&stack_count, 1, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -145,6 +164,8 @@ static void dstack_free(DStack *s) {
     sceKernelMunmap(s->va, s->len);
     sceKernelReleaseDirectMemory(s->off, s->len);
     s->va = NULL;
+    __atomic_sub_fetch(&stack_bytes, s->len, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&stack_count, 1, __ATOMIC_RELAXED);
 }
 
 struct PlatThread {
@@ -211,6 +232,7 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
         }
     }
     if (e) {
+        if (size > stack_cap()) size = stack_cap();
         pthread_attr_setstacksize(&a, size);
         e = pthread_create(&t->t, &a, thread_main, t);
     }
@@ -374,6 +396,7 @@ PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     if (!stack) stack = stack_default();
     stack = (stack + KPAGE - 1) & ~(size_t)(KPAGE - 1);
     if (stack < 2 * KPAGE) stack = 2 * KPAGE;
+    if (stack > stack_cap()) stack = stack_cap();   // também no mmap de reserva (memória flexível, ~400 MiB no total)
     void *m;
     if (dstack_alloc(&f->stk, stack)) {
         m = f->stk.va;
@@ -950,8 +973,11 @@ static void mem_report(const char *why) {
     // o maior trecho livre contíguo, não a soma: um limite inferior do livre
     sceKernelAvailableDirectMemorySize(0, (int64_t)sceKernelGetDirectMemorySize(), 0x200000, &st, &dfree);
     sceKernelAvailableFlexibleMemorySize(&ffree);
-    rt_log("orbis mem (%s): jogo mapeou %llu MiB; memória direta: maior trecho livre %llu MiB de %llu MiB; flexível "
-           "livre %llu MiB", why, (unsigned long long)(__atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) >> 20),
+    rt_log("orbis mem (%s): jogo mapeou %llu MiB; pilhas %llu (%llu MiB); memória direta: maior trecho livre %llu MiB "
+           "de %llu MiB; flexível livre %llu MiB", why,
+           (unsigned long long)(__atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) >> 20),
+           (unsigned long long)__atomic_load_n(&stack_count, __ATOMIC_RELAXED),
+           (unsigned long long)(__atomic_load_n(&stack_bytes, __ATOMIC_RELAXED) >> 20),
            (unsigned long long)(dfree >> 20), (unsigned long long)(sceKernelGetDirectMemorySize() >> 20),
            (unsigned long long)(ffree >> 20));
 }
