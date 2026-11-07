@@ -745,6 +745,8 @@ def orbis_data_dir(exefs):
     """A pasta de dados do jogo no console, /data/slop/<title id>, com o title ID (16 dígitos hexadecimais minúsculos)
     tirado do Program ID do main.npdm (ACI0 + 0x10): nada do jogo fixo no código. É a mesma convenção do
     ~/ocarina-ps4/game_info.py (campo ps4_data_dir), que o carregador de dev recebe na compilação."""
+    if not (Path(exefs) / 'main.npdm').is_file():
+        sys.exit(f'build_game: sem {exefs}/main.npdm: é dele que sai o title ID da pasta de dados do PS4')
     npdm = (Path(exefs) / 'main.npdm').read_bytes()
     if npdm[:4] != b'META':
         sys.exit(f'build_game: {exefs}/main.npdm não é um NPDM')
