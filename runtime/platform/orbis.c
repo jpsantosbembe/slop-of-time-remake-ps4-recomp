@@ -1040,6 +1040,7 @@ static Resv resv[MAX_RESV];
 static volatile int32_t nresv;   // entradas só são acrescentadas; o tratador de sinal lê sem trava
 static PlatMutex vm_lock = PLAT_MUTEX_INIT;
 static uint64_t mapped_bytes;   // memória direta mapeada nas reservas (plat_commit_info)
+static uint64_t mapped_by_fault, mapped_by_prefault;   // janelas de 2 MiB mapeadas por cada caminho (monitor)
 
 static uint64_t down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
 static uint64_t up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
@@ -1255,9 +1256,16 @@ static void mem_report(const char *why) {
     // o maior trecho livre contíguo, não a soma: um limite inferior do livre
     sceKernelAvailableDirectMemorySize(0, (int64_t)sceKernelGetDirectMemorySize(), 0x200000, &st, &dfree);
     sceKernelAvailableFlexibleMemorySize(&ffree);
-    rt_log("orbis mem (%s): jogo mapeou %llu MiB; pilhas %llu (%llu MiB); memória direta: maior trecho livre %llu MiB "
-           "de %llu MiB; flexível livre %llu MiB; pool interno da libkernel livre %llu KiB", why,
+    extern void vk_vma_usage(uint64_t *dev, uint64_t *host) __attribute__((weak));
+    uint64_t vdev = 0, vhost = 0;
+    if (vk_vma_usage) vk_vma_usage(&vdev, &vhost);
+    rt_log("orbis mem (%s): jogo mapeou %llu MiB (toque da CPU %llu, uso da GPU/pread %llu); VMA %llu MiB local + %llu "
+           "MiB host; pilhas %llu (%llu MiB); memória direta: maior trecho livre %llu MiB de %llu MiB; flexível livre "
+           "%llu MiB; pool interno da libkernel livre %llu KiB", why,
            (unsigned long long)(__atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) >> 20),
+           (unsigned long long)(__atomic_load_n(&mapped_by_fault, __ATOMIC_RELAXED) >> 20),
+           (unsigned long long)(__atomic_load_n(&mapped_by_prefault, __ATOMIC_RELAXED) >> 20),
+           (unsigned long long)(vdev >> 20), (unsigned long long)(vhost >> 20),
            (unsigned long long)__atomic_load_n(&stack_count, __ATOMIC_RELAXED),
            (unsigned long long)(__atomic_load_n(&stack_bytes, __ATOMIC_RELAXED) >> 20),
            (unsigned long long)(dfree >> 20), (unsigned long long)(sceKernelGetDirectMemorySize() >> 20),
@@ -1306,7 +1314,9 @@ static int map_window_locked(Resv *r, uint64_t a) {
 static int lazy_fault(uint64_t a) {
     Resv *r = resv_of(a);
     if (!r || win_mapped(r, a) || __atomic_load_n(&r->sub[(a - r->base) / SUB], __ATOMIC_RELAXED) < SS_NONE) return 0;
-    return map_window_locked(r, a);
+    int ok = map_window_locked(r, a);
+    if (ok) __atomic_add_fetch(&mapped_by_fault, WIN, __ATOMIC_RELAXED);
+    return ok;
 }
 
 // Garante as janelas de [addr, addr + n) mapeadas: o kernel (pread) e a GPU (importação) não geram falta, só erro.
@@ -1366,7 +1376,7 @@ void orbis_mem_prefault(uint64_t addr, uint64_t n) {
     for (uint64_t w = down(addr, WIN); w < addr + n; w += WIN) {
         uint64_t at = w < addr ? addr : w;
         Resv *r = resv_of(at);
-        if (r && !win_mapped(r, at)) map_window_locked(r, at);
+        if (r && !win_mapped(r, at) && map_window_locked(r, at)) __atomic_add_fetch(&mapped_by_prefault, WIN, __ATOMIC_RELAXED);
     }
 }
 
@@ -1622,6 +1632,34 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
     }
     uintptr_t rip = (uintptr_t)uc[UC_RIP];
     uintptr_t lo = (uintptr_t)__text_start, hi = (uintptr_t)__eh_frame_start;
+    {
+        // Pilha de chamadas do host, sem unwinder: os valores da pilha (a partir do rsp da falta) que caem no código do
+        // executável são candidatos a endereço de retorno. Saem como deslocamentos no ELF (totk+...) para simbolizar.
+        if (lo && hi) {
+            const uint64_t *sp = (const uint64_t *)(uintptr_t)uc[UC_RSP];
+            // Até o topo da pilha, se ela é uma das preguiçosas (ler além falta de novo, aqui dentro); senão 4 KiB.
+            int lim = 512;
+            int nl = __atomic_load_n(&nlstk, __ATOMIC_ACQUIRE);
+            for (int i = 0; i < nl; i++)
+                if (lstk[i].live && (uint64_t)(uintptr_t)sp >= lstk[i].base && (uint64_t)(uintptr_t)sp < lstk[i].end) {
+                    uint64_t q = (lstk[i].end - (uint64_t)(uintptr_t)sp) / 8;
+                    lim = q < 2048 ? (int)q : 2048;
+                }
+            char line[600];
+            int k = snprintf(line, sizeof line, "[host] orbis: pilha do host (candidatos, totk+):");
+            int found = 0;
+            for (int i = 0; i < lim && found < 24 && k < (int)sizeof line - 20; i++) {
+                uint64_t v = sp[i];
+                if (v >= lo && v < hi) {
+                    k += snprintf(line + k, sizeof line - k, " %llx", (unsigned long long)(v - lo));
+                    found++;
+                }
+            }
+            line[k++] = 0x0a;
+            write(2, line, (size_t)k);
+            rt_log("%.*s", k - 8, line + 7);
+        }
+    }
     if (crash_fn && (!lo || (rip >= lo && (!hi || rip < hi)))) {
         PlatCrash c;
         memset(&c, 0, sizeof c);
@@ -1642,24 +1680,6 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
         if (die < 0) {
             const char *e = getenv("OCARINA_CRASH_DIE");
             die = e && *e == 1;
-        }
-        // Pilha de chamadas do host, sem unwinder: os valores da pilha (a partir do rsp da falta) que caem no código do
-        // executável são candidatos a endereço de retorno. Saem como deslocamentos no ELF (totk+...) para simbolizar.
-        if (lo && hi) {
-            const uint64_t *sp = (const uint64_t *)(uintptr_t)uc[UC_RSP];
-            char line[600];
-            int k = snprintf(line, sizeof line, "[host] orbis: pilha do host (candidatos, totk+):");
-            int found = 0;
-            for (int i = 0; i < 2048 && found < 24 && k < (int)sizeof line - 20; i++) {
-                uint64_t v = sp[i];
-                if (v >= lo && v < hi) {
-                    k += snprintf(line + k, sizeof line - k, " %llx", (unsigned long long)(v - lo));
-                    found++;
-                }
-            }
-            line[k++] = 0x0a;
-            write(2, line, (size_t)k);
-            rt_log("%.*s", k - 8, line + 7);
         }
         if (!die) {
             static const char msg[] = "[host] orbis: a thread que falhou ficou parada; o processo segue vivo para o reload remoto\n";
