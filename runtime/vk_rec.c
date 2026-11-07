@@ -513,13 +513,13 @@ void rec_push_tpl(PFN_vkCmdPushDescriptorSetWithTemplateKHR fn, VkCommandBuffer 
 typedef struct { PFN_vkCmdDrawMeshTasksIndirectEXT fn; VkBuffer b; VkDeviceSize o; uint32_t n, stride; } A_MeshInd;
 typedef struct { PFN_vkCmdDrawMeshTasksEXT fn; uint32_t x, y, z; } A_Mesh;
 void rec_mesh(PFN_vkCmdDrawMeshTasksEXT fn, VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
-    work_crumb(cb, "DrawMeshTasks");
+    work_crumb(cb, "DrawMeshTasks", x, y, z, 0);
     if (!OWNED(cb)) { fn(cb, x, y, z); return; }
     A_Mesh *a = put(R_Mesh, sizeof *a);
     *a = (A_Mesh){fn, x, y, z};
 }
 void rec_mesh_ind(PFN_vkCmdDrawMeshTasksIndirectEXT fn, VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t stride) {
-    work_crumb(cb, "DrawMeshTasksIndirect");
+    work_crumb(cb, "DrawMeshTasksIndirect", (uint64_t)(uintptr_t)b, o, n, stride);
     if (!OWNED(cb)) { fn(cb, b, o, n, stride); return; }
     A_MeshInd *a = put(R_MeshInd, sizeof *a);
     *a = (A_MeshInd){fn, b, o, n, stride};
