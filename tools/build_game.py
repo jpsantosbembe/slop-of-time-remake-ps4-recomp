@@ -51,6 +51,13 @@ Split build. --make-runtime-lib compiles only runtime/ into <out>/libtotkrt.a (w
 then compiles only the generated C and the install-time files (modules.c and INSTALL_SIDE, which bake the player's
 game hashes and version in) and links them with that library. The library holds no game-derived data.
 
+PS4 (ocarina-ps4): --target orbis compila o mesmo C gerado e o runtime com o toolchain do bundle orbis-sdk
+(OpenOrbis + overlay orbis-compat), -march=btver2 (Jaguar) e -ffp-contract=off, liga o RADV do mesa-ps4, o vkloader do
+orbis-porting-kit e as bibliotecas estáticas de ~/ocarina-ps4/deps-ps4, e transforma o ELF em eboot.bin (create-fself).
+Ficam de fora linux.c, win32.c, *_sdl.* e *_win.*; entram os *_orbis.c. tools/orbis/build_ps4.sh é o caminho completo
+(log, nice, PKG). Os caminhos do bundle e das dependências: --orbis-sdk, --orbis-mesa, --orbis-kit, --orbis-deps (ou
+ORBIS_SDK, ORBIS_MESA, ORBIS_KIT, ORBIS_DEPS; padrão em ~/ocarina-ps4).
+
 Standard library only.
 """
 import argparse
@@ -118,8 +125,9 @@ VMA_LOCAL = ROOT / 'toolchain' / 'vma'
 
 
 def vma_include():
-    """The directory holding vk_mem_alloc.h: the system's, else toolchain/vma, fetched there on first use."""
-    if (VMA_INCLUDE / 'vk_mem_alloc.h').is_file():
+    """The directory holding vk_mem_alloc.h: the system's, else toolchain/vma, fetched there on first use. PS4: sempre
+    toolchain/vma (o VMA 3.4.0 fixado), nunca o /usr/include do host, que traria os headers do Fedora junto."""
+    if not ORBIS and (VMA_INCLUDE / 'vk_mem_alloc.h').is_file():
         return VMA_INCLUDE
     dst = VMA_LOCAL / 'vk_mem_alloc.h'
     if not dst.is_file():
@@ -148,6 +156,7 @@ LIB_NAME = 'libtotkrt.a'
 AR = UCRT / 'llvm-ar.exe' if WIN else on_path('llvm-ar')
 WINDRES = UCRT / 'windres.exe'   # runtime/totk.rc: the manifest of totk.exe
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
+ORBIS = None           # --target orbis: os caminhos do bundle e das dependências (orbis_setup)
 DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
 DISPLAY_VERSIONS = {'v0': '1.0.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3'}
@@ -250,11 +259,13 @@ RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build w
 
 def other_os(name):
     """A runtime file for another OS: Win32 ones (*_win.*, platform/win32.c, totk.rc) off Windows, the SDL window's
-    (*_sdl.*) and platform/linux.c on Windows."""
+    (*_sdl.*) and platform/linux.c on Windows; the *_orbis.* everywhere but the PS4, which leaves out all of these."""
     stem = name.rsplit('.', 1)[0]
+    if ORBIS:   # PS4: nem Win32 nem SDL nem Linux; os *_orbis.c ficam
+        return stem.endswith('_win') or stem.endswith('_sdl') or name in ('win32.c', 'linux.c', 'totk.rc')
     if WIN:
-        return stem.endswith('_sdl') or name == 'linux.c'
-    return stem.endswith('_win') or name in ('win32.c', 'totk.rc')
+        return stem.endswith('_sdl') or stem.endswith('_orbis') or name == 'linux.c'
+    return stem.endswith('_win') or stem.endswith('_orbis') or name in ('win32.c', 'totk.rc')
 
 
 def runtime_sources(skip=()):
@@ -297,7 +308,9 @@ def module_glue(layout, linked, hashes, paths, version):
     out += [f'    {{{c_string(f)}, {c_string(h)}}},' for f, h in sorted(hashes.items())]
     out += ['};', f'const int rt_exefs_sha256_count = {len(hashes)};', '']
     for name in ('exefs', 'romfs', 'profile'):
-        out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
+        # PS4: o caminho no console, não o da máquina do build (que só serve para montar o romfs-index.bin)
+        where = f'{ORBIS_DATA}/{name}' if ORBIS else paths[name].as_posix()
+        out.append(f'const char rt_default_{name}[] = {c_string(where)};')
     number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
     out += [f'const int rt_game_version = {number};', f'const char rt_port_version[] = {c_string(port_version())};', '']
     return '\n'.join(out)
@@ -327,6 +340,14 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(DEPS / "include" / "vma")}' if DEPS else cmd_path(vma_include())
     imgui = cmd_path(RUNTIME / 'third_party' / 'imgui')
     rt_inc = f'{inc} -I {cmd_path(out)} -I {vma} -I {imgui}'   # romfs_config.h, vk_mem_alloc.h (+ deps headers), imgui.h
+    # PS4: os includes de sistema vêm na frente de cada linha, um conjunto para C e outro para C++ (a ordem do libc++
+    # antes do overlay e do SDK é a do toolchain/orbis-sdk.cmake: trocada, std::abs(float) vira inteiro sem erro).
+    sys_c = sys_cxx = ''
+    if ORBIS:
+        sys_c = ' '.join(ORBIS['sys_c']) + ' '
+        sys_cxx = ' '.join(ORBIS['sys_cxx']) + ' '
+        rt_inc = rt_inc.replace(f'-I {vma}', f'-isystem {vma}')   # o VMA é de terceiros: sem os avisos dele
+        rt_inc += f' -I {cmd_path(ORBIS["kit"] / "vkloader")}'
     libs = [f'-L {cmd_path(DEPS / "lib")}'] + (LLVM_LINK_LIBS if WIN else LINK_LIBS) if DEPS else LINK_LIBS
     # A compiler cache (sccache) may front clang: every lift rewrites the generated chunks with the same contents, so
     # the cached objects save the compile step on the next build.
@@ -336,8 +357,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         'ninja_required_version = 1.10',
         f'builddir = {ninja_path(out)}',
         f'cc = {cache}{cmd_arg(CLANG.as_posix())}',
-        f'genflags = {" ".join(GEN_FLAGS)} {inc}',
-        f'rtflags = {" ".join(RT_FLAGS)} {rt_inc}',
+        f'genflags = {sys_c}{" ".join(GEN_FLAGS)} {inc}',
+        f'rtflags = {sys_c}{" ".join(RT_FLAGS)} {rt_inc}',
         f'ldflags = {" ".join(LINK_FLAGS)}',
         f'libs = {" ".join(libs)}',
         '',
@@ -384,6 +405,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources = [p for p in sources if p.name in INSTALL_SIDE] + [out / 'modules.c']
     else:
         sources += [out / 'modules.c']
+    if ORBIS and not runtime_lib:
+        sources += ORBIS['extra_src']   # o vkloader do kit: a ABI C do Vulkan sobre os três símbolos ICD do RADV
     for src in sources:
         o = runtime_object(out, src)
         if src.suffix == '.rc':   # windres writes no depfile: the files totk.rc embeds are listed by hand
@@ -391,7 +414,10 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
                          f'{ninja_path(RUNTIME / "totk.ico")}')
         else:
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
-            if src.suffix == '.cpp':   # the Ampere lowering headers (runtime/third_party/eglantine) need C++20
+            if src.suffix == '.cpp' and ORBIS:   # PS4: a linha inteira, com os includes de sistema do C++
+                lines.append(f'  rtflags = {sys_cxx}{" ".join(RT_FLAGS)} {rt_inc} -std=c++20 '
+                             f'-I {cmd_path(RUNTIME / "third_party" / "eglantine")}')
+            elif src.suffix == '.cpp':   # the Ampere lowering headers (runtime/third_party/eglantine) need C++20
                 lines.append(f'  rtflags = $rtflags -std=c++20 -I {cmd_path(RUNTIME / "third_party" / "eglantine")}')
         rt.append(o)
     objs['runtime'] = rt
@@ -411,7 +437,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
                   f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {cmd_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out',
                   '  rspfile = $out.rsp', '  rspfile_content = $in_newline', '  description = LINK $out']
     lines += ['', f'build {ninja_path(exe)}: {rule} ' + ' '.join(ninja_path(o) for o in every) +
-              (f' | {ninja_path(runtime_lib)}' if runtime_lib else ''),
+              (f' | {ninja_path(runtime_lib)}' if runtime_lib else '') +
+              (' | ' + ' '.join(ninja_path(a) for a in ORBIS['link_deps']) if ORBIS else ''),   # PS4: refaz com as libs
               'build objects: phony ' + ' '.join(ninja_path(o) for o in every), f'default {ninja_path(exe)}', '']
     return '\n'.join(lines), objs, exe
 
@@ -706,6 +733,108 @@ def mib(n):
     return f'{n / (1 << 20):,.1f} MiB'
 
 
+# ---- PS4 (--target orbis)
+ORBIS_DATA = '/data/ocarina'   # a pasta gravável do app no console (runtime/platform/orbis.c ORBIS_DATA_DIR)
+ORBIS_HOME = Path.home() / 'ocarina-ps4'
+# As bibliotecas de sistema do PS4 que o runtime e o RADV chamam (stubs .so do SDK).
+ORBIS_SCE_LIBS = ['-lSceGnmDriver', '-lSceVideoOut', '-lScePad', '-lSceAudioOut', '-lSceUserService', '-lSceNet',
+                  '-lSceRandom', '-lSceSysmodule', '-lSceSystemService']
+
+
+def orbis_path(arg, env, default):
+    p = arg or (Path(os.environ[env]) if os.environ.get(env) else default)
+    return Path(p).expanduser().resolve()
+
+
+def orbis_setup(args):
+    """--target orbis: os caminhos, as flags de compilação e a linha de ligação do PS4. Muda GEN_FLAGS, RT_FLAGS,
+    LINK_FLAGS e LINK_LIBS no lugar (como --sysroot), e o nome do executável."""
+    global ORBIS, EXE
+    sdk = orbis_path(args.orbis_sdk, 'ORBIS_SDK', ORBIS_HOME / 'sdk' / 'orbis-sdk-v1')
+    mesa = orbis_path(args.orbis_mesa, 'ORBIS_MESA', ORBIS_HOME / 'ext' / 'mesa-ps4')
+    kit = orbis_path(args.orbis_kit, 'ORBIS_KIT', ORBIS_HOME / 'ext' / 'orbis-porting-kit')
+    deps = orbis_path(args.orbis_deps, 'ORBIS_DEPS', ORBIS_HOME / 'deps-ps4')
+    oo, compat = sdk / 'sdk', sdk / 'orbis-compat'
+    radv = mesa / 'build-orbis' / 'src' / 'amd' / 'vulkan' / 'libvulkan_radeon.a'
+    zlib = sorted((mesa / 'build-orbis' / 'subprojects').glob('zlib-*/libz.a'))
+    need = [(sdk / 'BUNDLE.txt', 'o bundle orbis-sdk (--orbis-sdk)'), (compat / 'build' / 'liborbis-compat.a', 'o overlay'),
+            (radv, 'o RADV do mesa-ps4 (--orbis-mesa; mesa-ps4/build-orbis)'),
+            (mesa / 'include' / 'vulkan' / 'vulkan.h', 'os headers Vulkan do mesa-ps4'),
+            (kit / 'vkloader' / 'vkloader.c', 'o vkloader do orbis-porting-kit (--orbis-kit)'),
+            (deps / 'lib' / 'libdav1d.a', 'as dependências do PS4 (--orbis-deps; deps_ps4.sh)')]
+    for f, what in need:
+        if not f.is_file():
+            sys.exit(f'build_game: --target orbis sem {what}: {f} não existe')
+    if not zlib:
+        sys.exit(f'build_game: sem libz.a em {mesa / "build-orbis" / "subprojects"}/zlib-*/ (o RADV importa deflate e crc32)')
+    base = ['--target=x86_64-pc-freebsd12-elf', '-fPIC', '-funwind-tables', '-D__PS4__', '-DPS4', '-D__ORBIS__',
+            '-D_BSD_SOURCE=1', '-nostdlibinc', f'-isysroot {cmd_path(oo)}']
+    # ⚠ -nostdlibinc: o driver FreeBSD do clang ignora -isysroot nos includes padrão e acharia o /usr/include do host
+    # (tools/orbis/check_platform.sh). Os headers do Vulkan do mesa-ps4 (os do RADV ligado) e das dependências vêm
+    # antes dos do SDK, que traz outros EGL/KHR.
+    third = [f'-isystem {cmd_path(mesa / "include")}', f'-isystem {cmd_path(deps / "include")}']
+    c_inc = third + [f'-isystem {cmd_path(compat / "include")}', f'-isystem {cmd_path(oo / "include")}']
+    cxx_inc = [f'-isystem {cmd_path(oo / "include" / "c++" / "v1")}'] + c_inc + ['-include orbis_prefix.h']
+    ORBIS = {'sdk': sdk, 'oo': oo, 'kit': kit, 'deps': deps, 'sys_c': base + c_inc, 'sys_cxx': base + cxx_inc,
+             'link_deps': [radv, zlib[0], compat / 'build' / 'liborbis-compat.a'] +
+                          [deps / 'lib' / f'lib{n}.a' for n in ('dav1d', 'opus', 'zstd')],
+             'extra_src': [kit / 'vkloader' / 'vkloader.c', kit / 'vkloader' / 'vkthunks.c']}
+    march = ['-march=btver2', '-ffp-contract=off']   # Jaguar: sem AVX2, FMA, BMI2; sem contração, como o x86-64-v2
+    GEN_FLAGS[:] = [f for f in GEN_FLAGS if not f.startswith('-march=')] + march
+    # RT_NO_VPX: sem libvpx no PS4 (os filmes do OoT são AV1, dav1d); runtime/vpx_none.h no lugar dos headers dela
+    RT_FLAGS[:] = [f for f in RT_FLAGS if not f.startswith('-march=')] + march + ['-DRT_NO_VPX']
+    # A ligação do toolchain/orbis-sdk.cmake (orbis-compat/cmake/ps4-openorbis.cmake): -pie com o script corrigido, o
+    # overlay inteiro (--whole-archive: ninguém referencia os interpositores), e no fim -lc, -lkernel, crt1.o.
+    LINK_FLAGS[:] = ['--target=x86_64-pc-freebsd12-elf', '-nostdlib', '-fuse-ld=lld', '-pie', '-Wl,-m,elf_x86_64',
+                     f'-Wl,--script={cmd_path(sdk / "toolchain" / "orbis-tls.ld")}', '-Wl,--eh-frame-hdr',
+                     '-Wl,--no-rosegment', f'-L {cmd_path(oo / "lib")}', f'-L {cmd_path(deps / "lib")}',
+                     '-Wl,--whole-archive', cmd_path(compat / 'build' / 'liborbis-compat.a'), '-Wl,--no-whole-archive',
+                     '"-Wl,-Map=$builddir/ocarina.map"']
+    # O RADV inteiro (nada o abre depois por dlopen) e a zlib dele logo atrás; dav1d, opus e zstd estáticos.
+    LINK_LIBS[:] = (['-Wl,--whole-archive', cmd_path(radv), '-Wl,--no-whole-archive', cmd_path(zlib[0]),
+                     '-l:libdav1d.a', '-l:libopus.a', '-l:libzstd.a'] + ORBIS_SCE_LIBS +
+                    ['-lc++', '-lm', '-lc', '-lkernel', cmd_path(oo / 'lib' / 'crt1.o')])
+    EXE = 'ocarina.elf'
+    print(f'build_game: alvo PS4 (bundle {sdk}, mesa {mesa}, kit {kit}, deps {deps})')
+
+
+def orbis_check_segments(elf):
+    """Cada PT_LOAD alinhado a 0x4000 (página do PS4) em p_vaddr e p_offset; senão o console recusa a imagem com "Cannot
+    start the application" e nenhum log (orbis-compat cmake/orbis-tls.ld). Devolve a lista de problemas."""
+    with open(elf, 'rb') as f:
+        head = f.read(64)
+        phoff = int.from_bytes(head[0x20:0x28], 'little')
+        phentsize, phnum = (int.from_bytes(head[o:o + 2], 'little') for o in (0x36, 0x38))
+        f.seek(phoff)
+        table = f.read(phentsize * phnum)
+    bad, loads = [], 0
+    for i in range(phnum):
+        ph = table[i * phentsize:(i + 1) * phentsize]
+        if int.from_bytes(ph[0:4], 'little') != 1:   # PT_LOAD
+            continue
+        loads += 1
+        off, vaddr = int.from_bytes(ph[8:16], 'little'), int.from_bytes(ph[16:24], 'little')
+        if vaddr % 0x4000 or off % 0x4000:
+            bad.append(f'PT_LOAD #{i}: p_vaddr {vaddr:#x} p_offset {off:#x}')
+    return loads, bad
+
+
+def orbis_eboot(exe):
+    """O ELF ligado -> eboot.bin ao lado (create-fself do SDK, PAID dos exemplos do OpenOrbis)."""
+    loads, bad = orbis_check_segments(exe)
+    if bad:
+        sys.exit('build_game: segmentos fora da página de 16 KiB (o PS4 recusa a imagem):\n  ' + '\n  '.join(bad))
+    print(f'{below_root(exe)}: {loads} PT_LOAD, todos alinhados a 0x4000')
+    tool = ORBIS['oo'] / 'bin' / 'linux' / 'create-fself'
+    eboot = exe.parent / 'eboot.bin'
+    env = dict(os.environ, OO_PS4_TOOLCHAIN=str(ORBIS['oo']))
+    r = subprocess.run([str(tool), f'-in={exe}', f'-out={exe.with_suffix(".oelf")}', '--eboot', str(eboot),
+                        '--paid', '0x3800000000000011'], env=env, cwd=exe.parent)
+    if r.returncode or not eboot.is_file():
+        sys.exit(f'build_game: create-fself falhou ({r.returncode})')
+    print(f'{below_root(eboot)}: {mib(eboot.stat().st_size)}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--version', default='v121', help='game version (default v121)')
@@ -742,7 +871,18 @@ def main():
                                                     f'({", ".join(sorted(INSTALL_SIDE))} and modules.c still compile)')
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
+    ap.add_argument('--target', choices=('host', 'orbis'), default='host',
+                    help='orbis: o PS4 (bundle orbis-sdk, mesa-ps4, -march=btver2), eboot.bin em --out')
+    ap.add_argument('--orbis-sdk', type=Path, help='o bundle orbis-sdk (padrão ~/ocarina-ps4/sdk/orbis-sdk-v1)')
+    ap.add_argument('--orbis-mesa', type=Path, help='o mesa-ps4 com build-orbis/ (padrão ~/ocarina-ps4/ext/mesa-ps4)')
+    ap.add_argument('--orbis-kit', type=Path, help='o orbis-porting-kit (padrão ~/ocarina-ps4/ext/orbis-porting-kit)')
+    ap.add_argument('--orbis-deps', type=Path, help='zstd, opus e dav1d do PS4 (padrão ~/ocarina-ps4/deps-ps4)')
     args = ap.parse_args()
+    if args.target == 'orbis':
+        if WIN or args.toolchain or args.sysroot or args.deps or args.runtime_lib or args.make_runtime_lib:
+            sys.exit('build_game: --target orbis roda no Linux, sem --toolchain, --sysroot, --deps nem a biblioteca '
+                     'pré-compilada do runtime')
+        orbis_setup(args)
 
     gen = (args.gen or ROOT / 'generated' / args.version).resolve()
     out = (args.out or ROOT / 'build' / args.version).resolve()
@@ -827,6 +967,8 @@ def main():
         why = '--full-build'
     elif args.toolchain:
         why = f'--toolchain {flag_path(args.toolchain)}'
+    elif ORBIS:
+        why = 'alvo PS4'   # objetos de outra máquina: nunca os do build do PC
     elif out == main_out:
         why = ''
     else:
@@ -874,9 +1016,17 @@ def main():
     if args.make_runtime_lib:
         print(f'{below_root(exe)}: {mib(exe.stat().st_size)}')
         return
+    if ORBIS:
+        orbis_eboot(exe)
     for dll in dlls:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to totk.exe
         shutil.copy2(dll, exe.parent / dll.name)
     sections, image = pe_sections(exe) if WIN else elf_sections(exe)
+    if ORBIS:   # o RADV e o libc++ do PS4 saem com uma seção por símbolo (-fdata-sections): somadas pelo prefixo
+        merged = {}
+        for k, v in sections.items():
+            key = '.' + k.split('.')[1] if k.count('.') > 1 else k
+            merged[key] = merged.get(key, 0) + v
+        sections = merged
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))
     if image > 3 * GiB // 2:
