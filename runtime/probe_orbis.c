@@ -119,6 +119,34 @@ static void step_threads(void) {
           (int)thread_hits, (plat_now_ns() - t0) / 1e6);
 }
 
+// ---- 2b. threads em massa: quantas threads vivas ao mesmo tempo o processo aceita (o OoT caiu com EAGAIN no
+// pthread_create com umas 17 pilhas vivas). Cada thread espera numa palavra até o fim do teste.
+#define NMASS 256
+static volatile uint32_t mass_go;
+static volatile int32_t mass_alive;
+
+static void mass_fn(void *arg) {
+    (void)arg;
+    plat_inc32(&mass_alive);
+    while (!__atomic_load_n(&mass_go, __ATOMIC_ACQUIRE)) plat_sleep_ms(5);
+}
+
+static void step_threads_mass(void) {
+    static PlatThread *t[NMASS];
+    int made = 0;
+    uint64_t t0 = plat_now_ns();
+    for (int i = 0; i < NMASS; i++) {
+        if (!(t[made] = plat_thread_new_ex(mass_fn, NULL, "massa", 256 << 10))) break;
+        made++;
+    }
+    for (int i = 0; i < 200 && mass_alive < made; i++) plat_sleep_ms(5);
+    int alive = mass_alive;
+    __atomic_store_n(&mass_go, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < made; i++) plat_thread_join(t[i]);
+    check(made == NMASS, "threads", "em massa: %d de %d criadas ao mesmo tempo (%d chegaram a rodar), pilha de 256 KiB "
+          "(%.1f ms); a falha, se houve, está no totk.log (\"não nasceu\")", made, NMASS, alive, (plat_now_ns() - t0) / 1e6);
+}
+
 // ---- 3. fibra
 static PlatFiber *fib_main, *fib_new;
 static volatile int fib_steps;
@@ -290,6 +318,7 @@ int probe_orbis(void) {
     say("probe-orbis: o runtime no PS4 sem o jogo (%s)", rt_port_version);
     step_memory();
     step_threads();
+    step_threads_mass();
     step_fiber();
     step_time();
     step_file();
