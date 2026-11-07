@@ -939,7 +939,10 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                    (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
         }
     }
-    else if (set) {   // in front, the least recently used way drops out
+    // A failure is memoised as well (s NULL): it is final (known_failed / X.waits), and without the entry every draw or
+    // dispatch of the program rebuilt the request, a SHA-256 over the control section and the whole code (frente P,
+    // 2026-11-07: ~88% of the render thread on the title movie, with SHA-NI missing on the Jaguar as on this Intel).
+    if (set) {   // in front, the least recently used way drops out
         memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
         set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s};
     }
