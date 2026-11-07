@@ -47,6 +47,7 @@ extern uint64_t sceKernelGetProcessTime(void);                    // us desde o 
 extern uint64_t sceKernelGetProcessTimeCounter(void);             // contador monotônico do processo
 extern uint64_t sceKernelGetProcessTimeCounterFrequency(void);
 extern int32_t sceKernelIsNeoMode(void);
+extern void rt_log(const char *fmt, ...);   // dispatch.c: o totk.log
 extern int32_t sceRandomGetRandomNumber(void *buf, size_t size);  // libSceRandom: no máximo 64 bytes por chamada
 // O _umtx_op exportado pela libkernel (a syscall 454 é barrada pelo sandbox; o símbolo funciona: orbis-compat
 // sys/umtx.h). O <sys/umtx.h> do overlay NÃO é incluído: ele define um _umtx_op static inline que esconderia este, e
@@ -726,20 +727,33 @@ int plat_file_replace(const char *from, const char *to) {
     return 1;
 }
 
+// Gravação atômica: arquivo temporário, fsync e rename. No PS4 cada passo que falha vai para o log com o errno (o
+// primeiro boot do OoT caiu aqui ao gravar o account.uid sem dizer onde). O fsync que falha não derruba a gravação, e
+// se o rename falhar, grava direto no destino: perder a atomicidade é melhor que um fatal no boot.
 int plat_file_write_atomic(const char *path, const void *data, size_t n) {
-    if (access(path, W_OK) && errno != ENOENT) return 0;
+    if (access(path, W_OK) && errno != ENOENT)
+        rt_log("orbis: write_atomic %s: access deu errno %d (seguindo mesmo assim)", path, errno);
     char tmp[PATH_MAX + 48];
     int len = snprintf(tmp, sizeof tmp, "%s.%u.%u.tmp", path, plat_process_id(), plat_thread_id());
     if (len < 0 || len >= (int)sizeof tmp) return 0;
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return 0;
-    int ok = write_all(fd, data, n) && fsync(fd) == 0;
-    ok = close(fd) == 0 && ok;
+    if (fd < 0) {
+        rt_log("orbis: write_atomic %s: open do temporário deu errno %d", path, errno);
+        return plat_file_write(path, data, n);
+    }
+    int ok = write_all(fd, data, n);
+    if (!ok) rt_log("orbis: write_atomic %s: write deu errno %d", path, errno);
+    if (fsync(fd)) rt_log("orbis: write_atomic %s: fsync deu errno %d (ignorado)", path, errno);
+    if (close(fd)) rt_log("orbis: write_atomic %s: close deu errno %d (ignorado)", path, errno);
     if (ok && !rename(tmp, path)) {
         sync_dir_of(path);
         return 1;
     }
+    if (ok) rt_log("orbis: write_atomic %s: rename deu errno %d; gravando direto", path, errno);
     unlink(tmp);
+    if (!ok) return 0;
+    if (plat_file_write(path, data, n)) return 1;
+    rt_log("orbis: write_atomic %s: gravação direta deu errno %d", path, errno);
     return 0;
 }
 
@@ -927,7 +941,6 @@ static int map_window(Resv *r, uint64_t a) {
 // o jogo usa. OCARINA_EAGER_COMMIT=1 volta ao commit imediato.
 // Monitor de memória (ocarina-ps4): a cada 2 s, se a memória direta mapeada mudou 64 MiB ou mais, uma linha no log
 // com o mapeado, o livre e o total da memória direta e a flexível livre. É o dado para a dieta de memória do OoT.
-extern void rt_log(const char *fmt, ...);
 extern int32_t sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t align, int64_t *out_start,
                                                   size_t *out_size);
 extern int32_t sceKernelAvailableFlexibleMemorySize(size_t *size);
