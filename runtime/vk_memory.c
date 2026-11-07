@@ -386,9 +386,14 @@ static int rec_class(const PoolRec *r) {
 
 typedef struct { uint64_t gen, lo, hi, base, end; VkBuffer buf; VmaAllocation alloc; int cls; void *pool; } ResolveHit;
 #define RHIT_SLOTS 512
-static _Thread_local ResolveHit rhit[RHIT_SLOTS];
+// A tabela de cada thread fica no heap, alocada no primeiro uso (36 KiB, zerada como o TLS era): no PS4 o bloco TLS do
+// processo vai inteiro para toda thread, e uma área fixa de TLS limitava o processo a umas 30 threads (ocarina-ps4).
+static _Thread_local ResolveHit *rhit;
 
-static ResolveHit *rhit_slot(uint64_t addr) { return &rhit[(addr >> 12 ^ addr >> 21) & (RHIT_SLOTS - 1)]; }
+static ResolveHit *rhit_slot(uint64_t addr) {
+    if (!rhit && !(rhit = calloc(RHIT_SLOTS, sizeof *rhit))) rt_fatal("vk: no memory for the resolve cache");
+    return &rhit[(addr >> 12 ^ addr >> 21) & (RHIT_SLOTS - 1)];
+}
 
 static int resolve_check_on(void) {
     static int on = -1;
