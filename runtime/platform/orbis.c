@@ -1801,6 +1801,19 @@ int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
         if (said++ < 8)
             rt_log("orbis: pread de %u bytes em %#llx (buffer %p) deu %lld, errno %d; sceKernelPread deu %lld (%#llx)", n,
                    (unsigned long long)off, buf, (long long)k, err, (long long)k2, (unsigned long long)k2);
+        if (said <= 8 && err == EFAULT) {   // o estado de cada página de 16 KiB do buffer
+            for (uint64_t pg = down((uint64_t)(uintptr_t)buf, KPAGE); pg < (uint64_t)(uintptr_t)buf + n; pg += KPAGE) {
+                Resv *r = resv_of(pg);
+                if (!r) {
+                    rt_log("orbis:   página %#llx: fora das reservas", (unsigned long long)pg);
+                    continue;
+                }
+                const uint8_t *sb = r->sub + (pg - r->base) / SUB;
+                rt_log("orbis:   página %#llx: reserva %#llx, janela %d, pedida %d, subpáginas %d %d %d %d, ww %d",
+                       (unsigned long long)pg, (unsigned long long)r->base, win_state(r, pg), page_req(r, pg), sb[0], sb[1],
+                       sb[2], sb[3], r->ww ? r->ww[(pg - r->base) / KPAGE] : -1);
+            }
+        }
         if (k2 > 0) return k2;
         if (k < 0) errno = err;
     }
