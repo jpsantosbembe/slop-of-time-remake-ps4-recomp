@@ -694,7 +694,8 @@ void vk_exec_image_gone(VkImage image) {
 // the 2048-slot direct-mapped table this replaced missed 3% of them on conflicts.
 #define SHADER_SETS 2048
 #define SHADER_WAYS 4
-typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const GfxShader *s; } ShaderEnt;
+typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const GfxShader *s; uint64_t retry; } ShaderEnt;
+#define SHADER_FAIL_RETRY 600   // frames a failed lookup stays memoised (shader_for)
 static ShaderEnt shader_tab[SHADER_SETS][SHADER_WAYS];
 
 static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
@@ -908,6 +909,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
         for (int w = 0; w < SHADER_WAYS && set[w].used; w++) {
             ShaderEnt *e = &set[w];
             if (e->serial != serial || e->stage != st || memcmp(&e->a, &a, sizeof a)) continue;
+            if (!e->s && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= e->retry) break;   // look again
             if (w) {   // to the front
                 ShaderEnt hit = *e;
                 memmove(&set[1], &set[0], w * sizeof *set);
@@ -939,12 +941,14 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                    (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
         }
     }
-    // A failure is memoised as well (s NULL): it is final (known_failed / X.waits), and without the entry every draw or
-    // dispatch of the program rebuilt the request, a SHA-256 over the control section and the whole code (frente P,
-    // 2026-11-07: ~88% of the render thread on the title movie, with SHA-NI missing on the Jaguar as on this Intel).
+    // A failure is memoised as well (s NULL), for SHADER_FAIL_RETRY frames: most are final (known_failed / X.waits), but
+    // an out-of-memory one (malloc in req_init or the queue) is not, so it is looked up again now and then. Without the
+    // entry every draw or dispatch of the program rebuilt the request, a SHA-256 over the control section and the whole
+    // code (frente P, 2026-11-07: ~88% of the render thread on the title movie; no SHA-NI on the Jaguar or this Intel).
     if (set) {   // in front, the least recently used way drops out
         memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
-        set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s};
+        set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s,
+                             .retry = s ? 0 : __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + SHADER_FAIL_RETRY};
     }
     return s;
 }
