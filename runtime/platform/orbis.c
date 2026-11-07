@@ -219,10 +219,10 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
     size_t size = stack ? stack : stack_default();
     pthread_attr_t a;
     pthread_attr_init(&a);
-    int e = -1;
+    int e = -1, es = -1, ed = -1;
     if (dstack_alloc(&t->stk, size)) {
-        if (!pthread_attr_setstack(&a, (char *)t->stk.va + STACK_PAGE, t->stk.len - STACK_PAGE))
-            e = pthread_create(&t->t, &a, thread_main, t);
+        if (!(es = pthread_attr_setstack(&a, (char *)t->stk.va + STACK_PAGE, t->stk.len - STACK_PAGE)))
+            e = ed = pthread_create(&t->t, &a, thread_main, t);
         if (e) {
             static int said;
             if (!said) said = 1, fprintf(stderr, "plat: pilha em memória direta recusada (%d): pilhas flexíveis\n", e);
@@ -237,7 +237,13 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
         e = pthread_create(&t->t, &a, thread_main, t);
     }
     pthread_attr_destroy(&a);
-    if (e) { free(t); return NULL; }
+    if (e) {
+        rt_log("orbis: thread \"%s\" não nasceu: pilha direta %s (setstack %d, create %d), pilha do sistema de %zu KiB: "
+               "create %d; pilhas vivas %llu", t->name, t->stk.va ? "ok" : "sem memória", es, ed, size >> 10, e,
+               (unsigned long long)__atomic_load_n(&stack_count, __ATOMIC_RELAXED));
+        free(t);
+        return NULL;
+    }
     return t;
 }
 
