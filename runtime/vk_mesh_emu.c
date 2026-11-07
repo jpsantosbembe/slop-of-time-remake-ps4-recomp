@@ -57,7 +57,7 @@ const uint32_t *mesh_emu_scan_cs(uint64_t *words) {
 uint32_t mesh_emu_default_tasks(void) {
     static uint32_t n;
     if (!n) {
-        const char *e = getenv("OCARINA_MESH_EMU_TASKS");
+        const char *e = cfg_get("OCARINA_MESH_EMU_TASKS");
         n = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 256;
     }
     return n;
@@ -108,7 +108,7 @@ static void held_done(void *arg) {   // completion thread
 uint32_t mesh_emu_default_cap(void) {
     static uint32_t cap;
     if (!cap) {
-        const char *e = getenv("OCARINA_MESH_EMU_CAP");
+        const char *e = cfg_get("OCARINA_MESH_EMU_CAP");
         cap = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 256;
     }
     return cap;
@@ -116,7 +116,7 @@ uint32_t mesh_emu_default_cap(void) {
 
 int mesh_emu_slab(uint64_t fence, VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off) {
     if (!chunk_bytes) {
-        const char *e = getenv("OCARINA_MESH_EMU_MB");
+        const char *e = cfg_get("OCARINA_MESH_EMU_MB");
         chunk_bytes = (VkDeviceSize)(e && atoi(e) > 0 ? atoi(e) : 8) << 20;
     }
     if (!held || held_fence != fence) {

@@ -288,7 +288,7 @@ static int create_device(void) {
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
     if (!c->mesh.meshShader) g_vk.has_mesh_shader = 0;
     {   // ocarina-ps4 (frente M): the PS4's GCN has no mesh shaders; OCARINA_MESH_EMULATE=1 forces the emulation elsewhere
-        const char *e = getenv("OCARINA_MESH_EMULATE");
+        const char *e = cfg_get("OCARINA_MESH_EMULATE");
         g_vk.mesh_emulate = !g_vk.has_mesh_shader || (e && *e == '1');
         rt_log("vk: mesh shaders: %s", g_vk.mesh_emulate ? "emulated in compute (vk_mesh_emu.c)" : "native");
     }
