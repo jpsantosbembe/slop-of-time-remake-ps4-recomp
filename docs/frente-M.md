@@ -95,6 +95,21 @@ Mesh sem task, direto: `vkCmdDispatch(N,1,1)`, slot = `WorkgroupId.x`. Indireto:
   workgroup não escreve e o desenho perde triângulos, com um log único. Nada de malloc do host além dos módulos.
 - Custo no GCN: o VS de pull exporta todas as Locations que o FS lê; geometria degenerada no fim de cada slab.
 
+## Estado (2026-11-07)
+
+Feito: reescritor de mesh e de task (`runtime/vk_mesh_emu_spirv.c`; os 753 módulos do pack passam no
+`spirv-val --target-env vulkan1.3`), pipelines (`vk_pipeline.c`: layout com set 3, VS de pull, computes do mesh, do
+task e do scan registrados por pipeline gráfico), execução (`vk_exec_draw.c`: `mesh_emu_dispatch` no `prepare_draw`,
+`mesh_emu_draw` nos ops), slabs device-local por command buffer (`vk_mesh_emu.c`). O bloco de controle fica no scratch
+host-visible do command buffer (o scratch ganhou `INDIRECT_BUFFER_BIT`; o `mesh_ring` ganhou `TRANSFER_SRC_BIT`).
+
+Diferenças em relação ao desenho acima: sem buffers dinâmicos (um descriptor set por desenho, de `alloc_set`); o task
+entrou já (task compute, `shaders/mesh_scan.comp` com um invocação só, mesh indireto em grade {max meshes, tasks, 1}).
+
+Limites atuais: desenho indireto reserva `OCARINA_MESH_EMU_CAP` slabs (padrão 256); com task, `OCARINA_MESH_EMU_TASKS`
+grupos de task (padrão 256) e o bloco de controle leva `tmax * payload` words (até 1,6 MB por desenho com payload de
+1600 words). Workgroups além da capacidade não desenham (a contagem real fica em `ctl[14]`, para dumps).
+
 ## Fases e teste
 
 1. Reescritor + `--probe-mesh-emu`: converte os 753 módulos extraídos e passa `spirv-val --target-env vulkan1.3`.
