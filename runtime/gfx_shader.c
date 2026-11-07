@@ -298,6 +298,11 @@ static void xlate_identity(void) {
     }
     rt_log("gfx_shader: translator identity %02x%02x%02x%02x%02x%02x%02x%02x (%s)", xlate_id[0], xlate_id[1], xlate_id[2],
            xlate_id[3], xlate_id[4], xlate_id[5], xlate_id[6], xlate_id[7], how);
+#ifdef __ORBIS__
+    if (!strncmp(how, "none", 4))
+        rt_log("gfx_shader: ⚠ sem identidade do tradutor: as chaves não batem com o cache do PC. Copie o "
+               "build/xlate/totk_xlate.id do PC para %s.id ou ponha TOTK_XLATE_ID no args.txt", xlate_exe);
+#endif
 }
 
 // The repository root is the nearest parent of totk.exe that holds build/xlate/totk_xlate.exe. The shader cache lives
@@ -326,6 +331,12 @@ static void init_paths(void *param) {
     if (xlate_cfg && *xlate_cfg && strlen(xlate_cfg) < sizeof xlate_exe) strcpy(xlate_exe, xlate_cfg);
     else if (exe_dir[0] && file_exists(beside)) strcpy(xlate_exe, beside);
     else if (root[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s/build/xlate/totk_xlate" PLAT_EXE_SUFFIX, root);
+#ifdef __ORBIS__
+    // ocarina-ps4: o PS4 não roda o tradutor, mas a identidade dele entra nas chaves do cache: o totk_xlate.id do PC
+    // (build/xlate/totk_xlate.id) vai para /data/ocarina, ao lado do eboot "virtual" (plat_exe_path), e é lido por
+    // xlate_identity como no PC. O tradutor em si nunca existe ali, então nenhum processo é aberto (xlate_absent).
+    else if (exe_dir[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s/totk_xlate", exe_dir);
+#endif
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
     else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s/shader-cache", exe_dir);
     xlate_identity();
@@ -1977,6 +1988,56 @@ static void dump_failed_request(const char *hex, const char *request, const char
            hex, packet);
 }
 
+#ifdef __ORBIS__
+// ---- PS4 sem tradutor. Sem OCARINA_XLATE_REMOTE e sem o executável do tradutor (o normal no console), uma variante
+// que falta no cache não é traduzida: o pedido vai para <cache>/missing/<chave>.code e .req (o código e a linha do
+// pedido, como tools/replay_shader_failure.py os lê) e a chave para <cache>/missing.txt (as faltas desta execução),
+// para traduzir no PC e sincronizar o cache. A falha é registrada como qualquer outra (note_failed): o draw é pulado e
+// a chave não é pedida de novo. Nenhum processo é aberto e nada espera.
+static int xlate_absent(void) {
+    static int v = -1;
+    if (v < 0) {
+        char r[160];
+        v = !plat_getenv("OCARINA_XLATE_REMOTE", r, sizeof r) && !(xlate_exe[0] && file_exists(xlate_exe));
+        if (v) rt_log("gfx_shader: sem tradutor neste host: variantes que faltarem no cache vão para %s/missing", cache_dir);
+    }
+    return v;
+}
+
+static const GfxShader *note_missing(const Req *r, const char *hex, const uint8_t *control, const uint8_t *code,
+                                     uint64_t skip, const GfxShaderAnswers *a) {
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    static PlatAppend *list;
+    char dir[PATH_CAP + 16], code_path[PATH_CAP + 96], req_path[PATH_CAP + 96];
+    snprintf(dir, sizeof dir, "%s/missing", cache_dir);
+    snprintf(code_path, sizeof code_path, "%s/%s.code", dir, hex);
+    snprintf(req_path, sizeof req_path, "%s/%s.req", dir, hex);
+    plat_mutex_lock(&lock);
+    if (!list) {
+        mkdir_p(dir);
+        char lp[PATH_CAP + 32];
+        snprintf(lp, sizeof lp, "%s/missing.txt", cache_dir);
+        list = plat_append_open(lp);
+    }
+    if (!file_exists(req_path)) {
+        size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
+        char *req = malloc(cap);
+        if (req && write_file(code_path, code + skip, (size_t)(r->length - skip))) {
+            size_t n = build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control);
+            write_file(req_path, req, n);
+        }
+        free(req);
+    }
+    if (list) {
+        char line[128];
+        int n = snprintf(line, sizeof line, "%s %s\n", hex, r->stage_name);
+        plat_append_write(list, line, (size_t)n);
+    }
+    plat_mutex_unlock(&lock);
+    return fail("sem tradutor no PS4: variante anotada em missing/ para traduzir no PC", hex);
+}
+#endif
+
 static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
                                       const GfxShaderAnswers *a) {
     const uint8_t *key = r->key;
@@ -1993,6 +2054,9 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     uint64_t skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
     char hex[65], code_path[PATH_CAP + 80], spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80];
     key_hex(key, hex);
+#ifdef __ORBIS__
+    if (xlate_absent()) return note_missing(r, hex, control, code, skip, a);
+#endif
     mkdir_p(cache_dir);
     snprintf(code_path, PATH_CAP + 80, "%s/%s.code", cache_dir, hex);
     snprintf(spv_path, PATH_CAP + 80, "%s/%s.spv", cache_dir, hex);

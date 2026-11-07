@@ -107,6 +107,17 @@ void vk_caps_init(VkCtx *c) {
     static const VkShaderStageFlags stage[3] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
     uint32_t told[3];
     for (int i = 0; i < 3; i++) told[i] = vk_caps.sg_pin_stages & stage[i] ? want : sg.subgroupSize;
+    // ocarina-ps4: OCARINA_SHADER_SG=<n> diz ao tradutor (e às chaves do cache) n lanes por subgrupo, qualquer que seja o
+    // da GPU. As chaves de shader levam as respostas do host; o cache gerado num PC com subgrupos de 32 só casa no PS4
+    // (GCN, 64) com OCARINA_SHADER_SG=32, junto com TOTK_VK_SSBO_ALIGN e TOTK_GATHER_BIAS iguais aos do PC. Um shader que
+    // usa operações de subgrupo pode sair errado assim (ele conta 32 lanes numa onda de 64): é um atalho para o primeiro
+    // quadro, não o caminho final (o final é gerar o cache no PC com as respostas do PS4).
+    uint32_t sg_told = env_u32("OCARINA_SHADER_SG", 0);
+    if (sg_told && !(sg_told & (sg_told - 1)) && sg_told <= 128) {
+        for (int i = 0; i < 3; i++) told[i] = sg_told;
+        rt_log("vk caps: OCARINA_SHADER_SG=%u: o tradutor ouve %u lanes por subgrupo (a GPU tem %u)", sg_told, sg_told,
+               sg.subgroupSize);
+    } else sg_told = 0;
     // Gathers (TLD4) pick their four texels with Maxwell's rounding; AMD and Intel round a coordinate that sits between
     // two texels the other way, which draws dark lines along object edges in shadow-map filtering (docs/maxwell.md 2.10;
     // BotW and TotK on AMD). The translator biases gather coordinates by the host's sub-texel precision; NVIDIA rounds
@@ -114,6 +125,7 @@ void vk_caps_init(VkCtx *c) {
     uint32_t gather = env_u32("TOTK_GATHER_BIAS", c->props.vendorID == 0x10de ? 0 : l->subTexelPrecisionBits);
     gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather);
     uint32_t geometry_told = vk_caps.sg_pin_stages & VK_SHADER_STAGE_GEOMETRY_BIT ? want : sg.subgroupSize;
+    if (sg_told) geometry_told = sg_told;
     gfx_shader_set_geometry_host(geometry_told);
     if (gather) rt_log("vk caps: gather coordinates biased for %u sub-texel bits (TOTK_GATHER_BIAS)", gather);
 
