@@ -1664,10 +1664,9 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
         if (!die) {
             static const char msg[] = "[host] orbis: a thread que falhou ficou parada; o processo segue vivo para o reload remoto\n";
             write(2, msg, sizeof msg - 1);
-            for (;;) {
-                sceGnmSubmitDone();
-                usleep(100000);
-            }
+            // Sem sceGnmSubmitDone aqui: com a GPU presa num trabalho que a thread caída deixou pela metade, o
+            // SubmitDone dispara a conferência de GPU ociosa do sistema, que mata o app (0xa0d0c007, medido).
+            for (;;) usleep(1000000);
         }
     }
     // Ação padrão e volta: a instrução falta de novo e o processo termina. Sem signal(): o wrapper do musl foi
