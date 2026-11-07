@@ -22,7 +22,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __ORBIS__
+// ocarina-ps4: no PS4 a saída é a porta principal do sceAudioOut (48 kHz, estéreo float), alimentada do mesmo anel por
+// uma thread própria; a chamada bloqueante sceAudioOutOutput é o relógio do dispositivo, como o callback do SDL.
+#include "platform/platform.h"
+extern int32_t sceAudioOutInit(void);
+extern int32_t sceAudioOutOpen(int32_t user, int32_t port_type, int32_t index, uint32_t len, uint32_t freq,
+                               uint32_t param);
+extern int32_t sceAudioOutOutput(int32_t handle, const void *ptr);
+extern int32_t sceAudioOutClose(int32_t handle);
+#else
 #include <SDL3/SDL.h>
+#endif
 
 #include "cfg.h"
 #include "audio_effects.h"
@@ -50,7 +61,12 @@ typedef struct Mixer {
     float *buf; int nbuf, frame;
     int *offset;                                   // first mix buffer of each mix id
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
-    SDL_AudioStream *stream; int device_ok, rate;
+#ifdef __ORBIS__
+    int32_t port; PlatThread *out_thread; _Atomic int out_quit;   // sceAudioOut (output_open, PS4)
+#else
+    SDL_AudioStream *stream;
+#endif
+    int device_ok, rate;
     float ring[RING_FRAMES * 2];
     _Atomic uint64_t wr, rd, underruns, overruns, missing_frames, callback_frames, callback_nonzero, skipped_frames;
     _Atomic int playing; int ready;                // ready: the callback's own state
@@ -154,6 +170,78 @@ static void ring_pull(Mixer *m, float *out, uint32_t frames) {
     atomic_store_explicit(&m->rd, rd + n, memory_order_release);
 }
 
+#ifdef __ORBIS__
+// ---- PS4: sceAudioOut
+enum { ORBIS_GRAIN = 256,               // frames por sceAudioOutOutput (5,3 ms a 48 kHz): o período do dispositivo
+       ORBIS_RATE = 48000,              // a única taxa da porta principal
+       ORBIS_USER_SYSTEM = 0xff,        // SCE_USER_SERVICE_USER_ID_SYSTEM: a porta principal não é de um usuário
+       ORBIS_PORT_MAIN = 0, ORBIS_FMT_FLOAT_STEREO = 4 };
+
+// A thread da saída: puxa um bloco do anel e entrega à porta, que bloqueia até tocar o anterior. Dois blocos
+// alternados, porque a porta lê o bloco entregue até a chamada seguinte voltar.
+static void orbis_out_main(void *arg) {
+    Mixer *m = arg;
+    static float buf[2][ORBIS_GRAIN * 2];   // um mixer com saída por vez (o renderer do jogo)
+    int k = 0;
+    while (!atomic_load_explicit(&m->out_quit, memory_order_acquire)) {
+        atomic_store_explicit(&m->pulled_ns, kern_now_ns(), memory_order_release);
+        ring_pull(m, buf[k], ORBIS_GRAIN);
+        if (sceAudioOutOutput(m->port, buf[k]) < 0) {
+            rt_log("audio: sceAudioOutOutput falhou: a saída para");
+            break;
+        }
+        k ^= 1;
+    }
+    sceAudioOutOutput(m->port, NULL);   // espera o último bloco sair
+}
+
+static void output_open(Mixer *m, int rate) {
+    const char *mode = cfg_get("TOTK_AUDIO");
+    if ((mode && !strcmp(mode, "none")) || cfg_get("TOTK_AUDIO_OFF")) {
+        rt_log("audio: TOTK_AUDIO=none: mixing without a device");
+        return;
+    }
+    if (rate != ORBIS_RATE) {
+        rt_log("audio: o renderer pede %d Hz e a porta do PS4 só toca %d Hz: mixando sem som", rate, ORBIS_RATE);
+        return;
+    }
+    static int inited;
+    if (!inited) {
+        int32_t e = sceAudioOutInit();   // uma segunda chamada devolve "já iniciado", o que não impede o Open
+        if (e < 0) rt_log("audio: sceAudioOutInit devolveu %#x", (unsigned)e);
+        inited = 1;
+    }
+    m->port = sceAudioOutOpen(ORBIS_USER_SYSTEM, ORBIS_PORT_MAIN, 0, ORBIS_GRAIN, ORBIS_RATE, ORBIS_FMT_FLOAT_STEREO);
+    if (m->port < 0) {
+        rt_log("audio: sceAudioOutOpen falhou (%#x): mixando sem som", (unsigned)m->port);
+        return;
+    }
+    int period = ORBIS_GRAIN;
+    m->period = period;
+    m->target = m->frame * m->prefill > 2 * period ? m->frame * m->prefill : 2 * period;
+    if (m->target > RING_FRAMES / 2) m->target = RING_FRAMES / 2;
+    uint64_t period_ns = (uint64_t)period * 1000000000ull / (uint64_t)rate;
+    m->stall_ns = 4 * period_ns > STALL_MS * 1000000ull ? 4 * period_ns : STALL_MS * 1000000ull;
+    m->device_ok = 1;
+    m->out_thread = plat_thread_new(orbis_out_main, m, "audio out");
+    if (!m->out_thread) {
+        rt_log("audio: sem a thread da saída: mixando sem som");
+        m->device_ok = 0;
+        sceAudioOutClose(m->port);
+        return;
+    }
+    rt_log("audio: sceAudioOut porta %d aberta, %d Hz estéreo float, prefill %d ms, período %d frames; o dispositivo "
+           "dita o ritmo a %.1f ms na fila", m->port, rate, m->prefill * 5, period, m->target * 1000.0 / rate);
+}
+
+static void output_close(Mixer *m) {
+    if (!m->out_thread) return;
+    atomic_store_explicit(&m->out_quit, 1, memory_order_release);
+    plat_thread_join(m->out_thread);
+    m->out_thread = NULL;
+    sceAudioOutClose(m->port);
+}
+#else
 static void SDLCALL sdl_pull(void *user, SDL_AudioStream *stream, int additional, int total) {
     (void)total;
     Mixer *m = user;
@@ -204,6 +292,14 @@ static void output_open(Mixer *m, int rate) {
     rt_log("audio: SDL device '%s' opened, %d Hz stereo float, prefill %d ms, device period %d frames; the device paces "
            "rendering at %.1f ms queued", name ? name : "?", rate, m->prefill * 5, period, m->target * 1000.0 / rate);
 }
+
+static void output_close(Mixer *m) {
+    if (m->stream) {   // destroying the stream closes the device and waits for the callback to finish
+        SDL_DestroyAudioStream(m->stream);
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    }
+}
+#endif
 
 int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) {
     Mixer *m = r->mixer;
@@ -311,10 +407,7 @@ void audio_mixer_set_running(AudioRenderer *r, int running) {
 void audio_mixer_close(AudioRenderer *r) {
     Mixer *m = r->mixer;
     if (!m) return;
-    if (m->stream) {   // destroying the stream closes the device and waits for the callback to finish
-        SDL_DestroyAudioStream(m->stream);
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
-    }
+    output_close(m);
     for (int i = 0; i < m->nsplit; i++) free(m->split[i].ids);
     for (int i = 0; i < r->param.effect_count; i++) {
         audio_reverb_free(m->effect[i].reverb);
