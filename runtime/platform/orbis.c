@@ -1735,6 +1735,7 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 }
 
 void plat_crash_note(const char *note) { (void)note; }   // como no linux.c: só o Windows usa
+void plat_crash_file(const char *path) { (void)path; }   // idem
 
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
