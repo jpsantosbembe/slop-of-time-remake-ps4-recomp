@@ -1643,6 +1643,24 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
             const char *e = getenv("OCARINA_CRASH_DIE");
             die = e && *e == 1;
         }
+        // Pilha de chamadas do host, sem unwinder: os valores da pilha (a partir do rsp da falta) que caem no código do
+        // executável são candidatos a endereço de retorno. Saem como deslocamentos no ELF (totk+...) para simbolizar.
+        if (lo && hi) {
+            const uint64_t *sp = (const uint64_t *)(uintptr_t)uc[UC_RSP];
+            char line[600];
+            int k = snprintf(line, sizeof line, "[host] orbis: pilha do host (candidatos, totk+):");
+            int found = 0;
+            for (int i = 0; i < 2048 && found < 24 && k < (int)sizeof line - 20; i++) {
+                uint64_t v = sp[i];
+                if (v >= lo && v < hi) {
+                    k += snprintf(line + k, sizeof line - k, " %llx", (unsigned long long)(v - lo));
+                    found++;
+                }
+            }
+            line[k++] = 0x0a;
+            write(2, line, (size_t)k);
+            rt_log("%.*s", k - 8, line + 7);
+        }
         if (!die) {
             static const char msg[] = "[host] orbis: a thread que falhou ficou parada; o processo segue vivo para o reload remoto\n";
             write(2, msg, sizeof msg - 1);
