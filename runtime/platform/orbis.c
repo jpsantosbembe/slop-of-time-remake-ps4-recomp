@@ -153,6 +153,7 @@ typedef struct { uint64_t base, end; int64_t *off; volatile int32_t live; } LSta
 static LStack lstk[MAX_LSTACK];
 static volatile int32_t nlstk;   // vagas só crescem; o tratador lê sem trava
 static PlatMutex ls_lock = PLAT_MUTEX_INIT;
+static uint64_t ls_arena;   // a área fixa das pilhas (arena_get): 0 ainda não tentada, 1 falhou
 
 static int eager_stacks(void) {
     static int v = -1;
@@ -200,26 +201,60 @@ static void ls_release(LStack *st, uint64_t total_va, size_t total) {
         if (*o < 0) continue;
         sceKernelMunmap((void *)(uintptr_t)a, LS_CHUNK);
         sceKernelReleaseDirectMemory(*o, LS_CHUNK);
+        if (ls_arena > 1) {   // a área continua reservada: o trecho volta a ser reserva
+            void *p = (void *)(uintptr_t)a;
+            sceKernelReserveVirtualRange(&p, LS_CHUNK, K_MAP_FIXED | K_MAP_NO_OVERWRITE, 0);
+        }
         *o = -1;
         __atomic_sub_fetch(&stack_bytes, LS_CHUNK, __ATOMIC_RELAXED);
     }
-    sceKernelMunmap((void *)(uintptr_t)total_va, total);
+    if (ls_arena <= 1) sceKernelMunmap((void *)(uintptr_t)total_va, total);
+}
+
+// Área fixa das pilhas (2026-11-07): uma reserva separada de 256 MiB por pilha custava uns 5 MiB de memória FLEXÍVEL
+// cada (medido: 58 -> 2 MiB em 11 pilhas), e a reserva fixa e grande do heap não custa nada. Então todas as pilhas
+// moram numa área só, reservada uma vez em endereço fixo: LS_SLOTS vagas de LS_SLOT. A vaga i é a pilha da vaga i do
+// lstk; liberar devolve os pedaços e reserva o trecho de novo. Sem a área (endereços ocupados), o caminho antigo.
+#define LS_SLOT (128ull << 20)
+#define LS_SLOTS 256
+
+static uint64_t arena_get(void) {   // ls_lock tomado
+    if (ls_arena) return ls_arena > 1 ? ls_arena : 0;
+    static const uint64_t bases[] = {0x3000000000ull, 0x4000000000ull, 0x5000000000ull, 0x6000000000ull};
+    for (unsigned i = 0; i < sizeof bases / sizeof bases[0]; i++) {
+        void *a = (void *)(uintptr_t)bases[i];
+        if (!sceKernelReserveVirtualRange(&a, LS_SLOT * LS_SLOTS, K_MAP_FIXED | K_MAP_NO_OVERWRITE, 0) &&
+            a == (void *)(uintptr_t)bases[i]) {
+            ls_arena = bases[i];
+            rt_log("orbis: área das pilhas em %#llx (%d vagas de %llu MiB)", (unsigned long long)ls_arena, LS_SLOTS,
+                   (unsigned long long)(LS_SLOT >> 20));
+            return ls_arena;
+        }
+    }
+    ls_arena = 1;
+    rt_log("orbis: área fixa das pilhas não reservou; cada pilha reserva o próprio espaço");
+    return 0;
 }
 
 static int lstack_alloc(DStack *d, size_t len) {
+    if (len > LS_SLOT - LS_CHUNK) len = LS_SLOT - LS_CHUNK;
     size_t total = (size_t)(((len + LS_CHUNK - 1) & ~(LS_CHUNK - 1)) + LS_CHUNK);
     void *va = NULL;
-    if (sceKernelReserveVirtualRange(&va, total, 0, LS_CHUNK) || !va) return 0;
+    plat_mutex_lock(&ls_lock);
+    uint64_t arena = arena_get();
+    plat_mutex_unlock(&ls_lock);
+    if (!arena && (sceKernelReserveVirtualRange(&va, total, 0, LS_CHUNK) || !va)) return 0;
     plat_mutex_lock(&ls_lock);
     int slot = -1, n = nlstk;
     for (int i = 0; i < n; i++)
         if (!lstk[i].live && !lstk[i].off) { slot = i; break; }
-    if (slot < 0 && n < MAX_LSTACK) slot = n;
+    if (slot < 0 && n < (arena ? LS_SLOTS : MAX_LSTACK)) slot = n;
+    if (arena && slot >= 0) va = (void *)(uintptr_t)(arena + (uint64_t)slot * LS_SLOT + LS_SLOT - total);
     LStack *st = slot >= 0 ? &lstk[slot] : NULL;
     int64_t *offs = st ? malloc((total / LS_CHUNK) * sizeof *offs) : NULL;
     if (!offs) {
         plat_mutex_unlock(&ls_lock);
-        sceKernelMunmap(va, total);
+        if (!arena) sceKernelMunmap(va, total);
         return 0;
     }
     for (size_t i = 0; i < total / LS_CHUNK; i++) offs[i] = -1;
@@ -1019,9 +1054,9 @@ static Resv *resv_of_range(uint64_t addr, uint64_t n) {
     return r && n <= r->end - addr ? r : NULL;
 }
 
-static int win_mapped(const Resv *r, uint64_t a) {
-    return __atomic_load_n(&r->win[(a - r->win_base) / WIN], __ATOMIC_ACQUIRE);
-}
+// Estado da janela: 0 sem mapa, 1 memória real, 2 coringa (o bloco compartilhado só da GPU; orbis_mem_placeholder).
+static int win_state(const Resv *r, uint64_t a) { return __atomic_load_n(&r->win[(a - r->win_base) / WIN], __ATOMIC_ACQUIRE); }
+static int win_mapped(const Resv *r, uint64_t a) { return win_state(r, a) == 1; }
 
 // A proteção pedida mais permissiva entre as subpáginas commitadas da página de 16 KiB em pg; -1 sem nenhuma.
 static int page_req(const Resv *r, uint64_t pg) {
@@ -1165,6 +1200,57 @@ static int lazy_fault(uint64_t a) {
 }
 
 // Garante as janelas de [addr, addr + n) mapeadas: o kernel (pread) e a GPU (importação) não geram falta, só erro.
+// Coringa (ocarina-ps4, 2026-11-07): a GPU do PS4 usa o espaço de endereços do processo, e a importação de um pool
+// pelo mesa-ps4 é só um registro do ponteiro, que exige o trecho mapeado com GPU_RW (sceKernelVirtualQuery). O OoT cria
+// um pool de 2,4 GiB que usa aos poucos; mapear tudo de verdade esgotava a memória direta. As janelas ainda sem mapa
+// recebem então UM bloco de 2 MiB compartilhado, só com acesso da GPU: a importação passa sem gastar memória, e uma
+// leitura inesperada da GPU não trava o console. A CPU falta no coringa e ganha memória real (lazy_fault); o que a GPU
+// usa num desenho ganha memória real antes (orbis_mem_prefault no vk_mem_resolve). O espaço de endereços é o mesmo,
+// então a troca vale para os dois lados. OCARINA_NO_PLACEHOLDER=1 volta a mapear o pool inteiro.
+void orbis_mem_prefault(uint64_t addr, uint64_t n);
+static int64_t ph_off = -1;   // o bloco coringa (vm_lock)
+
+static int map_placeholder(Resv *r, uint64_t a) {
+    uint64_t w = down(a, WIN);
+    uint64_t start = w > r->base ? w : r->base, end = w + WIN < r->end ? w + WIN : r->end;
+    if (ph_off < 0 &&
+        sceKernelAllocateDirectMemory(0, (int64_t)sceKernelGetDirectMemorySize(), WIN, WIN, K_WB_ONION, &ph_off)) {
+        ph_off = -1;
+        return 0;
+    }
+    void *va = (void *)(uintptr_t)start;
+    int32_t e = sceKernelMapDirectMemory(&va, (size_t)(end - start), K_PROT_GPU, K_MAP_FIXED, ph_off, KPAGE);
+    if (e || va != (void *)(uintptr_t)start) {
+        static int said;
+        if (!said) said = 1, rt_log("orbis: coringa em %#llx falhou (%#x); a importação pode falhar",
+                                    (unsigned long long)start, (unsigned)e);
+        return 0;
+    }
+    __atomic_store_n(&r->win[(w - r->win_base) / WIN], 2, __ATOMIC_RELEASE);
+    return 1;
+}
+
+void orbis_mem_placeholder(uint64_t addr, uint64_t n) {
+    static int off = -1;
+    if (off < 0) {
+        char v[8];
+        off = plat_getenv("OCARINA_NO_PLACEHOLDER", v, sizeof v) && v[0] == '1';
+    }
+    if (off) {
+        orbis_mem_prefault(addr, n);
+        return;
+    }
+    if (!n) return;
+    for (uint64_t w = down(addr, WIN); w < addr + n; w += WIN) {
+        uint64_t at = w < addr ? addr : w;
+        Resv *r = resv_of(at);
+        if (!r || win_state(r, at)) continue;
+        plat_mutex_lock(&vm_lock);
+        if (!win_state(r, at)) map_placeholder(r, at);
+        plat_mutex_unlock(&vm_lock);
+    }
+}
+
 void orbis_mem_prefault(uint64_t addr, uint64_t n) {
     if (!n) return;
     for (uint64_t w = down(addr, WIN); w < addr + n; w += WIN) {

@@ -121,8 +121,8 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     uint64_t n = r->import_hi - r->import_lo;
 #ifdef __ORBIS__
     // ocarina-ps4: com o commit preguiçoso (platform/orbis.c), páginas do pool podem ainda não estar mapeadas
-    extern void orbis_mem_prefault(uint64_t addr, uint64_t n);
-    orbis_mem_prefault(r->import_lo, n);
+    extern void orbis_mem_placeholder(uint64_t addr, uint64_t n);
+    orbis_mem_placeholder(r->import_lo, n);   // só o coringa: memória real no uso (vk_mem_resolve) ou no toque da CPU
 #endif
     VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult res = p_host_props ? p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
@@ -501,7 +501,20 @@ int vk_mem_descriptor_key(uint64_t addr, uint64_t size, VkDescKey *out) {
     return ok;
 }
 
+#ifdef __ORBIS__
+// ocarina-ps4: o trecho de um pool importado que um desenho usa ganha memória real antes de a GPU tocá-lo (o resto do
+// pool pode estar no coringa: platform/orbis.c, orbis_mem_placeholder).
+extern void orbis_mem_prefault(uint64_t addr, uint64_t n);
+static int resolve_inner(uint64_t addr, uint64_t size, VkMemSpan *out);
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
+    int ok = resolve_inner(addr, size, out);
+    if (ok && out->pool) orbis_mem_prefault(addr, size);
+    return ok;
+}
+static int resolve_inner(uint64_t addr, uint64_t size, VkMemSpan *out) {
+#else
+int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
+#endif
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
     const ResolveHit *h = rhit_slot(addr);
