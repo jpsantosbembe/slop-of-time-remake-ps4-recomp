@@ -6,6 +6,8 @@
 // writes per crumb, and crumbs mark submissions, upload batches, ASTC chunks and presents, not draws.
 #include <stdint.h>
 #include <stdio.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "host.h"
 #include "vk.h"
@@ -32,7 +34,45 @@ void vk_crumbs_init(VkCtx *c) {
     words = info.pMappedData;
     words[0] = words[1] = 0;
     rt_log("vk: GPU breadcrumbs on (VK_AMD_buffer_marker)");
+#ifdef __ORBIS__
+    {
+        // ocarina-ps4: o PS4 mata o app 1 a 2 s depois de a GPU travar (0xa0d0c007), sem device lost. Um vigia lê os
+        // breadcrumbs a cada 200 ms: a GPU parada entre o início e o fim de um lote (alcançado != terminado) por 0,6 s
+        // é uma GPU travada, e o relatório sai no log e na tela antes de o sistema matar o processo.
+        extern void *vk_crumbs_watch(void *);
+        pthread_t t;
+        if (!pthread_create(&t, NULL, vk_crumbs_watch, NULL)) pthread_detach(t);
+    }
+#endif
 }
+
+#ifdef __ORBIS__
+static void describe(uint32_t code, char *o, size_t size);
+void *vk_crumbs_watch(void *arg) {
+    (void)arg;
+    uint32_t last0 = 0, last1 = 0;
+    int same = 0, said = 0;
+    for (;;) {
+        usleep(200000);
+        uint32_t w0 = words[0], w1 = words[1];
+        if (w0 == last0 && w1 == last1 && w0 != w1) same++;
+        else same = 0, said = 0;
+        last0 = w0, last1 = w1;
+        if (same >= 3 && !said) {
+            said = 1;
+            char reached[96], finished[96];
+            describe(w0, reached, sizeof reached);
+            describe(w1, finished, sizeof finished);
+            rt_log("vk: GPU PARADA há 0,6 s: alcançou %s, terminou %s (a GPU travou entre os dois)", reached, finished);
+            extern void plat_log_line(const char *line, size_t n);
+            char m[240];
+            int k = snprintf(m, sizeof m, "FATAL: GPU travou entre %s e %s", finished, reached);
+            plat_log_line(m, k > 0 ? (size_t)k : 0);
+        }
+    }
+    return NULL;
+}
+#endif
 
 void vk_crumbs_release(void) {
     VkCtx *c = vk_ctx();
