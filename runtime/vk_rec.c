@@ -232,6 +232,20 @@ FIXED(BindPipeline, (VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p), 
       VkPipeline p)
 // TOTK_CRUMBS=draw (vk_crumbs.c): a breadcrumb ahead of each draw and dispatch, numbered across the run;
 // TOTK_CRUMBS_LOG=1 also logs each number with the command as it is recorded.
+// OCARINA_SKIP_INSTANCED=1 (diagnóstico, PS4 2026-11-07): descarta os desenhos com mais de uma instância. Um
+// DrawIndexed instanciado travava a GPU do PS4; este knob confirma a causa sem corrigi-la.
+static int skip_instanced(uint64_t inst) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OCARINA_SKIP_INSTANCED");
+        on = e && *e == '1';
+    }
+    if (!on || inst <= 1) return 0;
+    static volatile uint64_t said;
+    if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 4) rt_log("vk: desenho com %llu instâncias descartado (OCARINA_SKIP_INSTANCED)", (unsigned long long)inst);
+    return 1;
+}
+
 static void work_crumb(VkCommandBuffer cb, const char *what, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3) {
     static volatile uint64_t n;
     static volatile int log_on = -1;
@@ -251,6 +265,7 @@ static void work_crumb(VkCommandBuffer cb, const char *what, uint64_t d0, uint64
 #define FIXED_WORK(name, params, call_args, ...)                                                                        \
     typedef struct { __VA_ARGS__; } A_##name;                                                                          \
     void rc_vkCmd##name params {                                                                                       \
+        if (INST_##name && skip_instanced(INST_##name)) return;                                                        \
         work_crumb(cb, #name, DET_##name);                                                                             \
         if (!OWNED(cb)) { vkCmd##name call_args; return; }                                                             \
         A_##name *a = put(R_##name, sizeof *a);                                                                        \
@@ -258,6 +273,11 @@ static void work_crumb(VkCommandBuffer cb, const char *what, uint64_t d0, uint64
         pub();                                                                                                          \
     }
 
+#define INST_Dispatch 0
+#define INST_DispatchIndirect 0
+#define INST_Draw i
+#define INST_DrawIndexed i
+#define INST_DrawIndexedIndirect 0
 #define DET_Dispatch x, y, z, 0
 #define DET_DispatchIndirect (uint64_t)(uintptr_t)b, o, 0, 0
 #define DET_Draw n, i, f, fi
