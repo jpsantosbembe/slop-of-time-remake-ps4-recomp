@@ -2845,3 +2845,94 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out) {
     *out = e;
     return n;
 }
+
+// ---- semente NVN 2 offline (Ocarina; tools/oot/oot_shader_seed.py)
+// <dir>/seed-nvn2.bin: "OOTNVN2S", u32 versão 1, u32 contagem; registros: u32 tamanho do controle, u32 tamanho do código,
+// u8 prioridade, 3 bytes zero, controle, código — cada estágio NVN 2 cru, como o jogo o passa a nvnProgramSetShaders.
+// Cada um é rebaixado aqui pelo mesmo nvn2_lower de prog_set_shaders (nvn_api_obj.c), e o resultado vira o registro de
+// programa que a jogada gravaria (ans_note) mais um registro de respostas com a variante padrão (todo slot de textura
+// 2D, entradas de vértice e saídas de cor float, compute com o tamanho local do controle, como answers_for lê). Escreve
+// <dir>/seed-programs.bin e <dir>/seed-answers.bin para `--prepare-shaders`. Ficam de fora os estágios de geometria (a
+// entrada e o controle portátil saem do draw: answers_for, native_gs_control) e de controle de tesselação (shader_for
+// não traduz o estágio NVN 3).
+int gfx_shader_seed_nvn2(const char *dir) {
+    char in[PATH_CAP + 32], ans[PATH_CAP + 32], prg[PATH_CAP + 32];
+    snprintf(in, sizeof in, "%s/seed-nvn2.bin", dir);
+    snprintf(ans, sizeof ans, "%s/seed-answers.bin", dir);
+    snprintf(prg, sizeof prg, "%s/seed-programs.bin", dir);
+    double t0 = (double)plat_now_ms();
+    uint64_t size = 0;
+    uint8_t *f = read_file(in, &size);
+    uint32_t version = 0, count = 0;
+    if (f && size >= 16) memcpy(&version, f + 8, 4), memcpy(&count, f + 12, 4);
+    if (!f || size < 16 || memcmp(f, "OOTNVN2S", 8) || version != 1) {
+        fprintf(stderr, "seed-nvn2: sem %s válido (tools/oot/oot_shader_seed.py o grava)\n", in);
+        free(f);
+        return 1;
+    }
+    Bytes P = {0}, A = {0};
+    Set64 progs = {0};
+    size_t o = 16, n = 0, lowered = 0, failed = 0, geometry = 0, tess = 0, other = 0, bad = 0, same = 0;
+    size_t stages[6] = {0}, by[3] = {0};
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t cl, dl;
+        if (size - o < 12) break;
+        memcpy(&cl, f + o, 4), memcpy(&dl, f + o + 4, 4);
+        uint8_t prio = f[o + 8] > 2 ? 2 : f[o + 8];
+        if (cl > 0x10000 || dl > (64u << 20) || size - o - 12 < (uint64_t)cl + dl) break;
+        n++;
+        // Cópias alinhadas; o controle com folga zerada (o rebaixamento lê campos até +0xc0).
+        uint8_t *ctl = calloc(1, cl > 0x400 ? cl : 0x400), *code = calloc(1, (size_t)dl + 16);
+        if (!ctl || !code) return free(ctl), free(code), free(f), 1;
+        memcpy(ctl, f + o + 12, cl), memcpy(code, f + o + 12 + cl, dl);
+        o += 12 + (size_t)cl + dl;
+        const uint8_t *nctl, *ncode;
+        int ok = gfx_shader_is_nvn2(ctl) && nvn2_lower(ctl, code, &nctl, &ncode);
+        free(ctl), free(code);   // nvn2_lower guarda o resultado (por conteúdo) e não guarda a entrada
+        if (!ok) { failed++; continue; }
+        lowered++;
+        uint32_t nst, length, c1_off;
+        memcpy(&nst, nctl + 0x714, 4), memcpy(&length, nctl + 0x704, 4), memcpy(&c1_off, nctl + 0x700, 4);
+        int st = nst == 0 || nst == 4 ? GFX_STAGE_VS : nst == 1 ? GFX_STAGE_FS : nst == 5 ? GFX_STAGE_CS : -1;
+        if (nst == 2) { geometry++; continue; }
+        if (nst == 3) { tess++; continue; }
+        if (st < 0) { other++; continue; }
+        if (c1_off > length || nvn_geometry_control_get(nctl, CONTROL_SIZE, ncode, length, NULL) < 0) { bad++; continue; }
+        uint8_t h[32];
+        if (!build_code_hash(st, nctl, ncode, length, ncode + c1_off, length - c1_off, 0, h)) { bad++; continue; }
+        if (!set_add(&progs, hash8(h))) { same++; continue; }   // dois estágios crus que rebaixam igual
+        uint32_t head[3] = {(uint32_t)st, length, length - c1_off};
+        bytes_put(&P, head, 12), bytes_put(&P, h, 32), bytes_put(&P, nctl, CONTROL_SIZE);
+        bytes_put(&P, ncode, length), bytes_put(&P, ncode + c1_off, length - c1_off);
+        GfxShaderAnswers a = {0};
+        for (int s = 0; s < 32; s++) a.tex_type[s] = GFX_TEX_2D;
+        if (st == GFX_STAGE_CS)
+            for (int k = 0; k < 3; k++) {
+                uint32_t l;
+                memcpy(&l, nctl + 0x748 + 4 * k, 4);
+                a.local[k] = (uint16_t)(l ? l : 1);
+            }
+        uint8_t rec[ANS_REC] = {0};
+        uint32_t st32 = (uint32_t)st;
+        memcpy(rec, &st32, 4), memcpy(rec + 4, h, 32);   // id de entrada zero: o tradutor acha a máscara de uso
+        pack_geometry_answers(rec + 68, &a);
+        rec[ANS_REC - 1] = prio;
+        bytes_put(&A, rec, sizeof rec);
+        stages[st]++, by[prio]++;
+    }
+    free(f), free(progs.v);
+    RecHeader hp = {{'T', 'O', 'T', 'K', 'S', 'P', 'R', 'G'}, PRG_VERSION, 0};
+    RecHeader ha = {{'T', 'O', 'T', 'K', 'S', 'A', 'N', 'S'}, ANS_VERSION, ANS_REC};
+    int ok = 1;
+    remove(prg), remove(ans);
+    ok &= rec_append(prg, "TOTKSPRG", hp.version, hp.rec_size, &P);
+    ok &= rec_append(ans, "TOTKSANS", ha.version, ha.rec_size, &A);
+    printf("seed-nvn2: %zu estágios crus de %u; %zu rebaixados, %zu falharam no rebaixamento; fora: %zu geometria, %zu "
+           "controle de tesselação, %zu outro estágio, %zu controle inválido, %zu repetidos depois do rebaixamento; "
+           "%zu programas (vértice %zu, fragmento %zu, compute %zu; prioridade 0 %zu, 1 %zu, 2 %zu) em %.0f ms; %s %s\n",
+           n, count, lowered, failed, geometry, tess, other, bad, same, A.n / ANS_REC, stages[GFX_STAGE_VS],
+           stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], by[0], by[1], by[2], (double)plat_now_ms() - t0,
+           ok ? "gravou" : "não conseguiu gravar", prg);
+    free(P.p), free(A.p);
+    return ok && n == count ? 0 : 1;
+}
