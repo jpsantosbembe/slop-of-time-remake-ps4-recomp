@@ -49,6 +49,7 @@ extern uint64_t sceKernelGetProcessTimeCounter(void);             // contador mo
 extern uint64_t sceKernelGetProcessTimeCounterFrequency(void);
 extern int32_t sceKernelIsNeoMode(void);
 extern int64_t sceKernelPread(int32_t fd, void *buf, size_t n, int64_t off);
+extern int32_t sceGnmSubmitDone(void);
 extern void rt_log(const char *fmt, ...);   // dispatch.c: o totk.log
 // O pool interno da libkernel (~14 MiB; alimenta threads, mutexes, condvars e attrs: orbis-compat orbis_mem.h). Não
 // está em header nenhum; a chamada com um ponteiro zerado cobre as duas formas plausíveis (como o orbis_mem.cpp).
@@ -1632,6 +1633,24 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
             c.access = (err & 16) ? 8 : (err & 2) ? 1 : 0, c.addr = a;
         }
         crash_fn(&c);
+    }
+    // Desenvolvimento (2026-11-07): a thread que falhou fica parada aqui, na pilha de sinal, e o processo continua
+    // vivo. Assim a thread de controle do carregador segue atendendo o reload remoto, sem ninguém reabrir o app no
+    // console. OCARINA_CRASH_DIE=1 volta ao comportamento padrão (o processo morre e o sistema mostra o erro).
+    {
+        static int die = -1;
+        if (die < 0) {
+            const char *e = getenv("OCARINA_CRASH_DIE");
+            die = e && *e == 1;
+        }
+        if (!die) {
+            static const char msg[] = "[host] orbis: a thread que falhou ficou parada; o processo segue vivo para o reload remoto\n";
+            write(2, msg, sizeof msg - 1);
+            for (;;) {
+                sceGnmSubmitDone();
+                usleep(100000);
+            }
+        }
     }
     // Ação padrão e volta: a instrução falta de novo e o processo termina. Sem signal(): o wrapper do musl foi
     // compilado com o SA_RESTART do Linux.
