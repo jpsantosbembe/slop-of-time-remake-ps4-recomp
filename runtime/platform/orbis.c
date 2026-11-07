@@ -1040,6 +1040,7 @@ static Resv resv[MAX_RESV];
 static volatile int32_t nresv;   // entradas só são acrescentadas; o tratador de sinal lê sem trava
 static PlatMutex vm_lock = PLAT_MUTEX_INIT;
 static uint64_t mapped_bytes;   // memória direta mapeada nas reservas (plat_commit_info)
+static const volatile uint64_t *ph_view;   // o mesmo bloco, só leitura para a CPU: o monitor confere se segue zerado
 static uint64_t mapped_by_fault, mapped_by_prefault;   // janelas de 2 MiB mapeadas por cada caminho (monitor)
 
 static uint64_t down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
@@ -1341,7 +1342,6 @@ static int lazy_fault(uint64_t a) {
 // então a troca vale para os dois lados. OCARINA_NO_PLACEHOLDER=1 volta a mapear o pool inteiro.
 void orbis_mem_prefault(uint64_t addr, uint64_t n);
 static int64_t ph_off = -1;   // o bloco coringa (vm_lock)
-static const volatile uint64_t *ph_view;   // o mesmo bloco, só leitura para a CPU: o monitor confere se segue zerado
 
 static int map_placeholder(Resv *r, uint64_t a) {
     uint64_t w = down(a, WIN);
