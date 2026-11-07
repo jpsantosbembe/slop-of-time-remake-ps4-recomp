@@ -5,7 +5,7 @@
 #define MESH_EMU_MAX_V 256
 #define MESH_EMU_MAX_P 256
 #define MESH_EMU_MAX_PAYLOAD 4096   // words
-#define MESH_EMU_LOCS 31            // Locations 0..30
+#define MESH_EMU_LOCS 28            // Locations 0..27: with Position and the 7 built-in components, 119 of 128
 #define MESH_EMU_NO_LOC 0xffffffffu
 
 // Set 3 of the emulation's pipelines: three dynamic storage buffers.

@@ -413,6 +413,8 @@ uint32_t *mesh_emu_spirv(const uint32_t *w, uint64_t n, uint64_t *out_n, MeshEmu
         if (op == OP_VARIABLE && a[2] != SC_OUTPUT)
             for (int l = 0; l < 31; l++) if (r.v_gen[l] == a[1]) r.v_gen[l] = 0;
     }
+    for (int l = MESH_EMU_LOCS; l < 31; l++)
+        if (r.v_gen[l]) return *why = "a Location past the pull vertex shader's", NULL;
     int nloc = 0;
     for (int l = 0; l < 31; l++) if (r.v_gen[l]) r.attr_of_loc[l] = ++nloc;
     r.attr_of_loc[31] = nloc;

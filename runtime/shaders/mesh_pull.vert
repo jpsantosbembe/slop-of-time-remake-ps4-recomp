@@ -34,9 +34,6 @@ layout(location = 24) out vec4 o24;
 layout(location = 25) out vec4 o25;
 layout(location = 26) out vec4 o26;
 layout(location = 27) out vec4 o27;
-layout(location = 28) out vec4 o28;
-layout(location = 29) out vec4 o29;
-layout(location = 30) out vec4 o30;
 vec4 at(uint b, uint off) {
     if (off == 0xffffffffu) return vec4(0.0, 0.0, 0.0, 1.0);
     return vec4(v[b + off], v[b + off + 1u], v[b + off + 2u], v[b + off + 3u]);
@@ -72,7 +69,4 @@ void main() {
     o25 = at(b, c[42]);
     o26 = at(b, c[43]);
     o27 = at(b, c[44]);
-    o28 = at(b, c[45]);
-    o29 = at(b, c[46]);
-    o30 = at(b, c[47]);
 }
