@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1958,7 +1959,16 @@ void plat_exit(int code) { orbis_idle_exit(code); }
 int rt_main(int argc, char **argv);
 // O stderr do processo (o do runtime antes do log abrir, o do Mesa, com o dump de GPU travada) não vai a lugar nenhum no
 // PS4: vira /data/ocarina/logs/stderr.log, um por execução.
+// O log do overlay orbis-compat (recusas do alocador de memória direta, falhas do pool de threads) vai para o totk.log.
+extern void orbis_set_log(void (*fn)(const char *fmt, va_list ap));
+static void overlay_log(const char *fmt, va_list ap) {
+    char b[1024];
+    vsnprintf(b, sizeof b, fmt, ap);
+    rt_log("overlay: %s", b);
+}
+
 int main(int argc, char **argv) {
+    orbis_set_log(overlay_log);
     mkdir(ORBIS_DATA_DIR, 0755);
     mkdir(ORBIS_DATA_DIR "/logs", 0755);
     int fd = open(ORBIS_DATA_DIR "/logs/stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
