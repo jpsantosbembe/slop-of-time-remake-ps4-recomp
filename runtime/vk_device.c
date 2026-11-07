@@ -332,11 +332,14 @@ static int create_device(void) {
     g_vk.max_buffer_size = p13.maxBufferSize;
     vk_caps_init(&g_vk);
 
+    // ocarina-ps4 (dieta): cada bloco do VMA é um trecho contíguo de memória direta no PS4; 256 MiB fragmentam o
+    // orçamento de 5 GiB (OCARINA_VMA_BLOCK_MIB, 0 = padrão do VMA; no PS4 64 MiB).
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
-                                 .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
+                                 .pDeviceMemoryCallbacks = vk_headroom_callbacks(),
+                                 .preferredLargeHeapBlockSize = vk_vma_block_size()};
     if ((r = vmaCreateAllocator(&ai, &g_vk.vma)) != VK_SUCCESS) { rt_log("vk: vmaCreateAllocator failed (%d)", (int)r); return 0; }
 
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,

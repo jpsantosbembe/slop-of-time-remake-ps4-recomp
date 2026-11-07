@@ -3008,6 +3008,16 @@ static int workers_start(void) {
     if (A.threads) return 1;
     uint32_t cpus = plat_cpu_usable();
     int n = cpus / 4 < 2 ? 2 : cpus / 4 > MAX_WORKERS ? MAX_WORKERS : (int)(cpus / 4);
+    // ocarina-ps4 (dieta): OCARINA_PIPE_WORKERS fixa o número (1..4). Cada compilação do Mesa (NIR + ACO) usa muito
+    // malloc; no PS4 o padrão é 1 worker, metade das compilações simultâneas.
+#ifdef __ORBIS__
+    const char *we = getenv("OCARINA_PIPE_WORKERS");
+    int want = we && *we ? atoi(we) : 1;
+#else
+    const char *we = getenv("OCARINA_PIPE_WORKERS");
+    int want = we && *we ? atoi(we) : 0;
+#endif
+    if (want > 0) n = want > MAX_WORKERS ? MAX_WORKERS : want;
     for (int i = 0; i < n; i++) {
         PlatThread *t = plat_thread_new(pipe_worker, (void *)(intptr_t)A.threads, "pipe worker");
         if (!t) break;
@@ -3438,6 +3448,17 @@ void vk_pipeline_prewarm(void) {
 
     PlatThread *t[64];
     int nt = 0;
+    // ocarina-ps4 (dieta): OCARINA_PREWARM_THREADS limita as threads que compilam pipelines no prewarm (padrão: todas as
+    // CPUs; no PS4 2, pelo malloc de cada compilação do Mesa).
+    {
+        const char *pe2 = getenv("OCARINA_PREWARM_THREADS");
+#ifdef __ORBIS__
+        int cap = pe2 && *pe2 ? atoi(pe2) : 2;
+#else
+        int cap = pe2 && *pe2 ? atoi(pe2) : 0;
+#endif
+        if (cap > 0 && cap < cpus) cpus = cap;
+    }
     for (int i = 0; i < cpus && i < 64 && queued; i++)
         if ((t[nt] = plat_thread_new(warm_builder, NULL, "pipe prewarm"))) nt++;
     if (!nt) warm_builder(NULL);

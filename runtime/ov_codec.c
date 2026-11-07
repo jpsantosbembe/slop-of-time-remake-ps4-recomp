@@ -569,7 +569,17 @@ static void av1_init(Cpu *c, uint64_t key, unsigned w, unsigned h) {
     Dec *d = dec_of(key);
     Dav1dSettings set;
     dav1d_default_settings(&set);
-    set.n_threads = 4;
+    // ocarina-ps4 (dieta): cada thread do dav1d tem seus buffers (~30 MiB vivos a 4 threads no Linux, 1080p).
+    // OCARINA_AV1_THREADS; no PS4 o padrão é 2.
+    {
+        const char *te = getenv("OCARINA_AV1_THREADS");
+#ifdef __ORBIS__
+        set.n_threads = te && *te ? atoi(te) : 2;
+#else
+        set.n_threads = te && *te ? atoi(te) : 4;
+#endif
+        if (set.n_threads < 1) set.n_threads = 1;
+    }
     set.max_frame_delay = 1;   // a picture per packet: the player waits for each one
     if (d && dav1d_open(&d->av1, &set) < 0) d->av1 = NULL;
     plat_mutex_unlock(&lock);
