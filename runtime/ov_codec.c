@@ -18,10 +18,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <vpx/vp8dx.h>
 #include <errno.h>
 #include <dav1d/dav1d.h>
+#ifdef RT_NO_VPX   // ocarina-ps4: build sem libvpx (vpx_none.h): o VP9 fica preto, o AV1 (dav1d) decodifica igual
+#include "vpx_none.h"
+#else
+#include <vpx/vp8dx.h>
 #include <vpx/vpx_decoder.h>
+#endif
 
 #include "host.h"
 #include "platform/platform.h"

@@ -28,8 +28,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef RT_NO_VPX   // ocarina-ps4: build sem libvpx (vpx_none.h); o Configure de um decodificador VP9 responde "não suportado"
+#include "vpx_none.h"
+#else
 #include <vpx/vp8dx.h>
 #include <vpx/vpx_decoder.h>
+#endif
 
 #include "cfg.h"
 #include "host.h"
@@ -535,7 +539,16 @@ static void ov_configure(Cpu *c) {
     release_codec(m);
     m->w = w;
     m->h = h;
+#ifdef RT_NO_VPX
+    if (!vpx_open(m)) {
+        unlock_back(m, away);
+        rt_log("movie: build sem libvpx (RT_NO_VPX): o filme VP9 %dx%d não toca", w, h);
+        ret_x(c, ST_UNSUPPORTED);
+        return;
+    }
+#else
     if (!vpx_open(m)) rt_fatal("movie: libvpx VP9 decoder initialisation");
+#endif
     for (int i = 0; i < IN_BUFS; i++) m->in[i] = mem_kernel_alloc(IN_CAP, 0x1000);
     for (int i = 0; i < OUT_BUFS; i++)
         if (!(m->out[i] = malloc((size_t)frame_bytes(m)))) rt_fatal("movie: output buffers");
