@@ -517,9 +517,11 @@ static void save_capture(const char *path) {
         px[i + 2] = g_cap_ptr[i + (bgra ? 0 : 2)];
         px[i + 3] = 255;
     }
+    uint64_t sum = 0;
+    for (size_t i = 0; i < n; i += 4 * 64) sum += (uint64_t)px[i] * 2 + px[i + 1] * 5 + px[i + 2];   // luma aproximada, amostrada
     rt_write_png(path, px, (uint32_t)g_cap_w, (uint32_t)g_cap_h);
     free(px);
-    rt_log("gfx: menu test shot %s (%dx%d)", path, g_cap_w, g_cap_h);
+    rt_log("gfx: shot %s (%dx%d), brilho médio %.1f", path, g_cap_w, g_cap_h, (double)sum / 8.0 / (double)(n / (4 * 64)));
 }
 
 // The rectangle {x, y, w, h} of a dw x dh swapchain image the cw x ch picture goes into: the whole image with
@@ -586,6 +588,23 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                      g_sc_ext.height, cw, ch, g_scaler};
     int overlay = g_sc_view[idx] &&
                   menu_overlay_frame(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), &mt, &menu_shot);
+    {   // OCARINA_SHOT_EVERY=<n> (desenvolvimento): a cada n apresentações, a imagem da tela vira PNG ao lado do log
+        // (shot_0..3.png, em rodízio), para ver de longe o que a TV mostra
+        static int every = -1;
+        static char shot_path[512];
+        if (every < 0) {
+            const char *e = getenv("OCARINA_SHOT_EVERY");
+            every = e && *e ? atoi(e) : 0;
+        }
+        const char *lp = rt_log_path();
+        if (every > 0 && !menu_shot && lp && g_frame % (unsigned)every == 0) {
+            static unsigned k;
+            const char *slash = strrchr(lp, '/');
+            int dl = slash ? (int)(slash - lp) : 0;
+            snprintf(shot_path, sizeof shot_path, "%.*s/shot_%u.png", dl, lp, k++ % 4);
+            menu_shot = shot_path;
+        }
+    }
     int cap = (g_capture || menu_shot) && ensure_capture_buffer();
     int thumb = g_th_n && ensure_thumbs();
 
