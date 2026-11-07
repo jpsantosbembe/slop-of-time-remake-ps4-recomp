@@ -903,17 +903,21 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     uint64_t serial = ex->prog->serial;
     answers_for(ex, st, ctl, slot_mask_of(serial, st), &a);
     ShaderEnt *set = NULL;
+    int refresh = 0;   // set[0] is an expired failure, looked up again: replaced in place
     if (serial) {
         uint64_t h = (serial * 0x9E3779B97F4A7C15ull ^ (uint64_t)st) ^ nvn_hm_hash(&a, sizeof a);   // a is zero-padded
         set = shader_tab[(h ^ h >> 29) & (SHADER_SETS - 1)];
         for (int w = 0; w < SHADER_WAYS && set[w].used; w++) {
             ShaderEnt *e = &set[w];
             if (e->serial != serial || e->stage != st || memcmp(&e->a, &a, sizeof a)) continue;
-            if (!e->s && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= e->retry) break;   // look again
             if (w) {   // to the front
                 ShaderEnt hit = *e;
                 memmove(&set[1], &set[0], w * sizeof *set);
                 set[0] = hit;
+            }
+            if (!set[0].s && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= set[0].retry) {
+                refresh = 1;   // look again
+                break;
             }
             return set[0].s;
         }
@@ -946,7 +950,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     // entry every draw or dispatch of the program rebuilt the request, a SHA-256 over the control section and the whole
     // code (frente P, 2026-11-07: ~88% of the render thread on the title movie; no SHA-NI on the Jaguar or this Intel).
     if (set) {   // in front, the least recently used way drops out
-        memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
+        if (!refresh) memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
         set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s,
                              .retry = s ? 0 : __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + SHADER_FAIL_RETRY};
     }
