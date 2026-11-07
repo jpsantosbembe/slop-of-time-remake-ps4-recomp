@@ -268,6 +268,9 @@ static void flip_locked(void) {
     vk_queue_lock();
     VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
+#ifdef __ORBIS__
+    wsys_presented();   // gfx_window_orbis.c: o sceGnmSubmitDone do quadro
+#endif
     vk_device_fault_report(r);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
 }

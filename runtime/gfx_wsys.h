@@ -15,6 +15,9 @@ void wsys_probe_escape(void);              // Esc pressed
 // A left click: 0 in the client area, 1 activating the window from its client area, 2 activating it from the title bar.
 // 0 when the window system has no such event (then the caller skips that check).
 int wsys_probe_click(int where);
+#ifdef __ORBIS__
+void wsys_presented(void);                 // ocarina-ps4: depois de cada vkQueuePresentKHR (sceGnmSubmitDone)
+#endif
 
 // ---- what gfx_present.c provides the back end
 void gfx_window_mark_dirty(void);          // the window changed size: the next present rebuilds the swapchain
