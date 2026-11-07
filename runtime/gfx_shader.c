@@ -378,6 +378,22 @@ static void child_stop(Svc *v) {
 
 static int child_start(Svc *v) {
     paths();
+    // ocarina-ps4: OCARINA_XLATE_REMOTE=host:port talks to the translator on another machine (tools/oot/xlate_bridge.py)
+    // instead of starting it; the PS4 runs no .NET and starts no processes. The cache key still needs the translator's
+    // identity: TOTK_XLATE_ID, or the translator file when this machine has one.
+    char remote[160];
+    if (plat_getenv("OCARINA_XLATE_REMOTE", remote, sizeof remote)) {
+        uint32_t rerr = 0;
+        v->child = plat_child_connect(remote, &rerr);
+        if (!v->child) {
+            rt_log("gfx_shader: cannot reach the translator at %s (error %lu)", remote, (unsigned long)rerr);
+            return 0;
+        }
+        static int said;
+        if (!said) said = 1, rt_log("gfx_shader: translator at %s over TCP", remote);
+        v->in_len = 0;
+        return 1;
+    }
     if (!xlate_exe[0] || !file_exists(xlate_exe)) {
         rt_log("gfx_shader: translator not found (%s); set TOTK_XLATE", xlate_exe[0] ? xlate_exe : "<none>");
         return 0;

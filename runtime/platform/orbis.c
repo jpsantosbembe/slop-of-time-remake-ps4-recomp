@@ -1489,23 +1489,83 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) { *pro
 
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) { *resident = *private_bytes = 0; }
 
-// ---- processos filhos: STUB, não existem no PS4 (os shaders vêm só do cache gerado no PC). err recebe ENOSYS.
+// ---- processos filhos: o PS4 não cria processos (plat_child_start falha com ENOSYS). O tradutor de shaders roda no PC,
+// e o canal com ele vira uma conexão TCP (plat_child_connect, OCARINA_XLATE_REMOTE=ip:porta; do outro lado,
+// tools/oot/xlate_bridge.py). O app pode conectar, só não pode escutar (bind dá EACCES, medido no galaxy-recomp).
+// Rede pela libSceNet (ligar com -lSceNet). A CONFIRMAR NO CONSOLE: se a libSceNet precisa de sceNetInit ou de
+// sceSysmoduleLoadModule antes da primeira chamada.
+extern int sceNetSocket(const char *name, int family, int type, int protocol);
+extern int sceNetConnect(int s, const void *addr, unsigned int addrlen);
+extern int sceNetSend(int s, const void *msg, size_t len, int flags);
+extern int sceNetRecv(int s, void *buf, size_t len, int flags);
+extern int sceNetSocketClose(int s);
+extern int sceNetSetsockopt(int s, int level, int optname, const void *optval, unsigned int optlen);
+extern int sceNetInetPton(int af, const char *src, void *dst);
+
+struct PlatChild { int s; };
+
 PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err) {
     (void)exe, (void)arg;
     if (err) *err = ENOSYS;
     return NULL;
 }
 
-void plat_child_stop(PlatChild *c) { (void)c; }
+PlatChild *plat_child_connect(const char *host_port, uint32_t *err) {
+    if (err) *err = 0;
+    char host[64];
+    const char *colon = strrchr(host_port, ':');
+    if (!colon || (size_t)(colon - host_port) >= sizeof host) return NULL;
+    memcpy(host, host_port, (size_t)(colon - host_port));
+    host[colon - host_port] = 0;
+    int port = atoi(colon + 1);
+    // sockaddr_in do FreeBSD: sin_len, sin_family (AF_INET = 2), porta big-endian, endereço, 8 zeros
+    struct { uint8_t len, family; uint16_t port; uint32_t addr; uint8_t zero[8]; } sa = {16, 2, 0, 0, {0}};
+    sa.port = (uint16_t)(((port & 0xff) << 8) | ((port >> 8) & 0xff));
+    if (sceNetInetPton(2, host, &sa.addr) <= 0) {
+        if (err) *err = EINVAL;
+        return NULL;
+    }
+    int sk = sceNetSocket("ocarina-xlate", 2, 1 /* SOCK_STREAM */, 0);
+    if (sk < 0) {
+        if (err) *err = (uint32_t)sk;
+        return NULL;
+    }
+    int r = sceNetConnect(sk, &sa, sizeof sa);
+    if (r < 0) {
+        if (err) *err = (uint32_t)r;
+        sceNetSocketClose(sk);
+        return NULL;
+    }
+    int one = 1;
+    sceNetSetsockopt(sk, 6 /* IPPROTO_TCP */, 1 /* TCP_NODELAY */, &one, sizeof one);
+    PlatChild *c = malloc(sizeof *c);
+    if (!c) {
+        sceNetSocketClose(sk);
+        return NULL;
+    }
+    c->s = sk;
+    return c;
+}
+
+void plat_child_stop(PlatChild *c) {
+    if (!c) return;
+    sceNetSocketClose(c->s);
+    free(c);
+}
 
 int plat_child_write(PlatChild *c, const void *data, size_t n) {
-    (void)c, (void)data, (void)n;
-    return 0;
+    const uint8_t *p = data;
+    while (n) {
+        int k = sceNetSend(c->s, p, n, 0);
+        if (k <= 0) return 0;
+        p += k, n -= (size_t)k;
+    }
+    return 1;
 }
 
 long plat_child_read(PlatChild *c, void *buf, size_t cap) {
-    (void)c, (void)buf, (void)cap;
-    return -1;
+    int k = sceNetRecv(c->s, buf, cap, 0);
+    return k > 0 ? (long)k : -1;
 }
 
 #endif /* __ORBIS__ */

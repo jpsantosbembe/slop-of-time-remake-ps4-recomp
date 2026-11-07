@@ -18,6 +18,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/resource.h>
@@ -1636,10 +1640,44 @@ PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err) {
 void plat_child_stop(PlatChild *c) {
     if (!c) return;
     close(c->in);
-    close(c->out);
-    kill(c->pid, SIGKILL);
-    waitpid(c->pid, NULL, 0);
+    if (c->out != c->in) close(c->out);
+    if (c->pid > 0) {   // a connection (plat_child_connect) has no process here
+        kill(c->pid, SIGKILL);
+        waitpid(c->pid, NULL, 0);
+    }
     free(c);
+}
+
+PlatChild *plat_child_connect(const char *host_port, uint32_t *err) {
+    if (err) *err = 0;
+    char host[128];
+    const char *colon = strrchr(host_port, ':');
+    if (!colon || (size_t)(colon - host_port) >= sizeof host) return NULL;
+    memcpy(host, host_port, (size_t)(colon - host_port));
+    host[colon - host_port] = 0;
+    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM}, *ai = NULL;
+    int e = getaddrinfo(host, colon + 1, &hints, &ai);
+    if (e || !ai) {
+        if (err) *err = (uint32_t)e;
+        return NULL;
+    }
+    int s = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+    if (s < 0 || connect(s, ai->ai_addr, ai->ai_addrlen)) {
+        if (err) *err = (uint32_t)errno;
+        if (s >= 0) close(s);
+        freeaddrinfo(ai);
+        return NULL;
+    }
+    freeaddrinfo(ai);
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);   // one line out, one line in: no Nagle delay
+    PlatChild *c = malloc(sizeof *c);
+    if (!c) {
+        close(s);
+        return NULL;
+    }
+    c->pid = 0, c->in = c->out = s;
+    return c;
 }
 
 // A child that died makes the write fail with EPIPE; SIGPIPE is ignored for the process (main.c), as Windows has none.
