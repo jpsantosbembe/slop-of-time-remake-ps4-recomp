@@ -48,6 +48,16 @@ extern uint64_t sceKernelGetProcessTimeCounter(void);             // contador mo
 extern uint64_t sceKernelGetProcessTimeCounterFrequency(void);
 extern int32_t sceKernelIsNeoMode(void);
 extern void rt_log(const char *fmt, ...);   // dispatch.c: o totk.log
+// O pool interno da libkernel (~14 MiB; alimenta threads, mutexes, condvars e attrs: orbis-compat orbis_mem.h). Não
+// está em header nenhum; a chamada com um ponteiro zerado cobre as duas formas plausíveis (como o orbis_mem.cpp).
+extern unsigned long long sceKernelInternalMemoryGetAvailableSize(void *, unsigned long long, unsigned long long)
+    __attribute__((weak));
+unsigned long long orbis_internal_free(void) {
+    if (!&sceKernelInternalMemoryGetAvailableSize) return 0;
+    unsigned long long scratch[8] = {0};
+    unsigned long long r = sceKernelInternalMemoryGetAvailableSize(scratch, sizeof scratch, 0);
+    return scratch[0] ? scratch[0] : r;
+}
 extern int32_t sceRandomGetRandomNumber(void *buf, size_t size);  // libSceRandom: no máximo 64 bytes por chamada
 // O _umtx_op exportado pela libkernel (a syscall 454 é barrada pelo sandbox; o símbolo funciona: orbis-compat
 // sys/umtx.h). O <sys/umtx.h> do overlay NÃO é incluído: ele define um _umtx_op static inline que esconderia este, e
@@ -239,8 +249,9 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
     pthread_attr_destroy(&a);
     if (e) {
         rt_log("orbis: thread \"%s\" não nasceu: pilha direta %s (setstack %d, create %d), pilha do sistema de %zu KiB: "
-               "create %d; pilhas vivas %llu", t->name, t->stk.va ? "ok" : "sem memória", es, ed, size >> 10, e,
-               (unsigned long long)__atomic_load_n(&stack_count, __ATOMIC_RELAXED));
+               "create %d; pilhas vivas %llu; pool interno da libkernel livre %llu KiB", t->name,
+               t->stk.va ? "ok" : "sem memória", es, ed, size >> 10, e,
+               (unsigned long long)__atomic_load_n(&stack_count, __ATOMIC_RELAXED), orbis_internal_free() >> 10);
         free(t);
         return NULL;
     }
@@ -980,12 +991,12 @@ static void mem_report(const char *why) {
     sceKernelAvailableDirectMemorySize(0, (int64_t)sceKernelGetDirectMemorySize(), 0x200000, &st, &dfree);
     sceKernelAvailableFlexibleMemorySize(&ffree);
     rt_log("orbis mem (%s): jogo mapeou %llu MiB; pilhas %llu (%llu MiB); memória direta: maior trecho livre %llu MiB "
-           "de %llu MiB; flexível livre %llu MiB", why,
+           "de %llu MiB; flexível livre %llu MiB; pool interno da libkernel livre %llu KiB", why,
            (unsigned long long)(__atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) >> 20),
            (unsigned long long)__atomic_load_n(&stack_count, __ATOMIC_RELAXED),
            (unsigned long long)(__atomic_load_n(&stack_bytes, __ATOMIC_RELAXED) >> 20),
            (unsigned long long)(dfree >> 20), (unsigned long long)(sceKernelGetDirectMemorySize() >> 20),
-           (unsigned long long)(ffree >> 20));
+           (unsigned long long)(ffree >> 20), orbis_internal_free() >> 10);
 }
 static void *mem_monitor(void *arg) {
     (void)arg;

@@ -131,9 +131,11 @@ static void mass_fn(void *arg) {
     while (!__atomic_load_n(&mass_go, __ATOMIC_ACQUIRE)) plat_sleep_ms(5);
 }
 
+extern unsigned long long orbis_internal_free(void);
 static void step_threads_mass(void) {
     static PlatThread *t[NMASS];
     int made = 0;
+    unsigned long long pool0 = orbis_internal_free();
     uint64_t t0 = plat_now_ns();
     for (int i = 0; i < NMASS; i++) {
         if (!(t[made] = plat_thread_new_ex(mass_fn, NULL, "massa", 256 << 10))) break;
@@ -141,6 +143,9 @@ static void step_threads_mass(void) {
     }
     for (int i = 0; i < 200 && mass_alive < made; i++) plat_sleep_ms(5);
     int alive = mass_alive;
+    unsigned long long pool1 = orbis_internal_free();
+    say("threads  pool interno da libkernel: %llu KiB livres antes, %llu KiB com %d threads vivas (%.1f KiB por thread)",
+        pool0 >> 10, pool1 >> 10, made, made ? (double)(pool0 - pool1) / 1024.0 / made : 0.0);
     __atomic_store_n(&mass_go, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < made; i++) plat_thread_join(t[i]);
     check(made == NMASS, "threads", "em massa: %d de %d criadas ao mesmo tempo (%d chegaram a rodar), pilha de 256 KiB "
