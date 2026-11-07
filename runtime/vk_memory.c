@@ -1485,7 +1485,9 @@ static void mirror_create(PoolRec *r) {
     }
     // Cards of 8 GiB or less give at most an eighth of the device-local heap to mirrors (after NotRexed/Hookshot
     // c02f290d4): on an RTX 4060 Ti 8 GB mirrors reached 2.8 GiB, the textures spilled to system memory, 2-12 fps
-    // (issue #18). A mirror is a speed-up; the pool works imported. TOTK_MIRROR_MAX_MB overrides (0 = no cap).
+    // (issue #18). Cards of 12 GiB or less get at most 1 GiB: an RTX 5070 12 GB reached 2.96 GiB of mirrors in Kokiri
+    // village and fell to 9-11 fps, and held 30 fps with 1 GiB (Ocarina issue #88). A mirror is a speed-up; the pool
+    // works imported. TOTK_MIRROR_MAX_MB overrides (0 = no cap).
     static int64_t mirror_cap = -1;   // replay thread only
     if (mirror_cap < 0) {
         const char *s = cfg_get("TOTK_MIRROR_MAX_MB");
@@ -1493,7 +1495,7 @@ static void mirror_create(PoolRec *r) {
         for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
             if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT && c->mem_props.memoryHeaps[h].size > heap)
                 heap = c->mem_props.memoryHeaps[h].size;
-        mirror_cap = s && *s ? (int64_t)atoll(s) << 20 : heap && heap <= (8ull << 30) ? (int64_t)(heap / 8) : 0;
+        mirror_cap = s && *s ? (int64_t)atoll(s) << 20 : heap && heap <= (12ull << 30) ? (int64_t)(heap / 8 < (1ull << 30) ? heap / 8 : 1ull << 30) : 0;
         if (mirror_cap < 0) mirror_cap = 0;
         rt_log("mem: mirrors capped at %.0f MiB (0 = no cap; device-local heap %.0f MiB)", mirror_cap / 1048576.0,
                heap / 1048576.0);

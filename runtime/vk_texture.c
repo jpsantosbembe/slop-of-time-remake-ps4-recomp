@@ -1096,6 +1096,15 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         if (!e) e = any ? any : own;
     }
     if (!e) e = s->t.mem ? entry_of(&s->t) : NULL;
+    // A followed RGB9E5 descriptor over an R11G11B10F image reads the bytes as RGB9E5, as Maxwell does. Ocarina's tone map
+    // packs RGB9E5 by hand through an R32UI view; the RGB9E5 texture is made anew each frame, so the upscale network's
+    // slot followed the R11G11B10F target at that storage, read the bits as R11G11B10F (NaN and inf) and drew black.
+    // ponytail: this pair only; other formats of one size would need the same view (vk_exec_draw.c get_view)
+    if (e && s->t.d.format == 0x40 && e->t.d.format == 0x3f && !(s->has_view && s->v.set_format)) {
+        if (!*has_view) memset(view, 0, sizeof *view);
+        view->set_format = 1, view->format = 0x40;
+        *has_view = 1;
+    }
     // A followed texture is another descriptor at the same storage: its image holds the content, but sampling takes the
     // slot descriptor's swizzle. The UI renders text into RGBA8 and samples it through a (A,A,A,A) descriptor; with the
     // render target's RGBA swizzle the text blur saw R = 1 everywhere and drew solid boxes behind tips and labels.

@@ -332,8 +332,14 @@ static int create_device(void) {
     g_vk.max_buffer_size = p13.maxBufferSize;
     vk_caps_init(&g_vk);
 
+    // VMA keeps one empty block of each memory type (256 MiB by default): five types held ~1.3 GiB of the 8 GiB card
+    // doing nothing. A smaller preferred block cuts that reserve. TOTK_VMA_BLOCK_MIB overrides it.
+    const char *bm = cfg_get("TOTK_VMA_BLOCK_MIB");
+    VkDeviceSize block = bm && *bm ? (VkDeviceSize)atoi(bm) << 20 : 64ull << 20;
+    if (block < 16ull << 20) block = 16ull << 20;
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
+                                 .preferredLargeHeapBlockSize = block,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};

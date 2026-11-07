@@ -218,6 +218,7 @@ typedef struct {
 } PlatCrash;
 void plat_crash_hook(void (*fn)(const PlatCrash *c));
 void plat_crash_note(const char *note);   // this thread's current work, named by a crash outside the executable; NULL clears
+void plat_crash_file(const char *path);   // a crash with a note appends the note as a line to this file
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 int plat_mem_readable(uint64_t addr, uint64_t n);         // every page of [addr, addr + n) can be read; no fault
 void *plat_aligned_alloc(size_t size, size_t align);      // free with plat_aligned_free; NULL on failure
