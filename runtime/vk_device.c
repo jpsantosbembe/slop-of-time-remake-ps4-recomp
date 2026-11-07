@@ -287,6 +287,11 @@ static int create_device(void) {
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
     if (!c->mesh.meshShader) g_vk.has_mesh_shader = 0;
+    {   // ocarina-ps4 (frente M): the PS4's GCN has no mesh shaders; OCARINA_MESH_EMULATE=1 forces the emulation elsewhere
+        const char *e = cfg_get("OCARINA_MESH_EMULATE");
+        g_vk.mesh_emulate = !g_vk.has_mesh_shader || (e && *e == '1');
+        rt_log("vk: mesh shaders: %s", g_vk.mesh_emulate ? "emulated in compute (vk_mesh_emu.c)" : "native");
+    }
     c->mesh.multiviewMeshShader = c->mesh.primitiveFragmentShadingRateMeshShader = c->mesh.meshShaderQueries = 0;   // need features not enabled
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
