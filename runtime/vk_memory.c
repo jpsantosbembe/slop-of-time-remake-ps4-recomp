@@ -164,6 +164,9 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         free(r->wbuf), r->wbuf = NULL, r->nwin = 0;
         return 0;
     }
+    if (rt_knob("CRUMBS_LOG", "0"))
+        rt_log("vk: pool buffer %p = guest %#llx+%#llx (pool %#llx+%#llx)", (void *)r->buf, (unsigned long long)r->import_lo,
+               (unsigned long long)blen, (unsigned long long)addr, (unsigned long long)size);
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(c->device, r->buf, &req);
     int type = memory_type(c, req.memoryTypeBits & hp.memoryTypeBits,

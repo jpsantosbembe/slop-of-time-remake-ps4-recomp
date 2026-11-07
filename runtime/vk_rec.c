@@ -221,7 +221,9 @@ static void *tail_copy(uint8_t **at, const void *arr, size_t bytes) {
 #define PACK_BeginQuery *a = (A_BeginQuery){p, q, f}
 FIXED(BeginQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q, VkQueryControlFlags f), (cb, p, q, f),
       VkQueryPool p; uint32_t q; VkQueryControlFlags f)
-#define PACK_BindIndexBuffer *a = (A_BindIndexBuffer){b, o, t}
+static _Thread_local struct { VkBuffer b; VkDeviceSize o; int t; } crumb_ib;   // o último index buffer (TOTK_CRUMBS_LOG)
+static _Thread_local struct { VkBuffer b; VkDeviceSize o, sz; } crumb_vb;       // o primeiro vertex buffer ligado
+#define PACK_BindIndexBuffer crumb_ib.b = b, crumb_ib.o = o, crumb_ib.t = (int)t, *a = (A_BindIndexBuffer){b, o, t}
 FIXED(BindIndexBuffer, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t), (cb, b, o, t), VkBuffer b;
       VkDeviceSize o; VkIndexType t)
 static _Thread_local VkPipeline crumb_pipe;   // o último pipeline ligado nesta thread (TOTK_CRUMBS_LOG)
@@ -230,15 +232,18 @@ FIXED(BindPipeline, (VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p), 
       VkPipeline p)
 // TOTK_CRUMBS=draw (vk_crumbs.c): a breadcrumb ahead of each draw and dispatch, numbered across the run;
 // TOTK_CRUMBS_LOG=1 also logs each number with the command as it is recorded.
-static void work_crumb(VkCommandBuffer cb, const char *what) {
+static void work_crumb(VkCommandBuffer cb, const char *what, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3) {
     static volatile uint64_t n;
     static volatile int log_on = -1;
     if (!vk_crumbs_draws()) return;
     uint64_t k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
     if (log_on < 0) log_on = rt_knob("CRUMBS_LOG", "0");
     if (log_on)
-        rt_log("vk: crumb draw or dispatch %llu: %s, pipeline %p", (unsigned long long)(k & 0x0fffffff), what,
-               (void *)crumb_pipe);
+        rt_log("vk: crumb draw or dispatch %llu: %s(%llu, %llu, %llu, %lld), pipeline %p, ib %p+%#llx t%d, vb0 %p+%#llx/%#llx",
+               (unsigned long long)(k & 0x0fffffff), what, (unsigned long long)d0, (unsigned long long)d1,
+               (unsigned long long)d2, (long long)d3, (void *)crumb_pipe, (void *)crumb_ib.b,
+               (unsigned long long)crumb_ib.o, crumb_ib.t, (void *)crumb_vb.b, (unsigned long long)crumb_vb.o,
+               (unsigned long long)crumb_vb.sz);
     rec_crumb(cb, VK_CRUMB_DRAW, k);
 }
 
@@ -246,13 +251,18 @@ static void work_crumb(VkCommandBuffer cb, const char *what) {
 #define FIXED_WORK(name, params, call_args, ...)                                                                        \
     typedef struct { __VA_ARGS__; } A_##name;                                                                          \
     void rc_vkCmd##name params {                                                                                       \
-        work_crumb(cb, #name);                                                                                          \
+        work_crumb(cb, #name, DET_##name);                                                                             \
         if (!OWNED(cb)) { vkCmd##name call_args; return; }                                                             \
         A_##name *a = put(R_##name, sizeof *a);                                                                        \
         PACK_##name;                                                                                                    \
         pub();                                                                                                          \
     }
 
+#define DET_Dispatch x, y, z, 0
+#define DET_DispatchIndirect (uint64_t)(uintptr_t)b, o, 0, 0
+#define DET_Draw n, i, f, fi
+#define DET_DrawIndexed n, i, f, (uint64_t)(int64_t)v
+#define DET_DrawIndexedIndirect (uint64_t)(uintptr_t)b, o, n, s
 #define PACK_Dispatch *a = (A_Dispatch){x, y, z}
 FIXED_WORK(Dispatch, (VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z), (cb, x, y, z), uint32_t x, y, z)
 #define PACK_DispatchIndirect *a = (A_DispatchIndirect){b, o}
@@ -358,6 +368,7 @@ void rc_vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPi
 typedef struct { uint32_t first, n; const VkBuffer *b; const VkDeviceSize *o, *sz, *st; } A_BindVertexBuffers2;
 void rc_vkCmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o,
                                 const VkDeviceSize *sz, const VkDeviceSize *st) {
+    if (first == 0 && n) crumb_vb.b = b[0], crumb_vb.o = o[0], crumb_vb.sz = sz ? sz[0] : 0;
     if (!OWNED(cb)) { vkCmdBindVertexBuffers2(cb, first, n, b, o, sz, st); return; }
     size_t e = sizeof(VkDeviceSize) * n;
     A_BindVertexBuffers2 *a = put(R_BindVertexBuffers2, sizeof *a + A8(sizeof *b * n) + 3 * A8(e));
