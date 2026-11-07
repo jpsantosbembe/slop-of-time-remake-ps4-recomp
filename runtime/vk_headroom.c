@@ -55,7 +55,8 @@ const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void) {
 
 static VkDeviceSize block_size(const VkCtx *c, uint32_t type) {
     VkDeviceSize heap = c->mem_props.memoryHeaps[c->mem_props.memoryTypes[type].heapIndex].size;
-    return heap <= HR_SMALL_HEAP ? heap / 8 : 256ull << 20;   // VMA's default preferredLargeHeapBlockSize
+    VkDeviceSize large = vk_vma_block_size();   // the allocator's preferredLargeHeapBlockSize (0: VMA's 256 MiB)
+    return heap <= HR_SMALL_HEAP ? heap / 8 : large ? large : 256ull << 20;
 }
 
 static int room(const VkCtx *c, uint32_t type, VkDeviceSize block) {

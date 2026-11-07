@@ -2163,9 +2163,33 @@ void vk_upload_end(void) { plat_rmutex_unlock(&cmd_lock); }
 // the headroom thread (vk_headroom.c) or a burst of uploads held every staging allocation of the render thread: one
 // took 47-50 ms, for a few bytes, in the first frame after a save load. Larger buffers than a block go to the default
 // pool.
-#define STG_BLOCK (64ull << 20)
-#define STG_MIN_BLOCKS 2
+// ocarina-ps4 (dieta): OCARINA_STG_MIB e OCARINA_STG_MIN mudam o bloco e os blocos mantidos. No PS4 o headroom está
+// desligado (TOTK_VRAM_HEADROOM=0) e os 2 x 64 MiB ficavam presos na memória direta: lá o padrão é 1 bloco de 32 MiB.
+#ifdef __ORBIS__
+#define STG_BLOCK_DEF 32
+#define STG_MIN_DEF 1
+#else
+#define STG_BLOCK_DEF 64
+#define STG_MIN_DEF 2
+#endif
+static uint64_t STG_BLOCK = (uint64_t)STG_BLOCK_DEF << 20;
+static int STG_MIN_BLOCKS = STG_MIN_DEF;
 static VmaPool stg_pool;
+
+static long env_long(const char *name, long def) {
+    const char *e = getenv(name);
+    return e && *e ? atol(e) : def;
+}
+
+// preferredLargeHeapBlockSize do VMA (vk_device.c): OCARINA_VMA_BLOCK_MIB, 0 = padrão do VMA (256 MiB); PS4 64 MiB.
+VkDeviceSize vk_vma_block_size(void) {
+#ifdef __ORBIS__
+    long mib = env_long("OCARINA_VMA_BLOCK_MIB", 64);
+#else
+    long mib = env_long("OCARINA_VMA_BLOCK_MIB", 0);
+#endif
+    return mib > 0 ? (VkDeviceSize)mib << 20 : 0;
+}
 static int stg_pool_tried;
 
 void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
@@ -2178,6 +2202,9 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
         plat_once(&cmd_once, cmd_init, NULL);
         plat_rmutex_lock(&cmd_lock);
         if (!stg_pool_tried) {
+            long mib = env_long("OCARINA_STG_MIB", STG_BLOCK_DEF), keep = env_long("OCARINA_STG_MIN", STG_MIN_DEF);
+            STG_BLOCK = (uint64_t)(mib >= 4 ? mib : 4) << 20;
+            STG_MIN_BLOCKS = keep >= 0 ? (int)keep : 0;
             uint32_t type;
             VmaPoolCreateInfo pi = {.blockSize = STG_BLOCK, .minBlockCount = STG_MIN_BLOCKS};
             if (vmaFindMemoryTypeIndexForBufferInfo(c->vma, &bi, &aci, &type) == VK_SUCCESS) {

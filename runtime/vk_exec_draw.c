@@ -3756,6 +3756,43 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     cb_res(ex);
     dummies_init();
+    {   // ocarina-ps4 (dieta): DKB_SKIP_CS antes do shader_for. Os compute pulados (o upscaler do filme) eram traduzidos ou
+        // lidos do pack e ficavam no cache em memória: no PS4, 21,3M palavras de SPIR-V (81 MiB) mais a reflexão, para
+        // dispatches que nunca rodam. As duas pontas do filme (54b0..., 3f6f...) seguem pelo caminho de baixo: o blit
+        // que substitui a rede usa os recursos do shader.
+        static uint64_t early[32];
+        static int nearly = -1;
+        if (nearly < 0) {
+            int k = 0;
+            const char *e = getenv("DKB_SKIP_CS");
+            for (char *end; e && *e && k < 32; e = *end ? end + 1 : end) {
+                uint64_t o = strtoull(e, &end, 16);
+                if (o != 0x54b0fc2b1c8fbfc7ull && o != 0x3f6f2b1d671badcdull) early[k++] = o;
+                if (end == e) break;
+            }
+            nearly = k;
+        }
+        if (nearly) {
+            const uint8_t *ectl, *ecode = NULL;
+            uint32_t elen;
+            uint64_t eo = find_stage(ex->prog, NVN_STAGE_CS, &ectl, &ecode, &elen) ? nvn2_origin(ecode) : 0;
+            for (int i = 0; eo && i < nearly; i++)
+                if (early[i] == eo) {
+                    static uint64_t told[32];
+                    static int ntold;
+                    int was = 0;
+                    for (int t = 0; t < ntold; t++) was |= told[t] == eo;
+                    if (!was && ntold < 32) {
+                        told[ntold++] = eo;
+                        rt_log("vk: skipped dispatch %016llx %ux%ux%u caller %#llx (DKB_SKIP_CS, shader not loaded) frame %llu",
+                               (unsigned long long)eo, (unsigned)d->x, (unsigned)d->y, (unsigned)d->z,
+                               (unsigned long long)d->caller,
+                               (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+                    }
+                    return;
+                }
+        }
+    }
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
     if (!cs) {   // LOCAL TEST (Ocarina): lost dispatches, one line per caller
