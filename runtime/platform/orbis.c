@@ -1129,6 +1129,113 @@ static int map_window(Resv *r, uint64_t a) {
     return 1;
 }
 
+// ---- logs na tela (ocarina-ps4, 2026-11-07, pedido do João): as fases do boot, a memória e os erros fatais viram
+// notificações do sistema (o balão no canto da tela), que aparecem por cima de tudo e não dependem da GPU do jogo, então
+// valem mesmo com ela travada. Uma thread manda uma por vez (o sistema enfileira e mostra cada uma alguns segundos):
+// fatal na frente, as fases em ordem e, quando a fila está vazia, a última linha de memória. OCARINA_NOTIFY=0 desliga.
+extern int32_t sceKernelSendNotificationRequest(int32_t device, void *req, size_t size, int32_t blocking);
+typedef struct {
+    int32_t type, req_id, priority, msg_id, target_id, user_id, unk1, unk2, app_id, error_num, unk3;
+    uint8_t use_icon;
+    char message[1024], icon_uri[1024], unk[1024];
+} NotifyReq;
+#define NQ 16
+static char nq[NQ][160];
+static int nq_head, nq_tail;
+static char n_mem[160];
+static PlatMutex n_lock = PLAT_MUTEX_INIT;
+
+static void notify_send(const char *msg) {
+    static NotifyReq r;   // 3 KiB: fora da pilha
+    memset(&r, 0, sizeof r);
+    r.target_id = -1;
+    r.use_icon = 1;
+    snprintf(r.message, sizeof r.message, "%s", msg);
+    snprintf(r.icon_uri, sizeof r.icon_uri, "cxml://psnotification/tex_icon_system");
+    sceKernelSendNotificationRequest(0, &r, sizeof r, 0);
+}
+
+static void *notify_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        char msg[160] = "";
+        plat_mutex_lock(&n_lock);
+        if (nq_head != nq_tail) {
+            snprintf(msg, sizeof msg, "%s", nq[nq_head]);
+            nq_head = (nq_head + 1) % NQ;
+        } else if (n_mem[0]) {
+            snprintf(msg, sizeof msg, "%s", n_mem);
+            n_mem[0] = 0;
+        }
+        plat_mutex_unlock(&n_lock);
+        if (msg[0]) notify_send(msg);
+        usleep(msg[0] ? 3500000 : 500000);
+    }
+    return NULL;
+}
+
+static void notify_push(const char *msg, int urgent, int is_mem) {
+    static int on = -1;
+    if (on < 0) {
+        char v[8];
+        on = !(plat_getenv("OCARINA_NOTIFY", v, sizeof v) && v[0] == '0');
+        if (on) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, notify_thread, NULL)) on = 0;
+            else pthread_detach(t);
+        }
+    }
+    if (!on) return;
+    if (urgent) {   // fatal: na hora, sem esperar a fila (o processo pode morrer em seguida)
+        notify_send(msg);
+        return;
+    }
+    plat_mutex_lock(&n_lock);
+    if (is_mem) snprintf(n_mem, sizeof n_mem, "%s", msg);
+    else if ((nq_tail + 1) % NQ != nq_head) {
+        snprintf(nq[nq_tail], sizeof nq[0], "%s", msg);
+        nq_tail = (nq_tail + 1) % NQ;
+    }
+    plat_mutex_unlock(&n_lock);
+}
+
+// As linhas que viram notificação: as fases do boot (palavras do log do runtime, nenhuma do jogo), os fatais e a memória.
+void plat_log_line(const char *line, size_t n) {
+    char l[200];
+    snprintf(l, sizeof l, "%.*s", (int)(n < sizeof l - 1 ? n : sizeof l - 1), line);
+    for (char *p = l; *p; p++)
+        if (*p == '\n') *p = 0;
+    const char *t = !strncmp(l, "[host] ", 7) ? l + 7 : l;
+    static const struct { const char *key, *say; } phases[] = {
+        {"boot: guest starts", "Boot: código do jogo carregado"},
+        {"RomFS ready", "Boot: RomFS pronto"},
+        {"ENTER nnMain", "Boot: o jogo começou (nnMain)"},
+        {"audio: sceAudioOut", "Áudio aberto"},
+        {"host save storage", "Save montado"},
+        {"prebuilt libraries a draw used", "GPU: primeiros desenhos"},
+    };
+    if (!strncmp(t, "FATAL", 5)) {
+        char m[200];
+        snprintf(m, sizeof m, "ERRO: %s", t);
+        notify_push(m, 1, 0);
+        return;
+    }
+    for (unsigned i = 0; i < sizeof phases / sizeof phases[0]; i++)
+        if (strstr(t, phases[i].key)) {
+            notify_push(phases[i].say, 0, 0);
+            return;
+        }
+    if (!strncmp(t, "orbis mem", 9)) {
+        unsigned long long jogo = 0, livre = 0, total = 0;
+        const char *a = strstr(t, "jogo mapeou "), *b = strstr(t, "maior trecho livre ");
+        if (a) jogo = strtoull(a + 12, NULL, 10);
+        if (b) sscanf(b + 19, "%llu MiB de %llu", &livre, &total);
+        char m[160];
+        snprintf(m, sizeof m, "Memória: jogo %llu MiB, livre %llu de %llu MiB", jogo, livre, total);
+        notify_push(m, 0, 1);
+    }
+}
+
 // ---- commit preguiçoso (ocarina-ps4, 2026-11-07). O OoT pede um heap de 6,2 GiB de uma vez (nninitStartup:
 // SetHeapSize 0x18ac00000), mais do que a memória direta inteira do PS4. Com o commit preguiçoso, plat_mem_commit só
 // marca as subpáginas; a janela de 2 MiB é mapeada no primeiro toque da CPU (lazy_fault, no tratador de SIGSEGV) ou
@@ -1836,7 +1943,18 @@ void plat_exit(int code) { orbis_idle_exit(code); }
 
 // O main do runtime (main.c, renomeado para rt_main no PS4) volta por vários caminhos; aqui ele nunca retorna.
 int rt_main(int argc, char **argv);
-int main(int argc, char **argv) { orbis_idle_exit(rt_main(argc, argv)); }
+// O stderr do processo (o do runtime antes do log abrir, o do Mesa, com o dump de GPU travada) não vai a lugar nenhum no
+// PS4: vira /data/ocarina/logs/stderr.log, um por execução.
+int main(int argc, char **argv) {
+    mkdir(ORBIS_DATA_DIR, 0755);
+    mkdir(ORBIS_DATA_DIR "/logs", 0755);
+    int fd = open(ORBIS_DATA_DIR "/logs/stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        dup2(fd, 2);
+        close(fd);
+    }
+    orbis_idle_exit(rt_main(argc, argv));
+}
 
 int plat_setenv(const char *name, const char *value) {
     return (value ? setenv(name, value, 1) : unsetenv(name)) == 0;

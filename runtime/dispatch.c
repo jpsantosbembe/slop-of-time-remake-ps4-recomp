@@ -44,6 +44,15 @@ void rt_fatal(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     rt_log_raw("FATAL: ", 7);
+    {
+        extern void plat_log_line(const char *line, size_t n);
+        char b[512] = "FATAL: ";
+        va_list aq;
+        va_copy(aq, ap);
+        int k = vsnprintf(b + 7, sizeof b - 7, fmt, aq);
+        va_end(aq);
+        plat_log_line(b, k > 0 ? strlen(b) : 7);
+    }
     rt_vlogf(fmt, ap);
     rt_log_raw("\n", 1);
     va_end(ap);

@@ -78,6 +78,9 @@ void rt_logf(const char *fmt, ...) {
     va_end(ap);
 }
 
+// Uma linha completa de log (rt_log, os FATAL); a plataforma pode mostrá-la ao jogador (PS4: notificações na tela).
+__attribute__((weak)) void plat_log_line(const char *line, size_t n) { (void)line, (void)n; }
+
 void rt_log(const char *fmt, ...) {
     char buf[2048];
     int n = snprintf(buf, sizeof buf, "[host] ");
@@ -88,6 +91,7 @@ void rt_log(const char *fmt, ...) {
     n = k < 0 ? n : n + k < (int)sizeof buf - 1 ? n + k : (int)sizeof buf - 2;
     buf[n++] = '\n';
     rt_log_raw(buf, n);
+    plat_log_line(buf, (size_t)n);
 }
 
 const char *rt_log_path(void) {
@@ -224,6 +228,12 @@ static void crash_handler(const PlatCrash *x) {
     char d[160];
     uintptr_t rip = x->rip;
     rt_logf("FATAL: %s (%#x) at host %p (totk+%#llx)", x->what, x->code, (void *)rip, (unsigned long long)x->offset);
+    {
+        extern void plat_log_line(const char *line, size_t n);
+        char b[160];
+        int k = snprintf(b, sizeof b, "FATAL: %s em totk+%#llx", x->what, (unsigned long long)x->offset);
+        plat_log_line(b, k > 0 ? (size_t)k : 0);
+    }
     if (x->access >= 0)
         rt_logf(", %s address %#llx", x->access == 1 ? "writing" : x->access == 8 ? "executing" : "reading",
                 (unsigned long long)x->addr);
