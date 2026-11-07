@@ -82,7 +82,11 @@ void *vk_crumbs_watch(void *arg) {
         else same = 0, said = 0, rec0 = rec;
         last0 = w0, last1 = w1;
         // still words: between two crumbs (w0 != w1), or after the last one while the CPU recorded more past it
-        int ahead = rec >= rec0 + 2;
+        // An end crumb (submission, upload batch, present) both reached and finished is an idle GPU: the next submission
+        // starts with its own crumb, so a hang there would have moved the words (a false alarm after end of present 1504)
+        unsigned kind = w1 >> 28;
+        int idle = w0 == w1 && (kind == VK_CRUMB_SUBMIT_END || kind == VK_CRUMB_UPLOAD_END || kind == VK_CRUMB_PRESENT_END);
+        int ahead = rec >= rec0 + 2 && !idle;
         if (same >= 3 && !said && w0 && (w0 != w1 || ahead)) {
             said = 1;
             char reached[96], finished[96], next[96];
