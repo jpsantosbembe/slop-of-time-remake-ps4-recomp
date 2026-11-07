@@ -1439,6 +1439,19 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         uint64_t extra = st == NVN_STAGE_CS && !ubo && b->size ? slack : 0;
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead + extra : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
                        written, guarded, &bi)) {
+            // ocarina-ps4 (frente A, diagnóstico): OCARINA_SSBO_CAP=<bytes> corta o range de um storage buffer dos
+            // estágios gráficos maior que isso, para a robustez devolver 0 em vez de a leitura ir até o fim do pool (o VS
+            // 2f41b68b103a0f24 indexa vp_s0 por InstanceIndex / N, N lido do próprio buffer). OCARINA_SSBO_LOG=1 registra
+            // os primeiros 64 ranges acima de 1 MiB nos estágios gráficos (endereço, tamanho do c0, range ligado).
+            static int64_t cap = -1, slog = -1;
+            static volatile int32_t n_slog;
+            if (cap < 0) { const char *e = getenv("OCARINA_SSBO_CAP"); cap = e ? (int64_t)strtoull(e, NULL, 0) : 0; }
+            if (slog < 0) { const char *e = getenv("OCARINA_SSBO_LOG"); slog = e && *e == '1'; }
+            if (st != NVN_STAGE_CS && !ubo && bi.range > 0x100000 && slog && plat_inc32(&n_slog) <= 64)
+                rt_log("ssbo: stage %d c%d+%#x addr %#llx size %#llx range %#llx guarded %d%s", st, r->cbuf_slot, r->handle * 4,
+                       (unsigned long long)b->addr, (unsigned long long)b->size, (unsigned long long)bi.range, guarded,
+                       cap && (int64_t)bi.range > cap ? " (cortado pelo OCARINA_SSBO_CAP)" : "");
+            if (st != NVN_STAGE_CS && !ubo && cap && (int64_t)bi.range > cap) bi.range = (VkDeviceSize)cap;
             if (written && bi.buffer != VK_NULL_HANDLE) {
                 {   // LOCAL TEST (Ocarina): OOT_WB_LOG=<present>: what is marked written, by stage, guarded and size, in one present
                     static long wb_at = -2;
