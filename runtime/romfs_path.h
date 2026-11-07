@@ -3,6 +3,7 @@
 // RomFS path validation shared by the runtime (romfs.c) and its probe (fs_host.c probe_fs).
 #pragma once
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 // A RomFS-relative path: non-empty, no leading '/', no '\', no empty, "." or ".." component.
@@ -29,11 +30,15 @@ static inline const char *romfs_path_relative(const char *mount, const char *pat
     path += size + 2;
     while (*path == '/') ++path;
     if (strstr(path, "//")) {
-        static _Thread_local char collapsed[4096];
+        // No heap, um por thread no primeiro uso (ocarina-ps4: o bloco TLS do processo inteiro vai para toda thread, e o
+        // carregador de dev do PS4 reserva só 8 KiB; dois buffers de 4 KiB aqui, um por arquivo que inclui isto, não cabiam).
+        enum { COLLAPSED = 4096 };
+        static _Thread_local char *collapsed;
+        if (!collapsed && !(collapsed = malloc(COLLAPSED))) return NULL;
         size_t n = 0;
         for (const char *q = path; *q; q++) {
             if (*q == '/' && (q[1] == '/' || !q[1])) continue;
-            if (n + 1 >= sizeof collapsed) return NULL;
+            if (n + 1 >= COLLAPSED) return NULL;
             collapsed[n++] = *q;
         }
         collapsed[n] = 0;
