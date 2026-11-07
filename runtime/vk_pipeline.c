@@ -2179,6 +2179,8 @@ static int crash_count(const char *note) {
     for (const char *at = crashed; at && (at = strstr(at, note)); at += len)
         n += (at == crashed || at[-1] == '\n') && (at[len] == '\n' || at[len] == '\r');
     return n;
+}
+
 // frente M: the mesh stage of an emulated pipeline as a compute pipeline (vk_mesh_emu_spirv.c), entered for the graphics
 // pipeline gfx (vk_exec_draw.c finds it at the draw). The NaN min/max rewrite applies as it would to the mesh module.
 static VkPipeline mesh_emu_one(const GfxShader *ms, uint32_t off, const Layout *l, VkPipelineCache cache, MeshEmuInfo *out) {
