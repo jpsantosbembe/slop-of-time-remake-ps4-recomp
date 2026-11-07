@@ -1306,7 +1306,9 @@ static void mirror_mode(int discrete) {
     freeze_idle = fi && *fi ? atoi(fi) : 60;
     if (freeze_idle < 0) freeze_idle = 0;
     const char *sh = cfg_get("TOTK_SHADOW");
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ORBIS__)
+    // ocarina-ps4: no PS4 a cópia de cada pool dobra a memória (um pool de 244 MiB do OoT não coube); o mesa-ps4 importa
+    // a memória do jogo pelo próprio ponteiro (VK_EXT_external_memory_host), então o padrão é import, sem cópia.
     shadow_on = sh && *sh && strcmp(sh, "0");
 #else
     shadow_on = !sh || !*sh || strcmp(sh, "0");

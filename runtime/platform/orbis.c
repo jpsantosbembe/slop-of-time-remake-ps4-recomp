@@ -121,7 +121,7 @@ static void fx_wake(volatile uint32_t *w, int n) { _umtx_op((void *)w, UMTX_OP_W
 // Sem memória direta livre, a thread volta à pilha flexível do pthread (com o tamanho pedido) e a fibra ao mmap.
 #define STACK_PAGE 0x4000ull   // página do PS4
 
-typedef struct { void *va; size_t len; int64_t off; } DStack;   // va == NULL: nenhuma (pilha do sistema ou do mmap)
+typedef struct { void *va; size_t len; int64_t off; int lazy; } DStack;   // va == NULL: nenhuma; lazy: vaga + 1
 
 static size_t stack_default(void) {
     static size_t v;
@@ -139,12 +139,127 @@ static size_t stack_default(void) {
 // OCARINA_STACK_CAP_MIB=<MiB> (padrão 8) limita cada pilha. TODO: pilhas preguiçosas (reserva + janelas no toque, como
 // o heap) para devolver o tamanho pedido sem gastar memória.
 static uint64_t stack_bytes, stack_count;   // pilhas em memória direta vivas (o monitor de memória mostra)
+#define SYS_STACK_CAP (8u << 20)   // pilha do sistema ou do mmap (memória flexível, ~400 MiB no total)
+
+// Pilhas preguiçosas (2026-11-07): cada pilha reserva o espaço virtual inteiro (os 256 MiB do HOST_STACK) e só ganha
+// memória direta em pedaços de 64 KiB no primeiro toque (lazy_stack_fault, no tratador de SIGSEGV, que roda na pilha de
+// sinal). O topo (LS_PREFAULT) já nasce mapeado: o sistema escreve ali antes do nosso código, e a primeira falta da
+// thread precisa achar a pilha de sinal instalada (thread_main). O pedaço mais baixo é a guarda: nunca é mapeado.
+// OCARINA_EAGER_STACKS=1 volta às pilhas físicas inteiras (teto de 8 MiB).
+#define LS_CHUNK 0x10000ull
+#define LS_PREFAULT (512ull << 10)
+#define MAX_LSTACK 1024
+typedef struct { uint64_t base, end; int64_t *off; volatile int32_t live; } LStack;   // base: acima da guarda
+static LStack lstk[MAX_LSTACK];
+static volatile int32_t nlstk;   // vagas só crescem; o tratador lê sem trava
+static PlatMutex ls_lock = PLAT_MUTEX_INIT;
+
+static int eager_stacks(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("OCARINA_EAGER_STACKS");
+        v = e && *e == '1';
+    }
+    return v;
+}
+
+// Mapeia o pedaço de 64 KiB que contém a. ls_lock tomado por quem chama.
+static int ls_map_chunk(LStack *st, uint64_t a) {
+    size_t i = (size_t)((a - st->base) / LS_CHUNK);
+    if (st->off[i] >= 0) return 1;
+    int64_t off = 0;
+    if (sceKernelAllocateDirectMemory(0, (int64_t)sceKernelGetDirectMemorySize(), LS_CHUNK, LS_CHUNK, K_WB_ONION, &off))
+        return 0;
+    void *want = (void *)(uintptr_t)(st->base + i * LS_CHUNK), *va = want;
+    if (sceKernelMapDirectMemory(&va, LS_CHUNK, K_PROT_CPU_R | K_PROT_CPU_W, K_MAP_FIXED, off, LS_CHUNK) || va != want) {
+        sceKernelReleaseDirectMemory(off, LS_CHUNK);
+        return 0;
+    }
+    st->off[i] = off;
+    __atomic_add_fetch(&stack_bytes, LS_CHUNK, __ATOMIC_RELAXED);
+    return 1;
+}
+
+// Falta numa pilha preguiçosa ainda não mapeada: mapeia e devolve a instrução. Pedaço já mapeado ou guarda: 0.
+static int lazy_stack_fault(uint64_t a) {
+    int n = __atomic_load_n(&nlstk, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        LStack *st = &lstk[i];
+        if (!__atomic_load_n(&st->live, __ATOMIC_ACQUIRE) || a < st->base || a >= st->end) continue;
+        plat_mutex_lock(&ls_lock);
+        int ok = st->live && st->off[(a - st->base) / LS_CHUNK] < 0 && ls_map_chunk(st, a);
+        plat_mutex_unlock(&ls_lock);
+        return ok;
+    }
+    return 0;
+}
+
+static void ls_release(LStack *st, uint64_t total_va, size_t total) {
+    for (uint64_t a = st->base; a < st->end; a += LS_CHUNK) {
+        int64_t *o = &st->off[(a - st->base) / LS_CHUNK];
+        if (*o < 0) continue;
+        sceKernelMunmap((void *)(uintptr_t)a, LS_CHUNK);
+        sceKernelReleaseDirectMemory(*o, LS_CHUNK);
+        *o = -1;
+        __atomic_sub_fetch(&stack_bytes, LS_CHUNK, __ATOMIC_RELAXED);
+    }
+    sceKernelMunmap((void *)(uintptr_t)total_va, total);
+}
+
+static int lstack_alloc(DStack *d, size_t len) {
+    size_t total = (size_t)(((len + LS_CHUNK - 1) & ~(LS_CHUNK - 1)) + LS_CHUNK);
+    void *va = NULL;
+    if (sceKernelReserveVirtualRange(&va, total, 0, LS_CHUNK) || !va) return 0;
+    plat_mutex_lock(&ls_lock);
+    int slot = -1, n = nlstk;
+    for (int i = 0; i < n; i++)
+        if (!lstk[i].live && !lstk[i].off) { slot = i; break; }
+    if (slot < 0 && n < MAX_LSTACK) slot = n;
+    LStack *st = slot >= 0 ? &lstk[slot] : NULL;
+    int64_t *offs = st ? malloc((total / LS_CHUNK) * sizeof *offs) : NULL;
+    if (!offs) {
+        plat_mutex_unlock(&ls_lock);
+        sceKernelMunmap(va, total);
+        return 0;
+    }
+    for (size_t i = 0; i < total / LS_CHUNK; i++) offs[i] = -1;
+    st->base = (uint64_t)(uintptr_t)va + LS_CHUNK, st->end = (uint64_t)(uintptr_t)va + total, st->off = offs;
+    int ok = 1;
+    for (uint64_t a = st->end - (LS_PREFAULT < total - LS_CHUNK ? LS_PREFAULT : total - LS_CHUNK); ok && a < st->end;
+         a += LS_CHUNK)
+        ok = ls_map_chunk(st, a);
+    if (!ok) {
+        ls_release(st, (uint64_t)(uintptr_t)va, total);
+        free(offs);
+        st->off = NULL;
+        plat_mutex_unlock(&ls_lock);
+        return 0;
+    }
+    __atomic_store_n(&st->live, 1, __ATOMIC_RELEASE);
+    if (slot == n) __atomic_store_n(&nlstk, n + 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&ls_lock);
+    d->va = va, d->len = total, d->off = 0, d->lazy = slot + 1;
+    __atomic_add_fetch(&stack_count, 1, __ATOMIC_RELAXED);
+    return 1;
+}
+
+static void lstack_free(DStack *d) {
+    LStack *st = &lstk[d->lazy - 1];
+    plat_mutex_lock(&ls_lock);
+    __atomic_store_n(&st->live, 0, __ATOMIC_RELEASE);
+    ls_release(st, (uint64_t)(uintptr_t)d->va, d->len);
+    free(st->off);
+    st->off = NULL;
+    plat_mutex_unlock(&ls_lock);
+    d->va = NULL, d->lazy = 0;
+    __atomic_sub_fetch(&stack_count, 1, __ATOMIC_RELAXED);
+}
 static size_t stack_cap(void) {
     static size_t v;
     if (!v) {
         const char *e = getenv("OCARINA_STACK_CAP_MIB");
         long m = e && *e ? strtol(e, NULL, 10) : 0;
-        v = (m >= 1 && m <= 1024 ? (size_t)m : 8) << 20;
+        v = (m >= 1 && m <= 1024 ? (size_t)m : eager_stacks() ? 8 : 256) << 20;
     }
     return v;
 }
@@ -152,6 +267,7 @@ static size_t stack_cap(void) {
 // len bytes usáveis acima da página de guarda (no máximo stack_cap()); 1 quando deu.
 static int dstack_alloc(DStack *s, size_t len) {
     if (len > stack_cap()) len = stack_cap();
+    if (!eager_stacks()) return lstack_alloc(s, len);
     len = (len + STACK_PAGE - 1) & ~(size_t)(STACK_PAGE - 1);
     len += STACK_PAGE;
     int64_t off = 0;
@@ -163,7 +279,7 @@ static int dstack_alloc(DStack *s, size_t len) {
         return 0;
     }
     sceKernelMprotect(va, STACK_PAGE, 0);   // a guarda; se o kernel recusar, a pilha só fica sem ela
-    s->va = va, s->len = len, s->off = off;
+    s->va = va, s->len = len, s->off = off, s->lazy = 0;
     __atomic_add_fetch(&stack_bytes, len, __ATOMIC_RELAXED);
     __atomic_add_fetch(&stack_count, 1, __ATOMIC_RELAXED);
     return 1;
@@ -171,6 +287,10 @@ static int dstack_alloc(DStack *s, size_t len) {
 
 static void dstack_free(DStack *s) {
     if (!s->va) return;
+    if (s->lazy) {
+        lstack_free(s);
+        return;
+    }
     sceKernelMunmap(s->va, s->len);
     sceKernelReleaseDirectMemory(s->off, s->len);
     s->va = NULL;
@@ -242,7 +362,7 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
         }
     }
     if (e) {
-        if (size > stack_cap()) size = stack_cap();
+        if (size > SYS_STACK_CAP) size = SYS_STACK_CAP;
         pthread_attr_setstacksize(&a, size);
         e = pthread_create(&t->t, &a, thread_main, t);
     }
@@ -413,12 +533,12 @@ PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     if (!stack) stack = stack_default();
     stack = (stack + KPAGE - 1) & ~(size_t)(KPAGE - 1);
     if (stack < 2 * KPAGE) stack = 2 * KPAGE;
-    if (stack > stack_cap()) stack = stack_cap();   // também no mmap de reserva (memória flexível, ~400 MiB no total)
     void *m;
     if (dstack_alloc(&f->stk, stack)) {
         m = f->stk.va;
         stack = f->stk.len;
     } else {
+        if (stack > SYS_STACK_CAP) stack = SYS_STACK_CAP;   // o mmap de reserva vem da memória flexível
         m = mmap(NULL, stack, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (m == MAP_FAILED) {
             free(f);
@@ -1300,6 +1420,7 @@ static void fault_handler(int sig, siginfo_t *si, void *ucv) {
     const uint64_t *uc = ucv;
     if (sig == ORBIS_SIGSEGV || sig == ORBIS_SIGBUS) {
         if (lazy_fault(a)) return;
+        if (lazy_stack_fault(a)) return;
         if (ww_fault(a)) return;
         if (fault_hook && fault_hook(a)) return;
     }
