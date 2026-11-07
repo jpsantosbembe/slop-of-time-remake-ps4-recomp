@@ -290,22 +290,26 @@ static void step_vulkan(void) {
     char e[16];
     int frames = plat_getenv("OCARINA_PROBE_FRAMES", e, sizeof e) ? atoi(e) : 600;
     if (frames < 1) frames = 1;
+    // Padrão: um azul-escuro fixo (sem pisca-pisca na TV, pedido do João em 2026-11-07). OCARINA_PROBE_CORES=1 volta à
+    // sequência vermelho, verde, azul e branco, um segundo cada, para conferir as cores a olho.
     static const float colors[4][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}, {1, 1, 1, 1}};
+    static const float calm[4] = {0, 0, 0.2f, 1};   // 0x33 no azul
+    int cores = plat_getenv("OCARINA_PROBE_CORES", e, sizeof e) && e[0] == '1';
     vk_present_capture(1);
     int bad_clear = 0, readback = -1;
     uint64_t f0 = plat_now_ns(), worst = 0, prev = f0;
     for (int i = 0; i < frames; i++) {
-        const float *rgba = colors[(i / 60) % 4];
+        const float *rgba = cores ? colors[(i / 60) % 4] : calm;
         if (!source_clear(&s, i == 0, rgba)) bad_clear++;
         vk_present_image(s.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_FORMAT_R8G8B8A8_UNORM, SRC_W, SRC_H, NULL);
-        if (i == 0) {   // o centro do primeiro quadro, lido de volta do swapchain: vermelho puro
+        if (i == 0) {   // o centro do primeiro quadro, lido de volta do swapchain: vermelho puro ou o azul-escuro
             const uint8_t *px;
             int w, h;
             VkFormat fmt;
             if (vk_present_captured(&px, &w, &h, &fmt)) {
                 const uint8_t *m = px + ((size_t)(h / 2) * w + w / 2) * 4;
                 int red = fmt == VK_FORMAT_B8G8R8A8_UNORM ? m[2] : m[0], blue = fmt == VK_FORMAT_B8G8R8A8_UNORM ? m[0] : m[2];
-                readback = red == 255 && m[1] == 0 && blue == 0;
+                readback = cores ? red == 255 && m[1] == 0 && blue == 0 : red == 0 && m[1] == 0 && blue >= 0x30 && blue <= 0x36;
                 say("vulkan   swapchain %dx%d formato %d; centro do 1o quadro %02x %02x %02x", w, h, (int)fmt, m[0], m[1], m[2]);
             }
             vk_present_capture(0);
@@ -318,8 +322,9 @@ static void step_vulkan(void) {
     check(!bad_clear, "vulkan", "%d quadros em %.2f s (%.1f por segundo, o pior %.1f ms), %d limpezas falharam", frames,
           secs, frames / secs, worst / 1e6, bad_clear);
     check(readback == 1, "vulkan", "leitura de volta do 1o quadro: %s",
-          readback < 0 ? "não capturado" : readback ? "vermelho" : "cor errada");
-    say("vulkan   na tela: vermelho, verde, azul e branco, um segundo cada (confira a olho)");
+          readback < 0 ? "não capturado" : readback ? (cores ? "vermelho" : "azul-escuro") : "cor errada");
+    if (cores) say("vulkan   na tela: vermelho, verde, azul e branco, um segundo cada (confira a olho)");
+    else say("vulkan   na tela: azul-escuro fixo (OCARINA_PROBE_CORES=1 mostra a sequência de cores)");
     vkDeviceWaitIdle(c->device);
 }
 

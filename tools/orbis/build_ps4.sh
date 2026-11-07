@@ -10,7 +10,8 @@
 # O C gerado, o ExeFS e o RomFS (só o index.json, para o romfs-index.bin) são LIDOS da árvore principal
 # ($OCARINA_MAIN, padrão ~/ocarina-ps4/ext/ocarina-recomp), com o tools/oot/patch_generated.py já aplicado lá. A saída
 # vai para build/oot111-orbis desta árvore: ocarina.elf, eboot.bin, romfs-index.bin e o PKG em pkg/.
-# Variáveis: JOBS (padrão 8), NICE (padrão 10), OUT, LOG, TITLE_ID (OCAR00001), PKG_TITLE ("Ocarina PS4 (teste)").
+# Variáveis: JOBS (padrão 8), NICE (padrão 10), OUT, LOG. O PKG sai com o nome, o ID e a arte lidos do jogo
+# (~/ocarina-ps4/pkg_jogo.sh, variante teste).
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN=${OCARINA_MAIN:-$HOME/ocarina-ps4/ext/ocarina-recomp}
@@ -18,9 +19,7 @@ OUT=${OUT:-$R/build/oot111-orbis}
 LOG=${LOG:-$HOME/ocarina-ps4/oot-orbis-build.log}
 JOBS=${JOBS:-8}
 NICE=${NICE:-10}
-TITLE_ID=${TITLE_ID:-OCAR00001}
-PKG_TITLE=${PKG_TITLE:-Ocarina PS4 (teste)}
-MAKE_PKG=${MAKE_PKG:-$HOME/ocarina-ps4/make_pkg.sh}
+PKG_JOGO=${PKG_JOGO:-$HOME/ocarina-ps4/pkg_jogo.sh}
 
 bg=0 pkg=1
 extra=()
@@ -53,7 +52,7 @@ nice -n "$NICE" python3 tools/build_game.py --target orbis --version oot111 --ge
     --jobs "$JOBS" ${extra[@]+"${extra[@]}"}
 rc=$?
 if [ $rc = 0 ] && [ $pkg = 1 ] && [ -f "$OUT/eboot.bin" ] && [ ${#extra[@]} = 0 ]; then
-    bash "$MAKE_PKG" "$OUT/eboot.bin" "$OUT/pkg" "$TITLE_ID" "$PKG_TITLE" neo
+    bash "$PKG_JOGO" "$OUT/eboot.bin" "$OUT/pkg" teste
     rc=$?
 fi
 echo "build_ps4: $(date '+%F %T') fim"
