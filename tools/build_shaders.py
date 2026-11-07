@@ -54,7 +54,8 @@ def stale(runtime):
 
 
 def shader_sources(runtime):
-    return sorted([*(runtime / 'shaders').glob('*.comp'), *(runtime / 'shaders').glob('*.spvasm')])
+    return sorted([*(runtime / 'shaders').glob('*.comp'), *(runtime / 'shaders').glob('*.vert'),
+                   *(runtime / 'shaders').glob('*.spvasm')])
 
 
 def compile_one(src):
@@ -64,7 +65,7 @@ def compile_one(src):
             subprocess.run([str(BIN / 'spirv-as.exe') if WIN else 'spirv-as', '--target-env', TARGET,
                             '-o', str(spv), str(src)], check=True)
         else:
-            subprocess.run([str(BIN / 'glslc.exe') if WIN else 'glslc', '-O', f'--target-env={TARGET}', '-fshader-stage=compute',
+            subprocess.run([str(BIN / 'glslc.exe') if WIN else 'glslc', '-O', f'--target-env={TARGET}', '-fshader-stage=' + ('vertex' if src.suffix == '.vert' else 'compute'),
                             '-o', str(spv), str(src)], check=True)
         subprocess.run([str(BIN / 'spirv-val.exe') if WIN else 'spirv-val', f'--target-env', TARGET, str(spv)], check=True)
         data = spv.read_bytes()

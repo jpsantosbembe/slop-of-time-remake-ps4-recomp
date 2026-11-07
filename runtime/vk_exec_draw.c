@@ -30,6 +30,7 @@
 #include "nvn_geometry_control.h"
 #include "nvn_indirect_reset.h"
 #include "vk.h"
+#include "vk_mesh_emu.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
 
@@ -247,7 +248,8 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
                                  .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                       .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
         VmaAllocationInfo info;
@@ -2836,6 +2838,83 @@ unsupported:
 
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
 static int draw_is_mesh;   // LOCAL TEST (Ocarina): op_draw_mesh_ind is calling prepare_draw
+
+// ---- frente M: mesh draws emulated in compute (docs/frente-M.md, vk_mesh_emu.c)
+// op_draw_mesh(_ind) fill the group count (direct, or the {count, 1, 1} record of mesh_args); prepare_draw, once the
+// pipeline is known, ends the pass, runs the mesh stage as a compute over the draw's slabs and reopens the pass; the op
+// then draws the slabs' triangles with the pull vertex shader (mesh_emu_draw).
+static struct {
+    int on;                        // the current mesh draw is emulated
+    uint32_t direct;               // groups of a direct draw, 0 for an indirect one
+    VkBuffer ind;                  // indirect: the {count, 1, 1} record
+    VkDeviceSize ind_off;
+    // set by mesh_emu_dispatch for mesh_emu_draw
+    VkPipelineLayout layout;
+    VkDescriptorSet set;
+    VkBuffer ctl, idx;
+    VkDeviceSize ctl_off, idx_off;
+} ME;
+
+static int mesh_emu_dispatch(VkExec *ex, VkPipeline p, const VkPipeInfo *info) {
+    MeshEmuPipe *e = mesh_emu_find(p);
+    if (!e) return 0;
+    const MeshEmuInfo *mi = &e->info;
+    if (!e->cinfo_ok) {   // the graphics bindings at the compute bind point, written with write structs (no template)
+        e->cinfo = *info;
+        e->cinfo.pipeline = e->cs;
+        e->cinfo.bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
+        e->cinfo.tpl[0] = e->cinfo.tpl[1] = VK_NULL_HANDLE;
+        e->cinfo_ok = 1;
+    }
+    uint32_t cap = ME.ind ? mesh_emu_default_cap() : ME.direct;
+    if (!cap) return 0;
+    uint32_t pw = mi->payload_words ? mi->payload_words : 1;
+    uint32_t words = MESH_EMU_CTL_ARRAYS + pw + 64;   // the payload copy can read up to a workgroup past its end
+    VkBuffer cbuf;
+    VkDeviceSize coff;
+    uint32_t *ctl = (uint32_t *)scratch(ex, words * 4ull, &cbuf, &coff);
+    memset(ctl, 0, words * 4ull);
+    ctl[MESH_EMU_CTL_DRAW + 0] = ME.ind ? 0 : cap * mi->prims * 3;   // workgroup 0 writes it too
+    ctl[MESH_EMU_CTL_DRAW + 1] = 1;
+    ctl[MESH_EMU_CTL_CAP] = cap;
+    ctl[MESH_EMU_CTL_TMAX] = 1;
+    ctl[MESH_EMU_CTL_STRIDE] = mi->stride;
+    for (int i = 0; i < MESH_EMU_LOCS; i++) ctl[MESH_EMU_CTL_LOC + i] = mi->loc_off[i];
+    VkDeviceSize vbytes = (VkDeviceSize)cap * mi->max_v * mi->stride * 4, ibytes = (VkDeviceSize)cap * mi->prims * 12;
+    VkBuffer vb, ib;
+    VkDeviceSize vo, io;
+    if (!mesh_emu_slab(ex->fence, vbytes, &vb, &vo) || !mesh_emu_slab(ex->fence, ibytes, &ib, &io)) return 0;
+    VkDescriptorSet set = alloc_set(ex, mesh_emu_set_layout());
+    VkDescriptorBufferInfo bi[3] = {{vb, vo, vbytes}, {ib, io, ibytes}, {cbuf, coff, words * 4ull}};
+    VkWriteDescriptorSet w[3];
+    for (int i = 0; i < 3; i++)
+        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = (uint32_t)i,
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(vk_ctx()->device, 3, w, 0, NULL);
+    vk_exec_barrier(ex);   // ends the pass; earlier writes (the indirect record too) are visible to the compute
+    bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, e->cs);
+    dyn_collect(ex, &e->cinfo, 4);
+    bindless_bind(ex, &e->cinfo);
+    bind_resources(ex, &e->cinfo);
+    vkCmdBindDescriptorSets(ex->cb, VK_PIPELINE_BIND_POINT_COMPUTE, info->layout, 3, 1, &set, 0, NULL);
+    if (ME.ind) vkCmdDispatchIndirect(ex->cb, ME.ind, ME.ind_off);
+    else vkCmdDispatch(ex->cb, ME.direct, 1, 1);
+    ex->recorded++;
+    vk_exec_pass_begin(ex);   // its barrier makes the slabs and the draw record visible to the draw
+    ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
+    ME.layout = info->layout, ME.set = set, ME.ctl = cbuf, ME.ctl_off = coff, ME.idx = ib, ME.idx_off = io;
+    static int told;
+    if (!told++) rt_log("vk: mesh emulation: first draw: %s, cap %u slabs of %u vertices and %u triangles", ME.ind ? "indirect" : "direct",
+                        cap, mi->max_v, mi->prims);
+    return 1;
+}
+
+static void mesh_emu_draw(VkExec *ex) {
+    vkCmdBindDescriptorSets(ex->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ME.layout, 3, 1, &ME.set, 0, NULL);
+    vkCmdBindIndexBuffer(ex->cb, ME.idx, ME.idx_off, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexedIndirect(ex->cb, ME.ctl, ME.ctl_off + MESH_EMU_CTL_DRAW * 4, 1, sizeof(VkDrawIndexedIndirectCommand));
+    ex->recorded += 3;
+}
 // LOCAL TEST (Ocarina): why a draw returned without drawing, one line per reason and program. ponytail: a small table.
 static void draw_why(const VkExec *ex, const char *why) {
     static struct { const char *why; uint64_t prog; } seen[1024];
@@ -3110,6 +3189,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     }
     if (pending) return draw_why(ex, "pipeline pending"), 0;   // a background worker is building it: the draw is skipped until it is ready
     if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
+    if (draw_is_mesh && ME.on && !mesh_emu_dispatch(ex, p, info)) return draw_why(ex, "mesh emulation"), 0;
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         vk_pipeline_set_dynamic(ex->cb, &s);
@@ -3453,11 +3533,14 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
 static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     da_count(3);
     static PFN_vkCmdDrawMeshTasksEXT fn;
-    if (!vk_ctx()->has_mesh_shader || !d->count) return;
-    if (!fn) fn = (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdDrawMeshTasksEXT");
+    int emu = vk_ctx()->mesh_emulate;
+    if ((!vk_ctx()->has_mesh_shader && !emu) || !d->count) return;
+    if (!fn && !emu) fn = (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdDrawMeshTasksEXT");
     c0_binst = 0;
     draw_is_mesh = 1;
+    ME.on = emu, ME.direct = d->count, ME.ind = VK_NULL_HANDLE;
     int ok = prepare_draw(ex, NVN_DRAW_PRIMITIVE_TRIANGLES, 0x7fffffff, 0);
+    ME.on = 0;
     draw_is_mesh = 0;
     if (mesh_task_draw) B.c0_valid[0] = 0;
     mesh_task_draw = 0;
@@ -3473,7 +3556,8 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
         rt_log("vk: direct mesh draw: program %llu first %u count %u pass %ux%u", (unsigned long long)prog, d->first, d->count, ex->pass_w, ex->pass_h);
     }
     if (da_on()) rt_log("mesh draw: prog %llu first %u count %u pass %ux%u", (unsigned long long)prog, d->first, d->count, ex->pass_w, ex->pass_h);
-    rec_mesh(fn, ex->cb, d->count, 1, 1);
+    if (emu) mesh_emu_draw(ex);
+    else rec_mesh(fn, ex->cb, d->count, 1, 1);
     ex->recorded++;
     note_work(ex, 1, 0);
 }
@@ -3516,8 +3600,9 @@ static int mesh_args(VkExec *ex, const VkMemSpan *ip, VkDeviceSize *offset) {
 
 static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     static PFN_vkCmdDrawMeshTasksIndirectEXT fn;
-    if (!vk_ctx()->has_mesh_shader) return;
-    if (!fn) fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdDrawMeshTasksIndirectEXT");
+    int emu = vk_ctx()->mesh_emulate;
+    if (!vk_ctx()->has_mesh_shader && !emu) return;
+    if (!fn && !emu) fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdDrawMeshTasksIndirectEXT");
     c0_binst = 0;
     VkMemSpan ip;
     if (!vk_mem_resolve(d->ind, sizeof(VkDrawMeshTasksIndirectCommandEXT), &ip) || ip.offset % 4)
@@ -3579,14 +3664,16 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     VK_MEM_USE(ip);   // the copy reads the same buffer the GPU's culling wrote (the mirror, when there is one)
     static int mesh_old = -1;   // LOCAL TEST (Ocarina): OOT_MESH_OLD=1: the record as it is
     if (mesh_old < 0) mesh_old = getenv("OOT_MESH_OLD") != NULL;
-    if (!getenv("OOT_MESH_DIRECT") && !mesh_old && !mesh_args(ex, &ip, &mesh_off)) {
+    if ((emu || (!getenv("OOT_MESH_DIRECT") && !mesh_old)) && !mesh_args(ex, &ip, &mesh_off)) {
         static int told;
         if (!told++) rt_log("vk: indirect mesh draw dropped: mesh_args failed");
         return;
     }
     if (da_on()) rt_log("draw args: mesh past args prog %llu", ex->prog ? (unsigned long long)ex->prog->serial : 0ull);
     draw_is_mesh = 1;
+    ME.on = emu, ME.direct = 0, ME.ind = mesh_ring, ME.ind_off = mesh_off;
     int ok = prepare_draw(ex, NVN_DRAW_PRIMITIVE_TRIANGLES, 0x7fffffff, 0);
+    ME.on = 0;
     draw_is_mesh = 0;
     if (mesh_task_draw) B.c0_valid[0] = 0;
     mesh_task_draw = 0;
@@ -3598,7 +3685,9 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
         static PFN_vkCmdDrawMeshTasksEXT dfn;
         static int direct = -1;
         if (direct < 0) { const char *e = getenv("OOT_MESH_DIRECT"); direct = e ? atoi(e) : 0; }
-        if (direct) {
+        if (emu) {
+            mesh_emu_draw(ex);
+        } else if (direct) {
             if (!dfn) dfn = (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdDrawMeshTasksEXT");
             rec_mesh(dfn, ex->cb, (uint32_t)direct, 1, 1);
         } else {
