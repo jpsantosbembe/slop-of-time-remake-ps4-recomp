@@ -224,7 +224,8 @@ FIXED(BeginQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q, VkQueryControl
 #define PACK_BindIndexBuffer *a = (A_BindIndexBuffer){b, o, t}
 FIXED(BindIndexBuffer, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t), (cb, b, o, t), VkBuffer b;
       VkDeviceSize o; VkIndexType t)
-#define PACK_BindPipeline *a = (A_BindPipeline){bp, p}
+static _Thread_local VkPipeline crumb_pipe;   // o último pipeline ligado nesta thread (TOTK_CRUMBS_LOG)
+#define PACK_BindPipeline crumb_pipe = p, *a = (A_BindPipeline){bp, p}
 FIXED(BindPipeline, (VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p), (cb, bp, p), VkPipelineBindPoint bp;
       VkPipeline p)
 // TOTK_CRUMBS=draw (vk_crumbs.c): a breadcrumb ahead of each draw and dispatch, numbered across the run;
@@ -235,7 +236,9 @@ static void work_crumb(VkCommandBuffer cb, const char *what) {
     if (!vk_crumbs_draws()) return;
     uint64_t k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
     if (log_on < 0) log_on = rt_knob("CRUMBS_LOG", "0");
-    if (log_on) rt_log("vk: crumb draw or dispatch %llu: %s", (unsigned long long)(k & 0x0fffffff), what);
+    if (log_on)
+        rt_log("vk: crumb draw or dispatch %llu: %s, pipeline %p", (unsigned long long)(k & 0x0fffffff), what,
+               (void *)crumb_pipe);
     rec_crumb(cb, VK_CRUMB_DRAW, k);
 }
 

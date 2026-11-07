@@ -2341,6 +2341,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     if (shared) plat_mutex_unlock_shared(&cache_access);
     plat_crash_note(NULL);
+    if (r == VK_SUCCESS && rt_knob("CRUMBS_LOG", "0")) rt_log("vk: pipeline %p: %s", (void *)pipe, note);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     if (r != VK_SUCCESS) {
         rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
@@ -3535,6 +3536,12 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         rt_log("vk_pipeline: compute pipeline built again without optimization: %s", pipe ? "ok" : "failed too");
     }
     if (!cs_build_cache) plat_mutex_unlock_shared(&cache_access);
+    if (pipe && rt_knob("CRUMBS_LOG", "0")) {
+        uint64_t h = 1469598103934665603ull;   // FNV-1a do SPIR-V, como no create_graphics
+        for (uint64_t j = 0; j < words; j++) h = (h ^ code[j]) * 1099511628211ull;
+        rt_log("vk: pipeline %p: compute, %llu words %016llx", (void *)pipe, (unsigned long long)words,
+               (unsigned long long)h);
+    }
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }
