@@ -53,7 +53,7 @@ nice -n "$NICE" python3 tools/build_game.py --target orbis --version oot111 --ge
     --jobs "$JOBS" ${extra[@]+"${extra[@]}"}
 rc=$?
 if [ $rc = 0 ] && [ $pkg = 1 ] && [ -f "$OUT/eboot.bin" ] && [ ${#extra[@]} = 0 ]; then
-    "$MAKE_PKG" "$OUT/eboot.bin" "$OUT/pkg" "$TITLE_ID" "$PKG_TITLE" neo
+    bash "$MAKE_PKG" "$OUT/eboot.bin" "$OUT/pkg" "$TITLE_ID" "$PKG_TITLE" neo
     rc=$?
 fi
 echo "build_ps4: $(date '+%F %T') fim"
