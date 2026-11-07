@@ -1274,8 +1274,20 @@ static void mem_report(const char *why) {
 static void *mem_monitor(void *arg) {
     (void)arg;
     uint64_t last = 0;
+    int dirty_said = 0;
     for (;;) {
         usleep(2000000);
+        if (ph_view && dirty_said < 6) {   // o coringa sujo: a GPU escreveu numa área "intocada" de um pool
+            uint64_t nz = 0, first = 0;
+            for (uint64_t i = 0; i < WIN / 8; i++)
+                if (ph_view[i]) { if (!nz) first = i * 8; nz++; }
+            if (nz) {
+                dirty_said++;
+                rt_log("orbis: coringa SUJO: %llu palavras de 8 bytes não zero (a primeira em +%#llx, valor %#llx)",
+                       (unsigned long long)nz, (unsigned long long)first,
+                       (unsigned long long)ph_view[first / 8]);
+            }
+        }
         uint64_t m = __atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED);
         if (m > last + (64ull << 20) || m + (64ull << 20) < last) {
             mem_report("mudou");
@@ -1329,6 +1341,7 @@ static int lazy_fault(uint64_t a) {
 // então a troca vale para os dois lados. OCARINA_NO_PLACEHOLDER=1 volta a mapear o pool inteiro.
 void orbis_mem_prefault(uint64_t addr, uint64_t n);
 static int64_t ph_off = -1;   // o bloco coringa (vm_lock)
+static const volatile uint64_t *ph_view;   // o mesmo bloco, só leitura para a CPU: o monitor confere se segue zerado
 
 static int map_placeholder(Resv *r, uint64_t a) {
     uint64_t w = down(a, WIN);
@@ -1337,6 +1350,10 @@ static int map_placeholder(Resv *r, uint64_t a) {
         sceKernelAllocateDirectMemory(0, (int64_t)sceKernelGetDirectMemorySize(), WIN, WIN, K_WB_ONION, &ph_off)) {
         ph_off = -1;
         return 0;
+    }
+    if (!ph_view) {   // diagnóstico: a GPU não deveria escrever no coringa (memória intocada do Switch vale zero)
+        void *v = NULL;
+        if (!sceKernelMapDirectMemory(&v, WIN, K_PROT_CPU_R, 0, ph_off, WIN)) ph_view = v;
     }
     void *va = (void *)(uintptr_t)start;
     int32_t e = sceKernelMapDirectMemory(&va, (size_t)(end - start), K_PROT_GPU, K_MAP_FIXED, ph_off, KPAGE);
