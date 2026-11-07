@@ -227,17 +227,40 @@ FIXED(BindIndexBuffer, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexT
 #define PACK_BindPipeline *a = (A_BindPipeline){bp, p}
 FIXED(BindPipeline, (VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p), (cb, bp, p), VkPipelineBindPoint bp;
       VkPipeline p)
+// TOTK_CRUMBS=draw (vk_crumbs.c): a breadcrumb ahead of each draw and dispatch, numbered across the run;
+// TOTK_CRUMBS_LOG=1 also logs each number with the command as it is recorded.
+static void work_crumb(VkCommandBuffer cb, const char *what) {
+    static volatile uint64_t n;
+    static volatile int log_on = -1;
+    if (!vk_crumbs_draws()) return;
+    uint64_t k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+    if (log_on < 0) log_on = rt_knob("CRUMBS_LOG", "0");
+    if (log_on) rt_log("vk: crumb draw or dispatch %llu: %s", (unsigned long long)(k & 0x0fffffff), what);
+    rec_crumb(cb, VK_CRUMB_DRAW, k);
+}
+
+// FIXED for the commands that do GPU work: a breadcrumb first when TOTK_CRUMBS=draw.
+#define FIXED_WORK(name, params, call_args, ...)                                                                        \
+    typedef struct { __VA_ARGS__; } A_##name;                                                                          \
+    void rc_vkCmd##name params {                                                                                       \
+        work_crumb(cb, #name);                                                                                          \
+        if (!OWNED(cb)) { vkCmd##name call_args; return; }                                                             \
+        A_##name *a = put(R_##name, sizeof *a);                                                                        \
+        PACK_##name;                                                                                                    \
+        pub();                                                                                                          \
+    }
+
 #define PACK_Dispatch *a = (A_Dispatch){x, y, z}
-FIXED(Dispatch, (VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z), (cb, x, y, z), uint32_t x, y, z)
+FIXED_WORK(Dispatch, (VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z), (cb, x, y, z), uint32_t x, y, z)
 #define PACK_DispatchIndirect *a = (A_DispatchIndirect){b, o}
-FIXED(DispatchIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o), (cb, b, o), VkBuffer b; VkDeviceSize o)
+FIXED_WORK(DispatchIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o), (cb, b, o), VkBuffer b; VkDeviceSize o)
 #define PACK_Draw *a = (A_Draw){n, i, f, fi}
-FIXED(Draw, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, uint32_t fi), (cb, n, i, f, fi), uint32_t n, i, f, fi)
+FIXED_WORK(Draw, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, uint32_t fi), (cb, n, i, f, fi), uint32_t n, i, f, fi)
 #define PACK_DrawIndexed *a = (A_DrawIndexed){n, i, f, v, fi}
-FIXED(DrawIndexed, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, int32_t v, uint32_t fi), (cb, n, i, f, v, fi),
+FIXED_WORK(DrawIndexed, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, int32_t v, uint32_t fi), (cb, n, i, f, v, fi),
       uint32_t n, i, f; int32_t v; uint32_t fi)
 #define PACK_DrawIndexedIndirect *a = (A_DrawIndexedIndirect){b, o, n, s}
-FIXED(DrawIndexedIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s),
+FIXED_WORK(DrawIndexedIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s),
       VkBuffer b; VkDeviceSize o; uint32_t n, s)
 #define PACK_EndQuery *a = (A_EndQuery){p, q}
 FIXED(EndQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q), (cb, p, q), VkQueryPool p; uint32_t q)
@@ -476,11 +499,13 @@ void rec_push_tpl(PFN_vkCmdPushDescriptorSetWithTemplateKHR fn, VkCommandBuffer 
 typedef struct { PFN_vkCmdDrawMeshTasksIndirectEXT fn; VkBuffer b; VkDeviceSize o; uint32_t n, stride; } A_MeshInd;
 typedef struct { PFN_vkCmdDrawMeshTasksEXT fn; uint32_t x, y, z; } A_Mesh;
 void rec_mesh(PFN_vkCmdDrawMeshTasksEXT fn, VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    work_crumb(cb, "DrawMeshTasks");
     if (!OWNED(cb)) { fn(cb, x, y, z); return; }
     A_Mesh *a = put(R_Mesh, sizeof *a);
     *a = (A_Mesh){fn, x, y, z};
 }
 void rec_mesh_ind(PFN_vkCmdDrawMeshTasksIndirectEXT fn, VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t stride) {
+    work_crumb(cb, "DrawMeshTasksIndirect");
     if (!OWNED(cb)) { fn(cb, b, o, n, stride); return; }
     A_MeshInd *a = put(R_MeshInd, sizeof *a);
     *a = (A_MeshInd){fn, b, o, n, stride};
