@@ -2405,7 +2405,13 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         } else if (b->kind == GFX_RES_UBO) {
             for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
         } else if (b->kind == GFX_RES_SSBO) {
-            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
+            if (r->stride) {   // ocarina-ps4 (frente T): a guarded array: element k is the binding of the address stride * k words further
+                GfxShaderRes e = *r;
+                e.count = 1, e.stride = 0;
+                for (uint32_t k = 0; k < cnt; k++, e.handle = (uint16_t)(e.handle + r->stride)) o[k].buffer = ssbo_info(ex, st, &e, r->flags & 1);
+            } else {
+                for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
+            }
         } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {
             int img = b->kind == GFX_RES_IMG;
             if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {

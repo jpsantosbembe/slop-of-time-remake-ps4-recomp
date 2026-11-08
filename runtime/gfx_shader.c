@@ -915,6 +915,12 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
             r->cbuf_slot = (int8_t)json_int(o, e, "cb_slot", -1);
             r->handle = (uint16_t)json_int(o, e, "cb_offset", 0);
             r->flags = (uint8_t)json_int(o, e, "flags", 0);
+            // ocarina-ps4 (frente T): a guarded array (translator patch 0039): element k's address at cb_offset + k * cb_stride
+            int64_t n = json_int(o, e, "array", 1), stride = json_int(o, e, "cb_stride", 0);
+            if (n > 1 && n <= 64 && stride > 0 && stride < 64 && (r->flags & GFX_RES_SSBO_GUARDED))
+                r->count = (uint16_t)n, r->stride = (uint8_t)stride;
+            else if (n != 1)
+                r->count = 0;   // malformed: reflect() refuses the shader
             // NVN 2 compute: the address's place in the packed bank, as the NVN 1 compute offset of the same buffer
             // (uniform buffer u at 0x210 + 16u, storage buffer k at 0x310 + 16k), which is what vk_exec_draw.c's
             // ssbo_slot reads. vk_c0_fill puts the addresses at the packed offsets the shader reads.
@@ -1183,7 +1189,7 @@ static int storage_contract_version(const char *js, const char *end) {
     const char *p = json_member(js, end, "storage_candidates_version");
     if (!p) return 0;
     uint32_t version;
-    return json_uint(js, end, "storage_candidates_version", &version) && version <= 1 ? (int)version : -1;
+    return json_uint(js, end, "storage_candidates_version", &version) && version <= GFX_STORAGE_ARRAYS_VERSION ? (int)version : -1;
 }
 
 static int reflect(GfxShader *s, int flags) {
@@ -1235,6 +1241,8 @@ static int reflect(GfxShader *s, int flags) {
         return 0;
     }
     int storage_version = storage_contract_version(js, end);
+    int arrays = storage_version == GFX_STORAGE_ARRAYS_VERSION;   // version 1 plus guarded SSBO arrays
+    if (arrays) storage_version = GFX_STORAGE_CANDIDATES_VERSION;
     if ((require_c0 && storage_version != GFX_STORAGE_CANDIDATES_VERSION) ||
         (storage_version && (storage_version != GFX_STORAGE_CANDIDATES_VERSION ||
                              !s->has_c0 || s->stage != GFX_STAGE_CS))) {
@@ -1246,12 +1254,17 @@ static int reflect(GfxShader *s, int flags) {
         s->res[k] = calloc(count ? count : 1, sizeof *s->res[k]);
         json_objects(js, kinds[k], add_res, s, k);
     }
-    for (int i = 0; i < s->nres[GFX_RES_SSBO]; i++)
+    for (int i = 0; i < s->nres[GFX_RES_SSBO]; i++) {
         if ((s->res[GFX_RES_SSBO][i].flags & GFX_RES_SSBO_GUARDED) &&
             storage_version != GFX_STORAGE_CANDIDATES_VERSION && s->stage == GFX_STAGE_CS) {
             rt_log("gfx_shader: guarded storage resource without its versioned binding contract");
             return 0;
         }
+        if (s->res[GFX_RES_SSBO][i].count != 1 && !(arrays && s->res[GFX_RES_SSBO][i].count > 1)) {
+            rt_log("gfx_shader: storage buffer array outside storage contract version 2; rebuild the shader translator");
+            return 0;
+        }
+    }
     reflect_spirv(s);
     reflect_out_comps(s);
     if (s->geometry_source_passthrough) {

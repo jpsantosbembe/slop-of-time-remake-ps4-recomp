@@ -1,0 +1,209 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
+@@ -16,6 +16,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+     static class SpirvGenerator
+     {
++        // LOCAL TEST (Ocarina): GlobalToStorage names the guarded helpers that loop over a storage buffer array so.
++        public const string GuardedArrayFunctionPrefix = "GuardedArray_";
++
+         // Resource pools for Spirv generation. Note: Increase count when more threads are being used.
+         private const int GeneratorPoolCount = 1;
+         private static readonly ObjectPool<SpvInstructionPool> _instructionPool;
+@@ -562,7 +565,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+                     loopTargets.Add(e.Block, (context.NewBlock(), continueTarget));
+ 
+-                    context.LoopMerge(context.GetNextLabel(mergeBlock), continueTarget, LoopControlMask.MaskNone);
++                    // LOCAL TEST (Ocarina): the guarded candidate loop must stay a loop: the driver inlines its function at every
++                    // global access, and an unrolled copy is what made those compute shaders too large to compile.
++                    LoopControlMask loopControl = context.CurrentFunction.Name.StartsWith(GuardedArrayFunctionPrefix, StringComparison.Ordinal)
++                        ? LoopControlMask.DontUnroll
++                        : LoopControlMask.MaskNone;
++                    context.LoopMerge(context.GetNextLabel(mergeBlock), continueTarget, loopControl);
+                     context.Branch(context.GetFirstLabel(e.Block));
+                 }
+ 
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -77,6 +77,10 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
+             private readonly HelperFunctionManager _hfm;
+ 
++            // LOCAL TEST (Ocarina): the guarded helpers test the runtime's reachable-buffer list in a loop over one
++            // storage buffer array instead of 32 unrolled candidates (see CompactGuardedMinAccesses).
++            public bool CompactGuarded;
++
+             public GtsContext(HelperFunctionManager hfm)
+             {
+                 _entries = [];
+@@ -209,6 +213,19 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             }
+         }
+ 
++        // LOCAL TEST (Ocarina, frente T): runtime candidate programs (NVN 2 compute) with at least this many global memory
++        // accesses test the runtime's reachable-buffer list (c0 + 0x900, DynListEntries entries of 16 bytes: address, size)
++        // in a loop over one array binding of DynListEntries guarded storage buffers. Every guarded access calls its helper
++        // and the driver inlines each call: with the list unrolled (32 candidates, ~70 blocks per helper) a world compute
++        // shader with 243 accesses became 750 thousand NIR instructions and needed 1.1 to 1.5 GiB to compile on RADV.
++        // Fewer accesses keep the unrolled list, whose SPIR-V is unchanged. The candidates are tested in the same order
++        // and the first in range is used, as unrolled: the result is the same.
++        private const int CompactGuardedMinAccesses = 64;
++        private const int DynListFirstWord = 0x900 / 4;
++        private const int DynListStrideWords = 4;
++        private const int DynListEntries = 32;
++        private const uint DynListMarker = uint.MaxValue;   // in a helper's lookup key: it also tests the list in a loop
++
+         public static void RunPass(
+             HelperFunctionManager hfm,
+             BasicBlock[] blocks,
+@@ -223,6 +240,24 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             }
+             GtsContext gtsContext = new(hfm);
+ 
++            if (gpuAccessor.QueryStorageBufferRuntimeCandidates())
++            {
++                int accesses = 0;
++
++                foreach (BasicBlock block in blocks)
++                {
++                    foreach (INode node in block.Operations)
++                    {
++                        if (node is Operation operation && IsGlobalMemory(operation.StorageKind))
++                        {
++                            accesses++;
++                        }
++                    }
++                }
++
++                gtsContext.CompactGuarded = accesses >= CompactGuardedMinAccesses;
++            }
++
+             foreach (BasicBlock block in blocks)
+             {
+                 // DKB: the next node is taken before the operation is processed. A failed store is deleted below, and a
+@@ -516,19 +551,24 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             // LOCAL TEST (Ocarina): the address does not come straight from a constant buffer, so it may be a pointer read
+             // from memory, which no static search finds. The runtime lists, per dispatch, the buffers reachable from the bound
+             // tables at c0 + 0x900 (vk_exec_draw.c dyn_collect); the range guards pick the one that holds the address.
+-            if (!FindUniqueBaseAddressCb(gtsContext, block, operation.GetSource(0), needsOffset: false).Found)
++            bool dynList = !FindUniqueBaseAddressCb(gtsContext, block, operation.GetSource(0), needsOffset: false).Found;
++            bool dynLoop = dynList && gtsContext.CompactGuarded;
++            if (dynList && !dynLoop)
+             {
+-                for (int index = 0; index < 32; index++)
++                for (int index = 0; index < DynListEntries; index++)
+                 {
+-                    AddCandidate(new SearchResult(0, (0x900 + 16 * index) / 4));
++                    AddCandidate(new SearchResult(0, DynListFirstWord + DynListStrideWords * index));
+                 }
+             }
+ 
+-            if (candidates.Count == 0)
++            if (candidates.Count == 0 && !dynLoop)
+             {
+                 gpuAccessor.Log("LOCAL TEST (Ocarina): no bounded candidate: this global operation reads zero and drops its writes.");
+             }
+-            if (gtsContext.TryGetFunctionId(operation, true, candidates, out int functionId, guarded: true))
++            // The loop tests every list entry, also those already among the candidates: one found earlier was not in
++            // range there and is not here either (the same address, bound the same way).
++            List<uint> lookup = dynLoop ? [.. candidates, DynListMarker] : candidates;
++            if (gtsContext.TryGetFunctionId(operation, true, lookup, out int functionId, guarded: true))
+             {
+                 return functionId;
+             }
+@@ -582,6 +622,50 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+                 context.MarkLabel(skip);
+             }
+ 
++            if (dynLoop)
++            {
++                bool write = operation.Inst == Instruction.Store || operation.Inst.IsAtomic();
++                resourceManager.TryGetStorageBufferArrayBinding(0, DynListFirstWord, DynListStrideWords, DynListEntries, write, out int array);
++                int cb0 = resourceManager.GetConstantBufferBinding(0);
++
++                // for (i = 0; i < DynListEntries; i++): the same test as an unrolled candidate, on element i. i is the same
++                // in every invocation that runs the iteration, so the array index is dynamically uniform.
++                Operand index = Local();
++                context.Copy(index, Const(0));
++                Operand loop = Label();
++                context.MarkLabel(loop);
++                Operand vector = context.IAdd(index, Const(DynListFirstWord / 4));
++                Operand rawLow = context.Load(StorageKind.ConstantBuffer, cb0, Const(0), vector, Const(0));
++                Operand rawHigh = context.Load(StorageKind.ConstantBuffer, cb0, Const(0), vector, Const(1));
++                Operand baseLow = storageUnaligned ? context.BitwiseAnd(rawLow, Const(-alignment)) : rawLow;
++                Operand deltaLow = context.ISubtract(low, baseLow);
++                Operand borrow = context.BitwiseAnd(context.ICompareLessUnsigned(low, baseLow), Const(1));
++                Operand deltaHigh = context.ISubtract(context.ISubtract(high, rawHigh), borrow);
++                Operand word = context.ShiftRightU32(deltaLow, Const(2));
++                Operand words = context.StorageBufferLength(array, index);
++                Operand inRange = context.BitwiseAnd(context.ICompareEqual(deltaHigh, Const(0)),
++                    context.ICompareLessUnsigned(word, words));
++                inRange = context.BitwiseAnd(inRange, context.ICompareEqual(context.BitwiseAnd(deltaLow, Const(3)), Const(0)));
++
++                Operand next = Label();
++                context.BranchIfFalse(next, inRange);
++                Operand compare = arguments == 4 ? Argument(2) : null;
++                Operand value = arguments >= 3 ? Argument(arguments - 1) : null;
++                Operand result = GenerateArrayStorageOp(context, operation.Inst, array, index,
++                    context.ShiftRightU32(deltaLow, Const(2)), compare, value);
++                if (result != null)
++                {
++                    context.Return(result);
++                }
++                else
++                {
++                    context.Return();
++                }
++                context.MarkLabel(next);
++                context.Copy(index, context.IAdd(index, Const(1)));
++                context.BranchIfTrue(loop, context.ICompareLessUnsigned(index, Const(DynListEntries)));
++            }
++
+             bool returnsValue = operation.Dest != null;
+             if (returnsValue)
+             {
+@@ -591,9 +675,41 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             {
+                 context.Return();
+             }
++            string prefix = dynLoop ? CodeGen.Spirv.SpirvGenerator.GuardedArrayFunctionPrefix : "Guarded_";
+             Function function = new(ControlFlowGraph.Create(context.GetOperations()).Blocks,
+-                "Guarded_" + GetFunctionName(operation, true, candidates), returnsValue, arguments, 0);
+-            return gtsContext.AddFunction(operation, true, candidates, function, guarded: true);
++                prefix + GetFunctionName(operation, true, candidates), returnsValue, arguments, 0);
++            return gtsContext.AddFunction(operation, true, lookup, function, guarded: true);
++        }
++
++        // LOCAL TEST (Ocarina): a guarded 32-bit load, store or atomic on element `element` of a storage buffer array.
++        // Sources: binding, field, element, word offset, then the operation's own (compare, value), as the backend reads them.
++        private static Operand GenerateArrayStorageOp(EmitterContext context, Instruction inst, int binding, Operand element,
++            Operand wordOffset, Operand compare, Operand value)
++        {
++            if (inst == Instruction.Load)
++            {
++                return context.Add(Instruction.Load, StorageKind.StorageBuffer, Local(), Const(binding), Const(0), element, wordOffset);
++            }
++
++            if (inst == Instruction.Store)
++            {
++                context.Add(Instruction.Store, StorageKind.StorageBuffer, null, Const(binding), Const(0), element, wordOffset, value);
++                return null;
++            }
++
++            if (inst == Instruction.AtomicCompareAndSwap)
++            {
++                return context.Add(inst, StorageKind.StorageBuffer, Local(), Const(binding), Const(0), element, wordOffset, compare, value);
++            }
++
++            if (inst is Instruction.AtomicAdd or Instruction.AtomicAnd or Instruction.AtomicMaxS32 or Instruction.AtomicMaxU32 or
++                Instruction.AtomicMinS32 or Instruction.AtomicMinU32 or Instruction.AtomicOr or Instruction.AtomicSwap or
++                Instruction.AtomicXor)
++            {
++                return context.Add(inst, StorageKind.StorageBuffer, Local(), Const(binding), Const(0), element, wordOffset, value);
++            }
++
++            throw new NotSupportedException($"Cannot emit guarded storage array operation {inst}.");
+         }
+ 
+         private static bool CanUseInlineStorageOp(Operation operation, TargetLanguage targetLanguage)

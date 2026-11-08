@@ -1,0 +1,216 @@
+--- a/src/Ryujinx.Graphics.Shader/BufferDescriptor.cs
++++ b/src/Ryujinx.Graphics.Shader/BufferDescriptor.cs
+@@ -10,6 +10,10 @@ namespace Ryujinx.Graphics.Shader
+         public readonly byte SbCbSlot;
+         public readonly ushort SbCbOffset;
+         public readonly BufferUsageFlags Flags;
++        // LOCAL TEST (Ocarina): a binding of ArrayLength descriptors (0: one); the address of element k is at
++        // SbCbOffset + k * SbCbStride words of constant buffer SbCbSlot.
++        public readonly int ArrayLength;
++        public readonly int SbCbStride;
+ 
+         public BufferDescriptor(int set, int binding, int slot)
+         {
+@@ -29,6 +33,15 @@ namespace Ryujinx.Graphics.Shader
+             SbCbSlot = (byte)sbCbSlot;
+             SbCbOffset = (ushort)sbCbOffset;
+             Flags = flags;
++            ArrayLength = 0;
++            SbCbStride = 0;
++        }
++
++        public BufferDescriptor(int set, int binding, int slot, int sbCbSlot, int sbCbOffset, BufferUsageFlags flags, int arrayLength, int sbCbStride)
++            : this(set, binding, slot, sbCbSlot, sbCbOffset, flags)
++        {
++            ArrayLength = arrayLength;
++            SbCbStride = sbCbStride;
+         }
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -28,6 +28,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+         public Dictionary<int, Instruction> ConstantBuffers { get; } = new();
+         public Dictionary<int, Instruction> StorageBuffers { get; } = new();
++        // LOCAL TEST (Ocarina): pointer type to one element of a storage buffer array binding (GlobalToStorage candidate loop)
++        public Dictionary<int, Instruction> StorageBufferElementPointerTypes { get; } = new();
+ 
+         public Dictionary<int, Instruction> LocalMemories { get; } = new();
+         public Dictionary<int, Instruction> SharedMemories { get; } = new();
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -137,7 +137,18 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+                 // SPIR-V 1.4, needed by mesh stages, has no BufferBlock: storage buffers use their own class there.
+                 StorageClass bufferClass = isBuffer && NxMesh.Active ? StorageClass.StorageBuffer : StorageClass.Uniform;
+-                SpvInstruction pointerType = context.TypePointer(bufferClass, structType);
++                SpvInstruction pointerType;
++                if (isBuffer && buffer.ArrayLength > 0)
++                {
++                    // LOCAL TEST (Ocarina): an array of storage buffers, indexed with a dynamically uniform index.
++                    context.AddCapability(Capability.StorageBufferArrayDynamicIndexing);
++                    context.StorageBufferElementPointerTypes[buffer.Binding] = context.TypePointer(bufferClass, structType);
++                    pointerType = context.TypePointer(bufferClass, context.TypeArray(structType, context.Constant(context.TypeU32(), buffer.ArrayLength)));
++                }
++                else
++                {
++                    pointerType = context.TypePointer(bufferClass, structType);
++                }
+                 SpvInstruction variable = context.Variable(pointerType, bufferClass);
+ 
+                 context.Name(variable, buffer.Name);
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -861,6 +861,14 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                 throw new InvalidOperationException("Storage-buffer length requires a constant binding.");
+             }
+ 
++            if (operation.SourcesCount > 1)
++            {
++                // LOCAL TEST (Ocarina): the length of one element of a storage buffer array.
++                SpvInstruction element = context.AccessChain(context.StorageBufferElementPointerTypes[binding.Value],
++                    context.StorageBuffers[binding.Value], context.Get(AggregateType.S32, operation.GetSource(1)));
++                return new OperationResult(AggregateType.U32, context.ArrayLength(context.TypeU32(), element, (SpvLiteralInteger)0));
++            }
++
+             return new OperationResult(AggregateType.U32,
+                 context.ArrayLength(context.TypeU32(), context.StorageBuffers[binding.Value], (SpvLiteralInteger)0));
+         }
+@@ -1748,6 +1756,15 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                     baseObj = storageKind == StorageKind.ConstantBuffer
+                         ? context.ConstantBuffers[bindingIndex.Value]
+                         : context.StorageBuffers[bindingIndex.Value];
++
++                    if (storageKind == StorageKind.StorageBuffer && buffer.ArrayLength > 0)
++                    {
++                        // LOCAL TEST (Ocarina): a storage buffer array: binding, field, element, word (then the value).
++                        SpvInstruction element = context.Get(AggregateType.S32, operation.GetSource(srcIndex + 1));
++                        SpvInstruction member = context.Get(AggregateType.S32, operation.GetSource(srcIndex));
++                        SpvInstruction word = context.Get(AggregateType.S32, operation.GetSource(srcIndex + 2));
++                        return context.AccessChain(context.TypePointer(storageClass, context.GetType(varType)), baseObj, element, member, word);
++                    }
+                     break;
+ 
+                 case StorageKind.LocalMemory:
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/BufferDefinition.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/BufferDefinition.cs
+@@ -7,6 +7,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
+         public int Binding { get; }
+         public string Name { get; }
+         public StructureType Type { get; }
++        public int ArrayLength { get; }
+ 
+         public BufferDefinition(BufferLayout layout, int set, int binding, string name, StructureType type)
+         {
+@@ -15,6 +16,13 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
+             Binding = binding;
+             Name = name;
+             Type = type;
++            ArrayLength = 0;
++        }
++
++        public BufferDefinition(BufferLayout layout, int set, int binding, string name, StructureType type, int arrayLength)
++            : this(layout, set, binding, name, type)
++        {
++            ArrayLength = arrayLength;
+         }
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
+@@ -91,7 +91,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
+             Add(Instruction.ImageAtomic,              AggregateType.S32);
+             Add(Instruction.IsNan,                    AggregateType.Bool,   AggregateType.Scalar);
+             Add(Instruction.Load,                     AggregateType.FP32);
+-            Add(Instruction.StorageBufferLength,      AggregateType.U32, AggregateType.S32);
++            Add(Instruction.StorageBufferLength,      AggregateType.U32, AggregateType.S32, AggregateType.S32);
+             Add(Instruction.Lod,                      AggregateType.FP32);
+             Add(Instruction.LogarithmB2,              AggregateType.Scalar, AggregateType.Scalar);
+             Add(Instruction.LogicalAnd,               AggregateType.Bool,   AggregateType.Bool,    AggregateType.Bool);
+--- a/src/Ryujinx.Graphics.Shader/Translation/EmitterContextInsts.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/EmitterContextInsts.cs
+@@ -689,6 +689,11 @@ namespace Ryujinx.Graphics.Shader.Translation
+             return context.Add(Instruction.StorageBufferLength, Local(), Const(binding));
+         }
+ 
++        public static Operand StorageBufferLength(this EmitterContext context, int binding, Operand element)
++        {
++            return context.Add(Instruction.StorageBufferLength, Local(), Const(binding), element);
++        }
++
+         public static Operand Load(this EmitterContext context, StorageKind storageKind, Operand e0, Operand e1)
+         {
+             return context.Add(Instruction.Load, storageKind, Local(), e0, e1);
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -27,6 +27,16 @@ namespace Ryujinx.Graphics.Shader.Translation
+         private readonly Dictionary<int, int> _sbSlots;
+         private readonly Dictionary<int, int> _sbSlotsReverse;
+ 
++        // LOCAL TEST (Ocarina): guarded storage buffer arrays, one binding of Count descriptors whose element k takes its
++        // address from cbuf (CbSlot, FirstOffset + k * Stride). In creation order; none unless GlobalToStorage asks.
++        private sealed class SbArray
++        {
++            public int CbSlot, FirstOffset, Stride, Count, Set, Binding;
++            public bool Written;
++        }
++
++        private readonly List<SbArray> _sbArrays = new();
++
+         private readonly HashSet<int> _usedConstantBufferBindings;
+ 
+         private readonly record struct TextureInfo(int CbufSlot, int Handle, int ArrayLength, bool Separate, SamplerType Type, TextureFormat Format);
+@@ -196,6 +206,34 @@ namespace Ryujinx.Graphics.Shader.Translation
+             return true;
+         }
+ 
++        // LOCAL TEST (Ocarina): one binding for count guarded storage buffers whose addresses lie stride words apart in a
++        // constant buffer; the shader indexes it with a dynamically uniform index (GlobalToStorage's candidate loop).
++        public bool TryGetStorageBufferArrayBinding(int sbCbSlot, int firstOffset, int stride, int count, bool write, out int binding)
++        {
++            SbArray array = _sbArrays.Find(a => a.CbSlot == sbCbSlot && a.FirstOffset == firstOffset && a.Stride == stride && a.Count == count);
++
++            if (array == null)
++            {
++                SetBindingPair setAndBinding = _gpuAccessor.CreateStorageBufferBinding(_sbSlotToBindingMap.Length + _sbArrays.Count);
++                array = new SbArray
++                {
++                    CbSlot = sbCbSlot, FirstOffset = firstOffset, Stride = stride, Count = count,
++                    Set = setAndBinding.SetIndex, Binding = setAndBinding.Binding,
++                };
++                StructureType type = new(new[]
++                {
++                    new StructureField(AggregateType.Array | AggregateType.U32, "data", 0),
++                });
++                string name = $"{_stagePrefix}_d{_sbArrays.Count.ToString(CultureInfo.InvariantCulture)}";
++                Properties.AddOrUpdateStorageBuffer(new(BufferLayout.Std430, array.Set, array.Binding, name, type, count));
++                _sbArrays.Add(array);
++            }
++
++            array.Written |= write;
++            binding = array.Binding;
++            return true;
++        }
++
+         private bool TryGetSbSlot(byte sbCbSlot, ushort sbCbOffset, out int slot, bool guarded)
+         {
+             // A guarded descriptor must never alias an unguarded descriptor,
+@@ -528,6 +566,17 @@ namespace Ryujinx.Graphics.Shader.Translation
+                 Array.Resize(ref descriptors, descriptorIndex);
+             }
+ 
++            if (_sbArrays.Count != 0)
++            {
++                Array.Resize(ref descriptors, descriptorIndex + _sbArrays.Count);
++
++                foreach (SbArray array in _sbArrays)
++                {
++                    BufferUsageFlags flags = BufferUsageFlags.Guarded | (array.Written ? BufferUsageFlags.Write : BufferUsageFlags.None);
++                    descriptors[descriptorIndex++] = new BufferDescriptor(array.Set, array.Binding, 0xff, array.CbSlot, array.FirstOffset, flags, array.Count, array.Stride);
++                }
++            }
++
+             return descriptors;
+         }
+ 

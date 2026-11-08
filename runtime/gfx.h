@@ -94,8 +94,9 @@ const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words);
 uint64_t gfx_shader_failures(void);                         // failed translations; feeds GfxStats.shader_failures
 // Reflection: parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.
 enum { GFX_RES_UBO, GFX_RES_SSBO, GFX_RES_TEX, GFX_RES_IMG, GFX_RES_KINDS };
-// Version 1 requires guarded SSBOs to expose zero array elements when their address cannot be bound.
-enum { GFX_STORAGE_CANDIDATES_VERSION = 1, GFX_RES_SSBO_GUARDED = 0x80 };
+// Version 1 requires guarded SSBOs to expose zero array elements when their address cannot be bound. Version 2 (in the
+// .res.json only, frente T) adds guarded SSBO arrays: count descriptors, element k's address stride * k words further.
+enum { GFX_STORAGE_CANDIDATES_VERSION = 1, GFX_STORAGE_ARRAYS_VERSION = 2, GFX_RES_SSBO_GUARDED = 0x80 };
 typedef struct {
     uint16_t set, binding;      // as the SPIR-V decorates them: set 0, bindings from 1 per shader (0: support buffer)
     int16_t slot;               // UBO: c[slot]; SSBO: storage buffer index; TEX: c2 combined slot (handle at 0x20 + 8 slot)
@@ -108,6 +109,8 @@ typedef struct {
     uint16_t handle;            // TEX/IMG: raw handle (word offset; separate: texture | sampler << 14); SSBO: address offset
     uint16_t count;             // descriptors (array length)
     uint8_t separate;           // TEX: texture and sampler handles are separate
+    uint8_t stride;             // SSBO array (count > 1): words between the addresses of consecutive elements (in the
+                                // tail padding: the struct keeps its size)
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed, scalar_bits; } GfxShaderIo;   // scalar_bits: actual numeric SPIR-V width, 0 unknown
 int gfx_shader_is_task(const GfxShader *s);

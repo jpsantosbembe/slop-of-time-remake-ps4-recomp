@@ -322,7 +322,15 @@ static class SwshXlate
                     }
                 }
                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
-                foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
+                foreach (var b in p.Info.SBuffers)
+                {
+                    var o = new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags };
+                    // ocarina-ps4 (frente T): an array of guarded storage buffers; the address of element k is at
+                    // cb_offset + k * cb_stride words (runtime/vk_exec_draw.c ssbo_info). Contract version 2 makes an older
+                    // runtime refuse the shader instead of binding one descriptor where the shader declares an array.
+                    if (b.ArrayLength > 0) { o["array"] = b.ArrayLength; o["cb_stride"] = b.SbCbStride; res["storage_candidates_version"] = 2; }
+                    res["sbufs"].AsArray().Add((JsonNode)o);
+                }
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
                     foreach (var t in list.Where(x => x.Set != 2)) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
                 if (job["c0"] is JsonNode c0) {
