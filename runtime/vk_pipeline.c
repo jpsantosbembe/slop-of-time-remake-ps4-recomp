@@ -1198,11 +1198,9 @@ static int nan_minmax_cs(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("OCARINA_NAN_MINMAX_CS");
-#ifdef __ORBIS__
-        on = e && *e ? atoi(e) != 0 : 1;
-#else
+        // Padrão desligado também no PS4: ligado em todos os compute (o33, 2026-11-08) a cena da Deku Tree voltou a
+        // ficar toda preta; a troca muda outro compute além da névoa. Fica como opção para testes mais finos.
         on = e && *e ? atoi(e) != 0 : 0;
-#endif
     }
     return on;
 }
