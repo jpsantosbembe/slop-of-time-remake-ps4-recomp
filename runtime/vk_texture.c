@@ -58,6 +58,7 @@ typedef struct Tex {
     uint8_t *snap;                // a texture that fills no page: its storage bytes when the GPU write was recorded
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
+    uint32_t rel_epoch;           // submit_epoch when it was released (OCARINA_TEX_PRESSURE_RT_AGE)
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -625,23 +626,53 @@ static void sweep_released(void) {
 static int vram_pressure = -1;
 static uint64_t n_pressure_drops;
 
+// Frente O (ocarina-ps4): OCARINA_VRAM_BUDGET_MIB=<MiB> (default 0: the driver's budget) is the budget the pressure
+// percentage applies to, measured against the VMA's device-local blocks: on the PS4 the driver reports 3371 MiB of
+// device-local heap that the direct memory never has room for, so the policy never started. OCARINA_TEX_PRESSURE_RT_AGE=
+// <submits> (default 0, off): under pressure, released entries the GPU wrote (render targets, whose content lives only
+// in the image) go too once they were released that many submits ago and not taken back: Ocarina's local shadows
+// make depth targets of a new size (1889..1920 square, 14 MiB each) as the camera moves.
+static uint64_t vram_budget_ov;
+static uint32_t pressure_rt_age;
+static uint64_t n_pressure_rt_drops;
+
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
         const char *s = cfg_get("TOTK_TEX_VRAM_PRESSURE");
         vram_pressure = s && *s ? atoi(s) : 90;
         if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 90;
-        rt_log("vk: released textures under VRAM pressure: %s%d%%", vram_pressure ? "dropped above " : "off", vram_pressure);
+        const char *b = cfg_get("OCARINA_VRAM_BUDGET_MIB"), *a = cfg_get("OCARINA_TEX_PRESSURE_RT_AGE");
+        vram_budget_ov = (uint64_t)(b && *b ? atoi(b) : 0) << 20;
+        pressure_rt_age = a && *a ? (uint32_t)atoi(a) : 0;
+        rt_log("vk: released textures under VRAM pressure: %s%d%% of %s%.0f MiB; GPU-written ones released %u submits "
+               "before %s", vram_pressure ? "dropped above " : "off ", vram_pressure,
+               vram_budget_ov ? "OCARINA_VRAM_BUDGET_MIB " : "the driver budget", vram_budget_ov / 1048576.0,
+               pressure_rt_age, pressure_rt_age ? "too" : "never (OCARINA_TEX_PRESSURE_RT_AGE=0)");
     }
     if (!vram_pressure || !rel_head || submit_epoch & 7) return;   // the budget query every 8 submits
     uint64_t used, budget;
     int exact;
-    if (!vk_mem_vram(&used, &budget, &exact) || used <= budget / 100 * (uint64_t)vram_pressure) return;
+    if (vram_budget_ov) {
+        uint64_t host;
+        vk_vma_usage(&used, &host);
+        budget = vram_budget_ov;
+    } else if (!vk_mem_vram(&used, &budget, &exact)) {
+        return;
+    }
+    if (used <= budget / 100 * (uint64_t)vram_pressure) return;
     int dropped = 0;
     for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
         next = e->rel_next;
         if (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty) continue;
         destroy_tex(e);
         dropped++, n_pressure_drops++;
+    }
+    if (!pressure_rt_age || dropped) return;
+    for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
+        next = e->rel_next;
+        if (!e->alloc || submit_epoch - e->rel_epoch < pressure_rt_age) continue;
+        destroy_tex(e);
+        dropped++, n_pressure_drops++, n_pressure_rt_drops++;
     }
 }
 
@@ -1091,6 +1122,7 @@ void vk_texture_release(const tex_t *t) {
     Tex *e = nvn_hm_get(&by_key, &k);
     if (e && !e->released) {
         e->released = 1;
+        e->rel_epoch = submit_epoch;
         nreleased++;
         rel_append(e);
         tex_gen_bump(k.addr);
@@ -1976,6 +2008,8 @@ void vk_texture_census_log(const char *why) {
     rt_log("vram census (%s): vma %.0f MiB local + %.0f host; own-memory texture images %.0f MiB in %u (%llu bound into "
            "pools); made without their largest levels %llu, %.0f MiB at creation", why, dev / M, host / M, total / M, nl,
            (unsigned long long)bound, (unsigned long long)n_dropped, dropped_bytes / M);
+    rt_log("vram census:   released entries dropped under pressure %llu (GPU-written %llu)",
+           (unsigned long long)n_pressure_drops, (unsigned long long)n_pressure_rt_drops);
     uint64_t phys, mirror, shadow;
     vk_mem_vram_parts(&phys, &mirror, &shadow);
     VmaBudget vb[VK_MAX_MEMORY_HEAPS];
