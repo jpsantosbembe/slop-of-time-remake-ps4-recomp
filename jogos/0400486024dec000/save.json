@@ -1,0 +1,14 @@
+{
+  "_doc": "Campos do save usados por tools/editar_save.py (docs/saves.md). Hashes de campo da GameDataList do jogo (GameData/GameDataList.Product.110), achados em 2026-11-08 no save de demonstração do editor onif.info/ocarina. Os textos têm tamanho fixo (String32: 32 bytes, String64: 64). O arquivo não tem checksum: a exportação do editor só muda os bytes do valor.",
+  "progress": {
+    "cena_string32": [1248582525],
+    "cena_string64": [492931546],
+    "posicao": [3364127117, 2517292394, 2272522285],
+    "angulo": [514407384]
+  },
+  "caption": {
+    "posicao": [2334548366],
+    "rotulo_local_string64": [4149087886],
+    "rotulo_cena_string64": [214746829]
+  }
+}

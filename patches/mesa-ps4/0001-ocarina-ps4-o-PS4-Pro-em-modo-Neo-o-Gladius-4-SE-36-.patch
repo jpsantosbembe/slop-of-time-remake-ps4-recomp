@@ -1,0 +1,108 @@
+From af7d1dcc7af0d454c1f9610e55264d712c39f607 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Fri, 6 Nov 2026 21:22:57 -0300
+Subject: [PATCH 01/13] =?UTF-8?q?ocarina-ps4:=20o=20PS4=20Pro=20em=20modo?=
+ =?UTF-8?q?=20Neo=20=C3=A9=20o=20Gladius=20(4=20SE,=2036=20CU,=2016=20RB,?=
+ =?UTF-8?q?=20raster=20config=20de=204=20motores)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/amd/common/ac_gpu_info.c  |  4 +++-
+ src/amd/common/ac_orbis_drm.c | 38 ++++++++++++++++++++++++++++++-----
+ 2 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index 138472a..c465975 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -2550,7 +2550,9 @@ void ac_get_raster_config(const struct radeon_info *info, uint32_t *raster_confi
+     * targets and its pair is consistent.
+     */
+    case CHIP_GLADIUS:
+-      raster_config = 0x2a00161a;
++      /* ocarina-ps4: a forma de 4 motores e 16 RBs (Hawaii), coerente com raster_config_1 = 0x2e. O par anterior
++       * (0x2a00161a, forma de 2 motores) mandava os pixels a só 2 dos 4 motores do Pro. */
++      raster_config = 0x3a00161a;
+       raster_config_1 = 0x0000002e;
+       break;
+    /* 2 SEs / 8 RBs */
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index e4055c6..f1d9c44 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -253,6 +253,34 @@ orbis_wait_continue(struct orbis_wait_watch *w)
+    return true;
+ }
+ 
++
++/* ocarina-ps4 (2026-11-06): o PS4 Pro em modo Neo é o Gladius, não o Liverpool.
++ *
++ * MEDIDO no PS4 Pro do João com a bateria do ocarina-ps4 (FULL-1080p, GPU por passe): com a topologia fixa do
++ * Liverpool, o modo Neo deu o mesmo tempo de pixel e de compute que o modo base (luz 2,04 ms, pós 2,35 ms). Com
++ * ORBIS_NUM_SE=4 o compute caiu para 1,39 ms (1,7x) e o pixel não mudou, porque o raster config continuou o de
++ * 2 motores. O Pro tem 36 CUs em 4 motores (9 por array) e 64 ROPs (16 RBs).
++ *
++ * sceKernelIsNeoMode() diz se o app roda em modo Neo (bit NEO no ATTRIBUTE do param.sfo). Nesse modo este braço
++ * declara o Gladius: device_id 0x9924 (CHIP_GLADIUS), 4 motores, 16 RBs, 911 MHz. ORBIS_NEO_GLADIUS=0 volta ao
++ * Liverpool, para A/B no mesmo binário. */
++static bool
++orbis_neo_gladius(void)
++{
++#if defined(__PS4__)
++   static int cached = -1;
++   if (cached < 0) {
++      const char *const off = getenv("ORBIS_NEO_GLADIUS");
++      cached = sceKernelIsNeoMode() && !(off != NULL && atoi(off) == 0);
++      mesa_logi("orbis-drm: sceKernelIsNeoMode=%d -> %s", sceKernelIsNeoMode(),
++                cached ? "GLADIUS (4 SE, 36 CU, 16 RB)" : "LIVERPOOL");
++   }
++   return cached;
++#else
++   return false;
++#endif
++}
++
+ static void
+ orbis_poll_pause(void)
+ {
+@@ -6155,7 +6183,7 @@ orbis_query_dev_info(struct drm_amdgpu_info_device *d)
+ 
+    ORBIS_DRM_UNCITED("drm_amdgpu_info_device.device_id", "Liverpool's PCI id is in no oracle; "
+                                                          "it reaches only radeon_info.pci_id");
+-   d->device_id = 0x9920;
++   d->device_id = orbis_neo_gladius() ? 0x9924 : 0x9920;
+ 
+    /* --- shader array topology. ALL UNCITED, and gnmtune.h:732 says so in the fork's own words:
+     * "the fork cannot cite Liverpool's CU/SIMD topology from any oracle in the stash".
+@@ -6208,7 +6236,7 @@ orbis_query_dev_info(struct drm_amdgpu_info_device *d)
+     * contradiction it sits on: GB_ADDR_CONFIG's own NUM_SHADER_ENGINES field reads ONE. */
+    {
+       const char *const se = getenv("ORBIS_NUM_SE");
+-      d->num_shader_engines = se != NULL ? (uint32_t)MAX2(atoi(se), 1) : 2u;
++      d->num_shader_engines = se != NULL ? (uint32_t)MAX2(atoi(se), 1) : (orbis_neo_gladius() ? 4u : 2u);
+       if (se != NULL)
+          mesa_logi("orbis-drm: ORBIS_NUM_SE=%u - AN EXPERIMENT. This field is uncited, "
+                    "GB_ADDR_CONFIG says one, and the GSVS ring needs exactly twice what it sizes.",
+@@ -6235,14 +6263,14 @@ orbis_query_dev_info(struct drm_amdgpu_info_device *d)
+    /* --- render backends. MEASURED: gnm-tiling.md H5, "Liverpool has 8 RBs", and rung 2 of the tiling
+     * test passing is what confirmed it. Note this differs from Bonaire's 4, so it is one of the diff
+     * lines against the reference dump that is CORRECT rather than a defect. */
+-   d->num_rb_pipes = 8;
+-   d->enabled_rb_pipes_mask = 0xff;
++   d->num_rb_pipes = orbis_neo_gladius() ? 16 : 8;   /* Pro: 64 ROPs = 16 RBs */
++   d->enabled_rb_pipes_mask = orbis_neo_gladius() ? 0xffff : 0xff;
+ 
+    /* --- clocks. gpu_counter_freq is the one measured value in this group, and it is measured twice:
+     * gnmprof.h:477 says "100 ticks = 1 us, cross-checked against fence-wait", i.e. 100 MHz. RADV turns
+     * it into timestampPeriod = 1000000 / clock_crystal_freq = 10 ns. */
+    d->gpu_counter_freq = 100000; /* KHz. MEASURED. */
+-   d->max_engine_clock = 800000; /* KHz. gnmtune.h:138, "Liverpool's ~800 MHz". */
++   d->max_engine_clock = orbis_neo_gladius() ? 911000 : 800000; /* KHz. Liverpool ~800 MHz; Pro 911 MHz */
+    ORBIS_DRM_UNCITED("drm_amdgpu_info_device.max_memory_clock", "GDDR5 clock not established here");
+    d->max_memory_clock = 2750000;
+ 
+-- 
+2.53.0
+

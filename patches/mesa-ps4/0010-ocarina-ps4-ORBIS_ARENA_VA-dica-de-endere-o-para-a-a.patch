@@ -1,0 +1,41 @@
+From d5258f5b437765cfbf5aa5ac47bca514badbdf79 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 03:08:43 -0300
+Subject: [PATCH 10/13] =?UTF-8?q?ocarina-ps4:=20ORBIS=5FARENA=5FVA,=20dica?=
+ =?UTF-8?q?=20de=20endere=C3=A7o=20para=20a=20arena=20pregui=C3=A7osa=20(n?=
+ =?UTF-8?q?=C3=A3o=20tomar=20a=20janela=20do=20malloc)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/amd/common/ac_orbis_drm.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index 8b0ac04..e71d5cf 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -5178,8 +5178,19 @@ orbis_lazy_setup(uint64_t want, int type, void **va_out, off_t *phys_out)
+                 want >> 20);
+       return -1;
+    }
++   /* ORBIS_ARENA_VA=<endereço>: dica de onde reservar. Sem ela o kernel escolhe (0x640000000 no console), e uma arena
++    * de 3 GiB ali tomava a janela onde o mmap anônimo do malloc (orbis-compat, endereço escolhido pelo kernel) acha
++    * lugar para os carve-outs: o sceKernelMapDirectMemory deles passava a dar EINVAL com 1 GiB de memória livre. */
+    void   *rva = NULL;
++   {
++      const char *const e = getenv("ORBIS_ARENA_VA");
++      if (e != NULL && *e)
++         rva = (void *)(uintptr_t)strtoull(e, NULL, 0);
++   }
++   void   *rva_hint = rva;
+    int32_t err = sceKernelReserveVirtualRange(&rva, want, 0, ORBIS_DIRECT_ALIGN);
++   if (rva_hint != NULL)
++      mesa_logw("orbis-drm: ARENA_LAZY: ORBIS_ARENA_VA=%p -> reservado em %p (0x%08x)", rva_hint, rva, (unsigned)err);
+    if (err != 0 || rva == NULL) {
+       mesa_logw("orbis-drm: ARENA_LAZY: sceKernelReserveVirtualRange(%" PRIu64 " MiB) -> 0x%08x - arena comum",
+                 want >> 20, (unsigned)err);
+-- 
+2.53.0
+

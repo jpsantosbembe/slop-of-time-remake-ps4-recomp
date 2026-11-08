@@ -1,0 +1,23 @@
+#version 450
+// S3c: TAA simples: vizinhança 3x3 do quadro atual, histórico preso entre o mínimo e o máximo dela.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler smp;
+layout(set = 0, binding = 1) uniform texture2D cur;
+layout(set = 0, binding = 2) uniform texture2D hist;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D dst;
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(dst);
+    if (px.x >= sz.x || px.y >= sz.y) return;
+    vec3 mn = vec3(1e9), mx = vec3(-1e9), c = vec3(0.0);
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            vec3 s = texelFetch(sampler2D(cur, smp), clamp(px + ivec2(x, y), ivec2(0), sz - 1), 0).rgb;
+            mn = min(mn, s); mx = max(mx, s);
+            if (x == 0 && y == 0) c = s;
+        }
+    vec3 h = clamp(texelFetch(sampler2D(hist, smp), px, 0).rgb, mn, mx);
+    imageStore(dst, px, vec4(mix(h, c, 0.1), 1.0));
+}

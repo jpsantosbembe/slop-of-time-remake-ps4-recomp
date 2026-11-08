@@ -1,0 +1,22 @@
+#version 450
+// S3a: névoa volumétrica: 16 passos por pixel num volume de ruído 3D, misturada sobre o HDR.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler smp;
+layout(set = 0, binding = 1) uniform texture2D src_hdr;
+layout(set = 0, binding = 2) uniform texture3D noise;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D dst;
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(dst);
+    if (px.x >= sz.x || px.y >= sz.y) return;
+    vec2 uv = (vec2(px) + 0.5) / vec2(sz);
+    vec3 c = textureLod(sampler2D(src_hdr, smp), uv, 0.0).rgb;
+    float acc = 0.0;
+    for (int i = 0; i < 16; i++) {
+        vec3 q = vec3(uv, float(i) / 16.0);
+        acc += textureLod(sampler3D(noise, smp), q, 0.0).r * (1.0 - acc) * 0.08;
+    }
+    imageStore(dst, px, vec4(mix(c, vec3(0.6, 0.7, 0.8), acc), 1.0));
+}

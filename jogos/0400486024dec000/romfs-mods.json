@@ -1,0 +1,16 @@
+{
+  "_doc": "Receitas de modificação do RomFS (tools/romfs_mods.py gera o overlay a partir da cópia do jogo do usuário; o runtime o carrega por TOTK_ROMFS_MODS). Cada receita lista arquivos BYML soltos e as chaves de nível raiz a trocar (no lugar, sem mudar o tamanho). Achados da frente E (2026-11-08, docs/frentes.md).",
+  "sombra-estatica-off": {
+    "descricao": "Desliga a sombra estática da cena principal: some um par de alvos 4096² (D32F + R32F), -128 MiB de VRAM medidos no Linux. Kokiri Forest e o cenário UI já rodam assim. Risco visual: sombras de cenário entre 200 e 1000 de distância.",
+    "arquivos": {
+      "gsys/ModelSceneConfigParam/Main.gsys__ModelSceneConfigParam.bgyml": {"CreateStaticDepthShadow": "false"},
+      "agl/ShadowPrePassParam/MainField.agl__ShadowPrePassParam.bgyml": {"IsUseStaticDepthShadow": "false"}
+    }
+  },
+  "sombra-estatica-2048": {
+    "descricao": "Variante mais suave: mantém a sombra estática com 2048² em vez de 4096² (~-96 MiB, não medido).",
+    "arquivos": {
+      "gsys/ModelSceneConfigParam/Main.gsys__ModelSceneConfigParam.bgyml": {"StaticSdwWidth": "2048"}
+    }
+  }
+}

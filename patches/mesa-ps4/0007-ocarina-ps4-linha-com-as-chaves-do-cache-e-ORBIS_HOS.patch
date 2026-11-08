@@ -1,0 +1,66 @@
+From d449f3cc06343e3f226d79615013da8841b11435 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 01:43:36 -0300
+Subject: [PATCH 07/13] ocarina-ps4: linha com as chaves do cache e
+ ORBIS_HOST_NEO no build host
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Para gerar no Linux (build host-orbis) caches de pipeline que o PS4 aceite: o
+device loga "radv: orbis: chaves do cache - pipelineCacheUUID ..., device
+cache_hash ..." no console e no host, e ORBIS_HOST_NEO=1 faz o host declarar
+o Gladius como o console em modo Neo. Medido no host: Liverpool e Gladius dão
+o mesmo device cache_hash (o ac_compiler_info do GFX7 não depende dos
+motores).
+---
+ src/amd/common/ac_orbis_drm.c |  5 ++++-
+ src/amd/vulkan/radv_device.c  | 16 ++++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index 5884b00..9591806 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -277,7 +277,10 @@ orbis_neo_gladius(void)
+    }
+    return cached;
+ #else
+-   return false;
++   /* ocarina-ps4 (frente V): no build host-orbis, ORBIS_HOST_NEO=1 declara o Gladius como o console em modo Neo -
++    * para gerar no Linux shaders e caches com a mesma chave de device do PS4 Pro. */
++   const char *const neo = getenv("ORBIS_HOST_NEO");
++   return neo != NULL && atoi(neo) == 1;
+ #endif
+ }
+ 
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 5ce4fc5..ea15c36 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -906,6 +906,22 @@ radv_device_init_cache_key(struct radv_device *device)
+    _mesa_blake3_update(&ctx, &device->compiler_info.hw, sizeof(device->compiler_info.hw));
+    _mesa_blake3_update(&ctx, &device->compiler_info.key, sizeof(device->compiler_info.key));
+    _mesa_blake3_final(&ctx, device->cache_hash);
++
++#ifdef HAVE_ORBIS_PLATFORM
++   /* ocarina-ps4 (frente V): as duas chaves de que depende um cache de pipelines gerado fora do console. Se esta
++    * linha sai igual no console e no build host-orbis (Linux), os hashes de pipeline coincidem para o mesmo
++    * SPIR-V, layout e flags. */
++   {
++      const struct radv_physical_device *pdev = radv_device_physical(device);
++      char uuid[2 * VK_UUID_SIZE + 1], hash[2 * sizeof(device->cache_hash) + 1];
++      for (unsigned i = 0; i < VK_UUID_SIZE; i++)
++         snprintf(uuid + 2 * i, 3, "%02x", pdev->cache_uuid[i]);
++      for (unsigned i = 0; i < sizeof(device->cache_hash); i++)
++         snprintf(hash + 2 * i, 3, "%02x", device->cache_hash[i]);
++      mesa_logw("radv: orbis: chaves do cache - pipelineCacheUUID %s, device cache_hash %s (%s)", uuid, hash,
++                pdev->name);
++   }
++#endif
+ }
+ 
+ static void
+-- 
+2.53.0
+

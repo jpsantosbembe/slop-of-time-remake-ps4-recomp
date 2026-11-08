@@ -1,0 +1,15 @@
+{
+  "_doc": "Arte do PKG deste jogo (camada por jogo). Só caminhos dentro do RomFS e parâmetros: as imagens saem da cópia do jogo de quem builda (tools/arte/arte_pkg.py). Escolha do João em 2026-11-07: ícone 2 (logo sobre o campo) e splash 09B (Montanha da Morte com o logo no canto superior direito).",
+  "icon0": {
+    "tamanho": [512, 512],
+    "fundo": {"video": "Event/Movie/Dm_Title_0005.webm", "ponto": 0.30, "escurecer": 0.55},
+    "logo": {"bntx": "UI/Layout2Archive/Title.Product.100.Nin_Ounce_NVN2.bntx.zs", "textura": "Logo_USEU_00", "recortar": true},
+    "posicao": {"modo": "centro", "escala": 0.92, "brilho": true}
+  },
+  "pic": {
+    "tamanho": [1920, 1080],
+    "fundo": {"video": "Event/Movie/Dm_Title_0045.webm", "ponto": 0.60},
+    "logo": {"bntx": "UI/Layout2Archive/Title.Product.100.Nin_Ounce_NVN2.bntx.zs", "textura": "Logo_USEU_00", "recortar": false},
+    "posicao": {"modo": "canto", "largura": 620, "direita": 60, "topo": 40}
+  }
+}

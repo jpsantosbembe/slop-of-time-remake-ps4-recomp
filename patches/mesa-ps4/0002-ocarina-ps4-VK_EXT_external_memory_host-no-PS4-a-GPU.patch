@@ -1,0 +1,162 @@
+From 5118b666866b67a1010d091847fde842705facd2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Fri, 6 Nov 2026 21:24:13 -0300
+Subject: [PATCH 02/13] =?UTF-8?q?ocarina-ps4:=20VK=5FEXT=5Fexternal=5Fmemo?=
+ =?UTF-8?q?ry=5Fhost=20no=20PS4=20(a=20GPU=20usa=20o=20endere=C3=A7o=20da?=
+ =?UTF-8?q?=20CPU;=20BO=20importado=20mora=20no=20pr=C3=B3prio=20ponteiro)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/amd/common/ac_gpu_info.c                  | 11 ++++-
+ src/amd/common/ac_orbis_drm.c                 | 45 +++++++++++++++++--
+ src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c | 13 +++++-
+ 3 files changed, 62 insertions(+), 7 deletions(-)
+
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index c465975..7763a25 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -1113,7 +1113,16 @@ void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info
+     * returned VK_ERROR_INVALID_EXTERNAL_HANDLE ten times. Not advertising it removes all ten and
+     * costs nothing: nothing on this console can use it either way. */
+ #if defined(__PS4__)
+-   info->has_userptr = false;
++   /* ocarina-ps4 (2026-11-06): volta a anunciar, com outro modelo. No PS4 a GPU usa os MESMOS endereços virtuais
++    * que a CPU para tudo que está mapeado com permissão de GPU (o galaxy-recomp desenhou em framebuffers e mandou
++    * command buffers mapeados por ele mesmo, fora de qualquer arena). Então importar um ponteiro não precisa de
++    * espaço de endereços novo: o endereço de GPU do buffer é o próprio ponteiro, desde que a página já tenha GPU_RW
++    * (ac_drm_create_bo_from_user_mem confere com sceKernelVirtualQuery). ORBIS_USERPTR=0 volta ao comportamento
++    * antigo. */
++   {
++      const char *const e = getenv("ORBIS_USERPTR");
++      info->has_userptr = !(e != NULL && e[0] == '0');
++   }
+ #else
+    info->has_userptr = !info->is_virtio;
+ #endif
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index f1d9c44..4d0d451 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -419,6 +419,9 @@ struct orbis_bo {
+    bool has_metadata;
+    /* create_bo_from_user_mem: somebody else's pages, so neither arm may unmap or release them. */
+    bool foreign;
++   /* ocarina-ps4: memória de fora da arena já mapeada com GPU_RW; o endereço de GPU é o próprio cpu (VA op é só
++    * registro, nada é mapeado nem protegido) */
++   bool identity;
+ 
+    /* ⚠ REAL PHYSICAL BACKING FROM THE OTHER BUS. Zero unless this BO's range was re-backed with GARLIC
+     * memory; see orbis_garlic_back(). The address is kept so the arena's own pages can be put back
+@@ -7930,6 +7933,19 @@ orbis_bo_va_op(uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr
+ {
+    const bool gpu_read_only = !(flags & AMDGPU_VM_PAGE_WRITEABLE);
+ 
++   {
++      /* ocarina-ps4: memória importada por ponteiro, já visível à GPU no próprio endereço */
++      struct orbis_bo *ib = orbis_bo_from_handle(bo_handle);
++      if (ib != NULL && ib->identity) {
++         if (ops == AMDGPU_VA_OP_MAP && addr != (uint64_t)(uintptr_t)ib->cpu + offset) {
++            mesa_loge("orbis-drm: identity BO %u mapped at 0x%" PRIx64 ", not at its pointer %p", bo_handle, addr,
++                      ib->cpu);
++            return -EINVAL;
++         }
++         return 0;
++      }
++   }
++
+    switch (ops) {
+    case AMDGPU_VA_OP_MAP: {
+       struct orbis_bo *obo = orbis_bo_from_handle(bo_handle);
+@@ -8262,11 +8278,31 @@ ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_
+     * address it cannot read, and the symptom would be a shader reading zeroes. */
+    const uint64_t va = (uint64_t)(uintptr_t)cpu;
+ 
++   bool identity = false;
+    if (va < orbis_va_base || va + size > orbis_va_end) {
+-      mesa_logw("orbis-drm: user memory at 0x%" PRIx64 " (%" PRIu64 " bytes) is outside the arena - the GPU "
+-                "cannot address it",
+-                va, size);
+-      return -EINVAL;
++#if defined(__PS4__)
++      /* ocarina-ps4: fora da arena, aceita se cada trecho do intervalo está mapeado com GPU_R e GPU_W */
++      struct { uint64_t start, end, off; int32_t prot, type; uint8_t flags; char name[32]; } q;
++      uint64_t at = va;
++      bool ok = true;
++      while (ok && at < va + size) {
++         memset(&q, 0, sizeof(q));
++         if (sceKernelVirtualQuery((void *)(uintptr_t)at, 0, (void *)&q, sizeof(q)) != 0 || q.start > at ||
++             (q.prot & 0x30) != 0x30)
++            ok = false;
++         else
++            at = q.end;
++      }
++      if (ok) {
++         identity = true;
++      } else
++#endif
++      {
++         mesa_logw("orbis-drm: user memory at 0x%" PRIx64 " (%" PRIu64 " bytes) is outside the arena and not "
++                   "mapped GPU_RW - the GPU cannot address it",
++                   va, size);
++         return -EINVAL;
++      }
+    }
+ 
+    struct orbis_bo *obo = calloc(1, sizeof(*obo));
+@@ -8279,6 +8315,7 @@ ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_
+    obo->cpu = cpu;
+    /* Somebody else's pages: neither arm may release or unmap them. */
+    obo->foreign = true;
++   obo->identity = identity;
+ 
+    simple_mtx_lock(&orbis_bo_lock);
+    obo->handle = orbis_bo_slot_claim(obo);
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index a722a69..4012a0c 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -427,7 +427,8 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
+    if (bo->base.initial_domain & RADEON_DOMAIN_GTT)
+       p_atomic_add(&ws->alloc_tracker->allocated_gtt, -align64(bo->base.size, ws->info.gart_page_size));
+ 
+-   ac_drm_va_range_free(bo->va_handle);
++   if (bo->va_handle)   /* ocarina-ps4: BO importado por ponteiro não reservou faixa */
++      ac_drm_va_range_free(bo->va_handle);
+    FREE(bo);
+ }
+ 
+@@ -911,11 +912,18 @@ radv_amdgpu_winsys_bo_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_
+     */
+    vm_alignment = radv_amdgpu_get_optimal_vm_alignment(ws, size, ws->info.gart_page_size);
+ 
++#if defined(__PS4__)
++   /* ocarina-ps4: a GPU do PS4 usa o endereço da CPU; o BO importado mora no próprio ponteiro */
++   (void)vm_alignment;
++   va = (uint64_t)(uintptr_t)pointer;
++   va_handle = NULL;
++#else
+    if (ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, size, vm_alignment, 0, &va, &va_handle,
+                              AMDGPU_VA_RANGE_HIGH)) {
+       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       goto error_va_alloc;
+    }
++#endif
+ 
+    uint32_t kms_handle = 0;
+    ASSERTED int r = ac_drm_bo_export(ws->dev, buf_handle, amdgpu_bo_handle_type_kms, &kms_handle);
+@@ -948,7 +956,8 @@ radv_amdgpu_winsys_bo_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_
+    return VK_SUCCESS;
+ 
+ error_va_map:
+-   ac_drm_va_range_free(va_handle);
++   if (va_handle)
++      ac_drm_va_range_free(va_handle);
+ 
+ error_va_alloc:
+    ac_drm_bo_free(ws->dev, buf_handle);
+-- 
+2.53.0
+

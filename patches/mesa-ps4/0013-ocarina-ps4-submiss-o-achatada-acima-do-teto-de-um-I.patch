@@ -1,0 +1,346 @@
+From 2128a8878d8fd1e1d90ac331517c2078a83bb97a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 08:42:37 -0300
+Subject: [PATCH 13/13] =?UTF-8?q?ocarina-ps4:=20submiss=C3=A3o=20achatada?=
+ =?UTF-8?q?=20acima=20do=20teto=20de=20um=20IB=20vira=20v=C3=A1rios=20DCBs?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+O o18 (Deku Tree) morreu em sceGnmSubmitCommandBuffers(1) = 0x80d11000: com o staging de 8 MiB (d06e369) a
+submissão achatada cabia no slot, mas um DCB é um INDIRECT_BUFFER e o tamanho dele tem 20 bits de dwords
+(0x3FFFFC bytes), teto que o GNM confere por entrada.
+
+Logo antes do submit, depois de todos os diagnósticos (que seguem vendo o stream lógico, com os offsets das
+marcas de progresso e do anel de despejo), um stream acima de 0xFFFF8 dwords é cortado em fronteiras de
+pacote: cada segmento fecha com NOP/type-2 até múltiplo de 8, o resto é empurrado no próprio slot até 256
+bytes, o último ganha o próprio pad; nunca corta dentro do alcance de um COND_EXEC. Tudo vai numa chamada
+só (até 16 entradas); o fence fica no último. ORBIS_DCB_SPLIT_DW=<n> baixa o limite para exercitar o corte.
+O build_flat reserva a folga dos alinhamentos. Falha do submit agora loga seq, dwords achatados e o tamanho
+de cada entrada. Self-test do corte no boot (sintético, 2920 dwords em segmentos de 256).
+---
+ src/amd/common/ac_orbis_drm.c | 277 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 274 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index 42ebe82..86a377b 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -1770,6 +1770,211 @@ orbis_selftest_flatten(void)
+    orbis_va_end = saved_end;
+ }
+ 
++/* ocarina-ps4 (frente V2b, 2026-11-08): UM STREAM ACHATADO GRANDE VIRA VÁRIOS DCBs.
++ *
++ * O o18 (Deku Tree, 710 MiB livres) morreu em `sceGnmSubmitCommandBuffers(1) failed: 0x80d11000` logo depois de o
++ * d06e369 levar o staging de 2 para 8 MiB por slot: a submissão achatada passou a CABER no slot, mas um DCB é um
++ * INDIRECT_BUFFER, e o campo de tamanho dele tem 20 bits de dwords - (2^20 - 1) dwords = 0x3FFFFC bytes, o teto que
++ * a libSceGnmDriver confere por entrada (é 0x80d11000, SUBMISSION_FAILED_INVALID_ARGUMENT, que ela devolve quando
++ * um dcbSizesInBytes passa disso; o shadPS4 reproduz a mesma checagem com a mensagem "limited to (2*20)-1 DWORDS").
++ *
++ * Então, LOGO ANTES DO SUBMIT e depois de todos os diagnósticos (que continuam vendo o stream lógico inteiro, com os
++ * offsets que as marcas de progresso e o anel de despejo usam), um stream acima do limite é cortado em fronteiras de
++ * pacote PM4. Cada corte: o segmento fecha com NOP/type-2 até múltiplo de 8 dwords (pad_dw:0x7), o resto do stream
++ * é empurrado (memmove, no próprio slot) até o próximo múltiplo de 256 bytes (align:256), e um segmento novo
++ * começa. O fence (os dois EOP do fim) fica no último segmento porque ninguém mexe na ordem dos pacotes.
++ *
++ * Nunca corta dentro do alcance de um COND_EXEC (o pacote pula N dwords seguintes; cortar ali faria o pulo sair do
++ * IB). Pacote que não dá para andar (nem type-3 nem type-2): recusa, com o motivo. */
++static uint32_t *orbis_pad_ib(uint32_t *dw, const uint32_t *base);
++
++#define ORBIS_DCB_MAX_DW       0xFFFF8u /* o maior múltiplo de 8 abaixo de 2^20 - 1 dwords */
++#define ORBIS_DCB_MAX_SEGMENTS 16
++#define ORBIS_DCB_SPLIT_SLACK_DW (ORBIS_DCB_MAX_SEGMENTS * 72) /* por corte: até 7 de pad + 63 de alinhamento */
++
++/* Divide cb[0, *n_io) em segmentos de no máximo limit_dw dwords (múltiplo de 8). cb tem de estar alinhado a 256
++ * bytes e *n_io ser múltiplo de 8; cap é o tamanho do buffer em dwords. Escreve offset e tamanho (dwords) de cada
++ * segmento; devolve quantos, ou 0 com *why. *n_io sai com o fim do último segmento (o stream cresceu pelos
++ * alinhamentos). */
++static unsigned
++orbis_split_stream(uint32_t *cb, uint32_t *n_io, uint32_t cap, uint32_t limit_dw, uint32_t *seg_off,
++                   uint32_t *seg_dw, unsigned max_seg, const char **why)
++{
++   uint32_t n = *n_io, s = 0;
++   unsigned nseg = 0;
++
++   limit_dw &= ~7u;
++   if (limit_dw < 64 || (n & 7u) != 0 || ((uintptr_t)cb & 255u) != 0) {
++      *why = "argumentos fora do contrato (limite < 64, tamanho não múltiplo de 8 ou base desalinhada)";
++      return 0;
++   }
++   for (;;) {
++      if (((n - s + 7u) & ~7u) <= limit_dw) { /* com o pad do último segmento */
++         if (nseg == max_seg) {
++            *why = "segmentos demais";
++            return 0;
++         }
++         /* Os cortes andaram o resto do stream por quantidades que não são múltiplas de 8, então o último segmento
++          * ganha o próprio pad (depois do fence, como o orbis_pad_ib faz no stream inteiro). */
++         const uint32_t pad = (8u - ((n - s) & 7u)) & 7u;
++         if (n + pad > cap) {
++            *why = "o slot de staging não tem folga para o pad do último segmento";
++            return 0;
++         }
++         n = (uint32_t)(orbis_pad_ib(cb + n, cb + s) - cb);
++         seg_off[nseg] = s;
++         seg_dw[nseg] = n - s;
++         nseg++;
++         break;
++      }
++      if (nseg + 1 >= max_seg) {
++         *why = "segmentos demais";
++         return 0;
++      }
++      uint32_t i = s, best = s, guard = s;
++      while (i < n) {
++         const uint32_t hdr = cb[i];
++         uint32_t       words;
++         if ((hdr & 0xC0000000u) == 0x80000000u) {
++            words = 1;
++         } else if ((hdr & 0xC0000000u) == 0xC0000000u) {
++            words = 2 + ((hdr >> 16) & 0x3FFFu);
++            if (((hdr >> 8) & 0xFFu) == 0x22 /* IT_COND_EXEC */ && words >= 5 && i + 4 < n) {
++               const uint32_t g = i + words + (cb[i + 4] & 0x3FFFu);
++               if (g > guard)
++                  guard = g;
++            }
++         } else {
++            *why = "um dword que não é cabeçalho type-3 nem type-2 antes do limite";
++            return 0;
++         }
++         if (i + words - s + 7 > limit_dw)
++            break;
++         i += words;
++         if (i >= guard)
++            best = i;
++      }
++      if (best <= s) {
++         *why = "nenhuma fronteira de pacote cabe no limite";
++         return 0;
++      }
++      const uint32_t pad = (8u - ((best - s) & 7u)) & 7u;
++      const uint32_t end = best + pad;
++      const uint32_t ns = (end + 63u) & ~63u;
++      const uint32_t shift = ns - best;
++      if (n + shift > cap) {
++         *why = "o slot de staging não tem folga para os alinhamentos";
++         return 0;
++      }
++      memmove(cb + ns, cb + best, (size_t)(n - best) * 4);
++      if (pad >= 2) {
++         cb[best] = ORBIS_PM4_TYPE3(0x10 /* IT_NOP */, pad - 1);
++         for (uint32_t k = 1; k < pad; k++)
++            cb[best + k] = 0;
++      } else if (pad == 1) {
++         cb[best] = 0x80000000u; /* type-2: um dword, sem corpo */
++      }
++      for (uint32_t k = end; k < ns; k++)
++         cb[k] = 0; /* fora de qualquer segmento */
++      seg_off[nseg] = s;
++      seg_dw[nseg] = end - s;
++      nseg++;
++      n += shift;
++      s = ns;
++   }
++   *n_io = n;
++   return nseg;
++}
++
++/* O self-test do corte, nos dois braços: um stream sintético de ~3000 dwords (NOPs de tamanhos variados, um
++ * COND_EXEC cobrindo pacotes, e o fim com dois "EOP" marcados) cortado com limite de 256 dwords. Confere: cada
++ * segmento alinhado a 256 bytes, múltiplo de 8, dentro do limite, andando pacote a pacote até o fim exato; os
++ * pacotes de carga aparecem todos e na ordem; o alcance do COND_EXEC não foi cortado; o fim fica no último. */
++static void
++orbis_selftest_split(void)
++{
++   static uint32_t buf[4096] __attribute__((aligned(256)));
++   uint32_t        n = 0, payload = 0, cond_at = 0;
++   const char     *fail = NULL;
++
++   memset(buf, 0, sizeof(buf));
++   for (unsigned k = 0; n < 2900; k++) {
++      if (k == 37) {
++         /* COND_EXEC com 4 dados, pulando os 3 pacotes seguintes (3 x 4 dwords). */
++         cond_at = n;
++         buf[n++] = ORBIS_PM4_TYPE3(0x22, 4);
++         buf[n++] = 0;
++         buf[n++] = 0;
++         buf[n++] = 0;
++         buf[n++] = 12;
++         continue;
++      }
++      const uint32_t body = 1 + (k * 7) % 23;
++      buf[n++] = ORBIS_PM4_TYPE3(0x10, body);
++      buf[n++] = 0x5EC00000u | payload++;
++      for (uint32_t j = 1; j < body; j++)
++         buf[n++] = 0x11111111u;
++   }
++   buf[n++] = ORBIS_PM4_TYPE3(0x10, 1);
++   buf[n++] = 0xE0F00001u;
++   buf[n++] = ORBIS_PM4_TYPE3(0x10, 1);
++   buf[n++] = 0xE0F00002u;
++   n = (uint32_t)(orbis_pad_ib(buf + n, buf) - buf);
++
++   uint32_t       off[ORBIS_DCB_MAX_SEGMENTS], len[ORBIS_DCB_MAX_SEGMENTS];
++   const char    *why = NULL;
++   const uint32_t n_in = n;
++   const unsigned nseg = orbis_split_stream(buf, &n, ARRAY_SIZE(buf), 256, off, len, ORBIS_DCB_MAX_SEGMENTS, &why);
++
++   uint32_t seen = 0;
++   bool     end_last = false;
++   if (nseg < 2)
++      fail = nseg == 0 ? why : "o stream acima do limite não foi cortado";
++   for (unsigned g = 0; fail == NULL && g < nseg; g++) {
++      if ((off[g] & 63u) != 0 || (len[g] & 7u) != 0 || len[g] > 256 || len[g] == 0) {
++         fail = "um segmento desalinhado, fora do múltiplo de 8 ou acima do limite";
++         break;
++      }
++      uint32_t i = off[g];
++      while (i < off[g] + len[g]) {
++         const uint32_t hdr = buf[i];
++         uint32_t       words;
++         if ((hdr & 0xC0000000u) == 0x80000000u)
++            words = 1;
++         else if ((hdr & 0xC0000000u) == 0xC0000000u)
++            words = 2 + ((hdr >> 16) & 0x3FFFu);
++         else {
++            fail = "um segmento contém algo que não é pacote";
++            break;
++         }
++         if (((hdr >> 8) & 0xFFu) == 0x22 && i + words + buf[i + 4] > off[g] + len[g])
++            fail = "o alcance do COND_EXEC atravessou um corte";
++         if (((hdr >> 8) & 0xFFu) == 0x10 && words >= 2 && (buf[i + 1] & 0xFFF00000u) == 0x5EC00000u) {
++            if ((buf[i + 1] & 0xFFFFFu) != seen)
++               fail = "os pacotes de carga saíram fora de ordem ou faltando";
++            seen++;
++         }
++         if (words >= 2 && buf[i + 1] == 0xE0F00002u)
++            end_last = (g == nseg - 1);
++         i += words;
++      }
++      if (fail == NULL && i != off[g] + len[g])
++         fail = "um segmento não termina exatamente no tamanho dele";
++   }
++   if (fail == NULL && seen != payload)
++      fail = "faltam pacotes de carga";
++   if (fail == NULL && !end_last)
++      fail = "o fim (o lugar do fence) não ficou no último segmento";
++   (void)cond_at;
++
++   if (fail != NULL)
++      mesa_loge("orbis-drm: SELF-TEST DO CORTE EM DCBs FALHOU - %s (%u dwords, %u segmento(s))", fail, n_in, nseg);
++   else
++      mesa_logi("orbis-drm: self-test do corte em DCBs: %u dwords em %u segmentos de até 256, alinhados, %u pacotes "
++                "na ordem, COND_EXEC inteiro, fim no último - OK",
++                n_in, nseg, payload);
++}
++
+ 
+ /* ⚠ WHAT SHAPE IS THE DRIVER DRAWING IN? Thirty hypotheses have been eliminated and not one of them explained
+  * the ONE property that constrains this hardest: the artefacts are EXACTLY a quarter of the screen.
+@@ -6330,6 +6535,7 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
+    static unsigned selftest_done;
+    if (orbis_budget(&selftest_done, 1)) {
+       orbis_selftest_flatten();
++      orbis_selftest_split(); /* frente V2b */
+       orbis_selftest_pad();
+       orbis_selftest_dead_pool();
+       orbis_selftest_futex();
+@@ -10849,7 +11055,9 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+        * padding; the builder refuses rather than overrunning the slot. */
+       /* timed: the flatten is the one thing in this path nobody has measured */
+       const uint64_t orbis_flat_t0 = os_time_get_nano();
+-      uint32_t *dw = orbis_build_flat(cb, ORBIS_FENCE_CB_BYTES / 4, dcb, dcb_bytes, n_dcb, seq, 32);
++      /* frente V2b: a folga do corte em DCBs (alinhamentos) também fica reservada */
++      uint32_t *dw = orbis_build_flat(cb, ORBIS_FENCE_CB_BYTES / 4, dcb, dcb_bytes, n_dcb, seq,
++                                      32 + ORBIS_DCB_SPLIT_SLACK_DW);
+       orbis_api_time(ORBIS_ID_ARM_BUILD_FLAT, os_time_get_nano() - orbis_flat_t0);
+       orbis_api_count(ORBIS_ID_ARM_BUILD_FLAT, 1);
+       if (dw == NULL) {
+@@ -11320,10 +11528,64 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+       }
+    }
+ 
++   /* frente V2b: o stream lógico (o que os diagnósticos acima viram) acima do limite de um IB vira vários DCBs,
++    * enviados na mesma chamada. ORBIS_DCB_SPLIT_DW=<n> baixa o limite (múltiplo de 8, mínimo 64) para exercitar o
++    * corte em submissões comuns; o padrão é o teto do campo de 20 bits. */
++   void          *seg_addr[ORBIS_DCB_MAX_SEGMENTS];
++   uint32_t       seg_bytes[ORBIS_DCB_MAX_SEGMENTS];
++   uint32_t       seg_off[ORBIS_DCB_MAX_SEGMENTS], seg_dw[ORBIS_DCB_MAX_SEGMENTS];
++   void         **sub_addr = dcb;
++   uint32_t      *sub_bytes = dcb_bytes;
++   unsigned       sub_n = n_dcb;
++   const uint32_t flat_dw = dcb_bytes[0] / 4;
++   {
++      static uint32_t limit_dw;
++      if (limit_dw == 0) {
++         const char *const e = getenv("ORBIS_DCB_SPLIT_DW");
++         uint32_t          v = e != NULL ? (uint32_t)strtoul(e, NULL, 0) : 0;
++         v &= ~7u;
++         limit_dw = (v >= 64 && v <= ORBIS_DCB_MAX_DW) ? v : ORBIS_DCB_MAX_DW;
++         if (limit_dw != ORBIS_DCB_MAX_DW)
++            mesa_logw("orbis-drm: ORBIS_DCB_SPLIT_DW=%u - streams acima disso viram vários DCBs (o teto real é %u)",
++                      limit_dw, ORBIS_DCB_MAX_DW);
++      }
++      if (n_dcb == 1 && flat_dw > limit_dw) {
++         uint32_t       n = flat_dw;
++         const char    *why = NULL;
++         const unsigned k = orbis_split_stream((uint32_t *)dcb[0], &n, ORBIS_FENCE_CB_BYTES / 4, limit_dw, seg_off,
++                                               seg_dw, ORBIS_DCB_MAX_SEGMENTS, &why);
++         if (k == 0) {
++            mesa_loge("orbis-drm: submit #%" PRIu64 ": %u dwords achatados passam do limite de %u por DCB e o "
++                      "corte recusou: %s. A submissão vai inteira e o GNM deve recusar.",
++                      seq, flat_dw, limit_dw, why);
++         } else {
++            for (unsigned g = 0; g < k; g++) {
++               seg_addr[g] = (uint32_t *)dcb[0] + seg_off[g];
++               seg_bytes[g] = seg_dw[g] * 4;
++            }
++            sub_addr = seg_addr;
++            sub_bytes = seg_bytes;
++            sub_n = k;
++            static unsigned said;
++            static uint64_t splits;
++            ++splits;
++            if (orbis_budget(&said, 8) || (splits % 256) == 0) {
++               char     list[160];
++               unsigned at = 0;
++               for (unsigned g = 0; g < k && at < sizeof(list) - 16; g++)
++                  at += (unsigned)snprintf(list + at, sizeof(list) - at, "%s%u", g ? " + " : "", seg_dw[g]);
++               mesa_logw("orbis-drm: submit #%" PRIu64 ": %u dwords achatados > %u por DCB - %u DCBs (%s dwords); "
++                         "%" PRIu64 " submissão(ões) cortada(s) até aqui",
++                         seq, flat_dw, limit_dw, k, list, splits);
++            }
++         }
++      }
++   }
++
+    sceGnmFlushGarlic();
+ 
+    const uint64_t t0 = os_time_get_nano();
+-   const int32_t err = sceGnmSubmitCommandBuffers(n_dcb, dcb, dcb_bytes, NULL, NULL);
++   const int32_t err = sceGnmSubmitCommandBuffers(sub_n, sub_addr, sub_bytes, NULL, NULL);
+    const uint64_t t1 = os_time_get_nano();
+    if (getenv("ORBIS_WATCH_STRICT") != NULL && err == 0) {
+       /* Bounded, like every wait in this file: if the GPU does not get there, the check is skipped rather than the
+@@ -11370,7 +11632,16 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+                    "submission was NOT serialised and the run is compromised from here on", seq);
+    }
+    if (err != 0) {
+-      mesa_loge("orbis-drm: sceGnmSubmitCommandBuffers(%u) failed: 0x%08x", n_dcb, err);
++      {
++         /* frente V2b: o tamanho de cada entrada, que é o que o GNM confere. */
++         char     list[200];
++         unsigned at = 0;
++         for (unsigned g = 0; g < sub_n && at < sizeof(list) - 16; g++)
++            at += (unsigned)snprintf(list + at, sizeof(list) - at, "%s%u", g ? " + " : "", sub_bytes[g] / 4);
++         mesa_loge("orbis-drm: sceGnmSubmitCommandBuffers(%u) failed: 0x%08x - submit #%" PRIu64 ", %u dwords "
++                   "achatados, entradas de %s dwords (teto de um IB: %u)",
++                   sub_n, err, seq, flat_dw, list, 0xFFFFFu);
++      }
+       /* The GPU never received this stream, so its end-of-pipe will never fire. Same reasoning as the builder's
+        * refusal above: hand the ticket back so the fence label and the counter stay in step. */
+       --orbis_submit_seq_no;
+-- 
+2.53.0
+

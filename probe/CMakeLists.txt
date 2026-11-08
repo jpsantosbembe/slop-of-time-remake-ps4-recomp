@@ -1,0 +1,27 @@
+# ocarina-ps4 / Fase 0: sonda de memória, endereços, write-watch, Vulkan com memória do host e funções do OoT traduzidas.
+#   Linux (referência das funções): cmake -S probe -B build/probe-linux -G Ninja -DRUNTIME_DIR=... -DLIFT_TESTS=...
+#   PS4: cmake -S probe -B build/probe-ps4 -G Ninja -DCMAKE_TOOLCHAIN_FILE=<bundle>/toolchain/orbis-sdk.cmake
+#        -DORBIS_KIT_DIR=... -DORBIS_MESA_SRC=... -DORBIS_MESA_BUILD=... -DRUNTIME_DIR=... -DLIFT_TESTS=...
+cmake_minimum_required(VERSION 3.16)
+project(ocarina_probe C)
+if(NOT RUNTIME_DIR OR NOT LIFT_TESTS)
+  message(FATAL_ERROR "passe -DRUNTIME_DIR=<dkb-pc-recomp/runtime> e -DLIFT_TESTS=<lift_tests.c gerado>")
+endif()
+# o C traduzido: mesmas opções nos dois lados, sem contração de FMA (a Jaguar não tem FMA)
+set_source_files_properties(${LIFT_TESTS} PROPERTIES COMPILE_OPTIONS "-O2;-fno-strict-aliasing;-ffp-contract=off;-Wno-everything")
+if(PS4)
+  add_executable(probe probe_ps4.c lift_harness.c ${LIFT_TESTS})
+  target_compile_options(probe PRIVATE -O2 -march=btver2 -ffp-contract=off)
+  target_include_directories(probe PRIVATE ${RUNTIME_DIR})
+  add_subdirectory("${ORBIS_KIT_DIR}/vkloader" ps4-vkloader)
+  target_link_libraries(probe PRIVATE ps4-vkloader m)
+  orbis_compat_verify()
+  if(COMMAND ps4_create_eboot)
+    ps4_create_eboot(probe)
+  endif()
+else()
+  add_executable(probe lift_harness.c ${LIFT_TESTS})
+  target_compile_options(probe PRIVATE -O2 -march=x86-64-v2 -ffp-contract=off)
+  target_include_directories(probe PRIVATE ${RUNTIME_DIR})
+  target_link_libraries(probe PRIVATE m)
+endif()

@@ -1,0 +1,66 @@
+From d06e3692c4a06bd633f10a29506ed4e5de6457d0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 07:46:46 -0300
+Subject: [PATCH 11/13] =?UTF-8?q?ocarina-ps4:=20staging=20de=20submiss?=
+ =?UTF-8?q?=C3=A3o=20de=208=20MiB=20(8=20slots);=20a=20Deku=20Tree=20passa?=
+ =?UTF-8?q?va=20de=202=20MiB=20e=20a=20recusa=20travava=20o=20fence?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/amd/common/ac_orbis_drm.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index e71d5cf..01ea8eb 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -1325,7 +1325,11 @@ static simple_mtx_t orbis_retire_lock = SIMPLE_MTX_INITIALIZER;
+  * 2 MiB x ORBIS_FENCE_CB_SLOTS comes out of the arena's private slice - 32 MiB of a 1 GiB arena - which is a cost
+  * worth naming and not worth arguing about. The refusal stays, and it now prints how much was needed, so the next
+  * time this bounds a real workload the number comes from the console rather than from an estimate. */
+-#define ORBIS_FENCE_CB_BYTES (2 * 1024 * 1024)
++/* ocarina-ps4 (2026-11-08): 8 MiB. Na entrada da Deku Tree do OoT, uma submissão achatada passou de 2 MiB (chunk 1 de 3
++ * com 38032 dwords antes das cadeias); a recusa se repetia a cada quadro, o fence parava e o runtime via device lost.
++ * Com ORBIS_FENCE_CB_SLOTS 8, a fatia privada vai de 32 para 64 MiB. O anel de despejo segue com 2 MiB por entrada
++ * (ORBIS_HUNG_STREAM_DW): guarda só o começo de uma submissão maior. */
++#define ORBIS_FENCE_CB_BYTES (8 * 1024 * 1024)
+ 
+ /* ⚠ FLATTENING, AND IT REPLACES A ONE-LEVEL PATCH THAT COULD ONLY EVER BE A DOWN PAYMENT.
+  *
+@@ -2973,11 +2977,12 @@ static volatile uint32_t *orbis_fence_label = &orbis_host_label;
+  * measured - and ORBIS_HUNG_RING slots of .bss. Enabled by DEFAULT, and that is deliberate: a hang that produces no
+  * dump has cost this project more than half a megabyte of memory ever will. ORBIS_DUMP_HUNG=0 turns it off. */
+ #define ORBIS_HUNG_RING 8
++#define ORBIS_HUNG_STREAM_DW (2u * 1024 * 1024 / 4)   /* ocarina-ps4: o anel não cresce com o staging */
+ 
+ struct orbis_hung_slot {
+    uint64_t seq;
+    uint32_t dwords;
+-   uint32_t stream[ORBIS_FENCE_CB_BYTES / 4];
++   uint32_t stream[ORBIS_HUNG_STREAM_DW];
+ };
+ static struct orbis_hung_slot orbis_hung_ring[ORBIS_HUNG_RING];
+ 
+@@ -3746,7 +3751,7 @@ done:
+  * One slot per outstanding submit, indexed by sequence number, and a slot is only reused once the label proves
+  * the GPU has passed the submission that used it. 16 is far more than anything measured (RADV's own limit here
+  * is one submission per queue at a time), and running out is a bounded wait rather than corruption. */
+-#define ORBIS_FENCE_CB_SLOTS 16
++#define ORBIS_FENCE_CB_SLOTS 8   /* ocarina-ps4: 16 x 2 MiB virou 8 x 8 MiB (ver ORBIS_FENCE_CB_BYTES) */
+ /* ⚠ 256 BYTES BECAUSE THAT IS WHAT THIS DEVICE ITSELF REPORTS, and ignoring our own answer stalled the GPU.
+  * The console's radeon_info dump reads `IP GFX 7.2 queues:1 align:256 pad_dw:0x7`: an IB starts on a 256-byte
+  * boundary and its size is a multiple of 8 dwords. The two EOP packets are 12 dwords - not a multiple of 8 -
+@@ -10742,7 +10747,7 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+        * time a hang is noticed the original would be somebody else's stream. */
+       if (orbis_dump_hung_enabled()) {
+          struct orbis_hung_slot *const hs = &orbis_hung_ring[seq % ORBIS_HUNG_RING];
+-         hs->dwords = (uint32_t)(dw - cb);
++         hs->dwords = (uint32_t)(dw - cb) < ORBIS_HUNG_STREAM_DW ? (uint32_t)(dw - cb) : ORBIS_HUNG_STREAM_DW;
+          memcpy(hs->stream, cb, (size_t)hs->dwords * 4);
+          /* Last, so a reader can never see a size that does not match the sequence number. */
+          hs->seq = seq;
+-- 
+2.53.0
+

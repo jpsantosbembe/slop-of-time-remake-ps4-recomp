@@ -1,0 +1,28 @@
+#version 450
+// S3b: um nível do bloom. mode 0 = redução com 13 amostras; mode 1 = subida com filtro tenda de 9 amostras, somada ao nível de destino.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform PC { uint mode; float texel_x; float texel_y; uint pad; } pc;
+layout(set = 0, binding = 0) uniform sampler smp;
+layout(set = 0, binding = 1) uniform texture2D src;
+layout(set = 0, binding = 2, rgba16f) uniform image2D dst;
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(dst);
+    if (px.x >= sz.x || px.y >= sz.y) return;
+    vec2 uv = (vec2(px) + 0.5) / vec2(sz);
+    vec2 t = vec2(pc.texel_x, pc.texel_y);
+    vec3 s = vec3(0.0);
+    if (pc.mode == 0u) {
+        const vec2 o[13] = vec2[](vec2(0,0), vec2(-1,-1), vec2(1,-1), vec2(-1,1), vec2(1,1), vec2(-2,-2), vec2(0,-2),
+                                  vec2(2,-2), vec2(-2,0), vec2(2,0), vec2(-2,2), vec2(0,2), vec2(2,2));
+        for (int i = 0; i < 13; i++) s += textureLod(sampler2D(src, smp), uv + o[i] * t, 0.0).rgb;
+        imageStore(dst, px, vec4(s / 13.0, 1.0));
+    } else {
+        for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++)
+                s += textureLod(sampler2D(src, smp), uv + vec2(x, y) * t, 0.0).rgb * ((2 - abs(x)) * (2 - abs(y)));
+        imageStore(dst, px, vec4(imageLoad(dst, px).rgb + s / 16.0, 1.0));
+    }
+}

@@ -1,0 +1,109 @@
+From 4dfa5d1ff3bb060bf14146462733830e766ccdcf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 01:37:47 -0300
+Subject: [PATCH 06/13] ocarina-ps4: vars_to_ssa antes do copy_prop_vars em
+ shaders gigantes (ORBIS_BIG_NIR)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Os compute traduzidos do NVN chamam um ajudante de ~1500 linhas de SPIR-V (a
+busca do endereço global entre os storage buffers) até 243 vezes; depois do
+inline são até 750 mil instruções NIR e 20 mil variáveis function_temp. No
+console, com o otimizador ligado, o malloc acabou dentro do
+nir_opt_copy_prop_vars (lookup_entry_and_kill_aliases, gather_vars_written).
+
+Acima de ORBIS_BIG_NIR instruções depois do inline (padrão 100000; 0
+desliga) as variáveis viram SSA antes do primeiro copy_prop_vars. Medido no
+RADV host-orbis com os SPIR-V do jogo: o pico do copy_prop_vars cai de
+156-177 MiB para ~0 nos maiores (28 -> 4 MiB no a54f19e9).
+---
+ src/amd/vulkan/radv_shader.c | 58 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 65931d0..2d7b164 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -25,6 +25,7 @@
+ #include "util/u_atomic.h"
+ #include "util/log.h"
+ #include "util/u_call_once.h"
++#include "util/os_misc.h"
+ #include "ac_shader_util.h"
+ #include "radv_cs.h"
+ #include "radv_entrypoints.h"
+@@ -172,6 +173,45 @@ radv_can_dump_shader_stats(const struct radv_compiler_info *compiler_info, nir_s
+    return compiler_info->debug.dump_shader_stats && !is_meta_shader(nir);
+ }
+ 
++/* ocarina-ps4 (frente V): SHADERS GIGANTES E O nir_opt_copy_prop_vars.
++ *
++ * Os compute do jogo traduzidos do NVN chamam um ajudante de ~1500 linhas de SPIR-V (a busca do endereço global entre
++ * os storage buffers, ~70 variáveis Function e ~35 ifs) até 243 vezes; o inline gera centenas de milhares de
++ * instruções e dezenas de milhares de variáveis function_temp. O nir_opt_copy_prop_vars guarda, por nó de controle de
++ * fluxo, a lista de cópias conhecidas de cada variável (e o gather_vars_written um conjunto por nó): no console, com o
++ * otimizador ligado, foi ali que o malloc acabou (~520 MiB em lookup_entry_and_kill_aliases numa só compilação).
++ *
++ * Acima de ORBIS_BIG_NIR instruções (contadas logo depois do inline), as variáveis viram SSA (nir_lower_vars_to_ssa)
++ * ANTES do primeiro nir_opt_copy_prop_vars: o que sobra para ele são só as variáveis que não podem virar SSA (arrays
++ * com índice dinâmico), e o resultado do otimizador é o mesmo. ORBIS_BIG_NIR=0 desliga; o padrão está abaixo. */
++#define RADV_ORBIS_BIG_NIR_DEFAULT 100000
++
++static unsigned
++radv_orbis_big_nir_limit(void)
++{
++   static int limit = -1;
++   if (limit < 0) {
++      const char *s = os_get_option("ORBIS_BIG_NIR");
++      limit = s ? atoi(s) : RADV_ORBIS_BIG_NIR_DEFAULT;
++      if (limit < 0)
++         limit = 0;
++   }
++   return (unsigned)limit;
++}
++
++static unsigned
++radv_orbis_count_instrs(nir_shader *nir)
++{
++   unsigned n = 0;
++   nir_foreach_function_impl (impl, nir) {
++      nir_foreach_block (block, impl) {
++         nir_foreach_instr (instr, block)
++            n++;
++      }
++   }
++   return n;
++}
++
+ void
+ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively)
+ {
+@@ -577,6 +617,24 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
+       nir_remove_non_cmat_call_entrypoints(nir);
+ 
+       if (progress) {
++         const unsigned big = radv_orbis_big_nir_limit();
++         if (big) {
++            const unsigned n = radv_orbis_count_instrs(nir);
++            if (n >= big) {
++               unsigned vars = 0;
++               nir_foreach_function_impl (impl, nir) {
++                  nir_foreach_function_temp_variable (var, impl)
++                     vars++;
++               }
++               mesa_logw("radv: ORBIS_BIG_NIR: %u instruções NIR e %u variáveis function_temp depois do inline "
++                         "(limite %u) - nir_lower_vars_to_ssa antes do nir_opt_copy_prop_vars",
++                         n, vars, big);
++               NIR_PASS(_, nir, nir_opt_deref);
++               NIR_PASS(_, nir, nir_lower_vars_to_ssa);
++               NIR_PASS(_, nir, nir_opt_dce);
++               NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
++            }
++         }
+          NIR_PASS(_, nir, nir_opt_copy_prop_vars);
+          NIR_PASS(_, nir, nir_opt_copy_prop);
+       }
+-- 
+2.53.0
+

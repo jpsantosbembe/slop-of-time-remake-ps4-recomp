@@ -1,0 +1,111 @@
+From d45c11883b7c9071634a398ada3222e2f6e4d071 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 02:39:02 -0300
+Subject: [PATCH 09/13] =?UTF-8?q?ocarina-ps4:=20ORBIS=5FARENA=5FLAZY=3D2?=
+ =?UTF-8?q?=20(janela=20coberta=20por=20um=20ralo=20PROT=5FNONE)=20e=20dia?=
+ =?UTF-8?q?gn=C3=B3stico?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Com ORBIS_ARENA_LAZY=1 + ASTC na GPU o boot travou sem FATAL nem GPU PARADA. O
+modo 1 deixa a janela não lastreada como reserva pura (sem mapa); a arena
+antiga a deixava mapeada e PROT_NONE. Um endereço sem mapa que o CP lê por
+conta própria (DMA_DATA, SET_BASE, prefetch de código) trava o CP em vez de
+faltar - o próprio orbis_audit_hung_addresses diz isso.
+
+ORBIS_ARENA_LAZY=2 cobre a janela com vistas PROT_NONE de um ralo de
+ORBIS_ARENA_SINK_MIB (padrão 32 MiB, 64 vistas para 2 GiB), então fora dos
+BOs tudo fica como na arena antiga e o físico continua sendo o ralo mais os
+pedaços lastreados. Mais: uma linha por mapa que lastreia pedaços (os 48
+primeiros e todo mapa de 32 MiB ou mais).
+---
+ src/amd/common/ac_orbis_drm.c | 50 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index 9591806..8b0ac04 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -1243,6 +1243,7 @@ static int32_t orbis_arena_type;
+  * Exige o caminho por consulta do ORBIS_GARLIC_RELEASE (a aritmética da arena deixa de valer fora da fatia privada). */
+ #define ORBIS_LAZY_CHUNK ORBIS_DIRECT_ALIGN
+ static bool     orbis_arena_lazy;
++static int      orbis_lazy_mode;  /* 1 = só reserva; 2 = reserva coberta por um ralo PROT_NONE (ORBIS_ARENA_LAZY=2) */
+ static uint8_t *orbis_lazy_backed; /* um byte por pedaço de 2 MiB, a partir de orbis_arena_map_base */
+ static uint64_t orbis_lazy_chunks;
+ static uint64_t orbis_lazy_bytes;  /* físico lastreado na janela, além da fatia privada */
+@@ -5157,8 +5158,9 @@ static bool
+ orbis_arena_lazy_wanted(void)
+ {
+    const char *const s = getenv("ORBIS_ARENA_LAZY");
+-   if (s == NULL || s[0] != '1')
++   if (s == NULL || (s[0] != '1' && s[0] != '2'))
+       return false;
++   orbis_lazy_mode = s[0] - '0';
+    if (getenv("ORBIS_FLAT_ARENA") != NULL) {
+       mesa_logw("orbis-drm: ORBIS_ARENA_LAZY=1 ignorado: ORBIS_FLAT_ARENA pede a arena inteira mapeada");
+       return false;
+@@ -5209,6 +5211,43 @@ orbis_lazy_setup(uint64_t want, int type, void **va_out, off_t *phys_out)
+    }
+    memset(orbis_lazy_backed, 1, head / ORBIS_LAZY_CHUNK);
+    orbis_lazy_head = head;
++
++   /* ORBIS_ARENA_LAZY=2: o resto da janela não fica só reservado - fica MAPEADO, PROT_NONE, sobre um ralo de
++    * ORBIS_ARENA_SINK_MIB (padrão 32) repetido. Para a CPU e a GPU a janela volta a ser o que era na arena antiga
++    * (mapeada, sem acesso), e um acesso fora de um BO falta do mesmo jeito; o físico continua sendo só o ralo mais
++    * os pedaços lastreados. É o A/B contra o modo 1 para o travamento com ASTC=gpu. */
++   if (orbis_lazy_mode == 2) {
++      const char *const ms = getenv("ORBIS_ARENA_SINK_MIB");
++      uint64_t sink = (ms != NULL ? strtoull(ms, NULL, 10) : 32) << 20;
++      sink = sink < ORBIS_LAZY_CHUNK ? ORBIS_LAZY_CHUNK : sink / ORBIS_LAZY_CHUNK * ORBIS_LAZY_CHUNK;
++      off_t sphys = 0;
++      unsigned views = 0;
++      err = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sink, ORBIS_DIRECT_ALIGN, type, &sphys);
++      if (err == 0) {
++         const uint64_t base = (uint64_t)(uintptr_t)rva + head, end = (uint64_t)(uintptr_t)rva + want;
++         uint64_t at_va = base;
++         for (; at_va < end; at_va += sink) {
++            const uint64_t len = end - at_va < sink ? end - at_va : sink;
++            void *v = (void *)(uintptr_t)at_va;
++            err = sceKernelMapDirectMemory(&v, len, ORBIS_GRAPHICS_PROT, ORBIS_MAP_FIXED, sphys, ORBIS_DIRECT_ALIGN);
++            if (err != 0 || v != (void *)(uintptr_t)at_va) {
++               mesa_logw("orbis-drm: ARENA_LAZY=2: a vista %u do ralo em 0x%" PRIx64 " -> 0x%08x (foi para %p) - o "
++                         "resto da janela fica só reservado",
++                         views, at_va, (unsigned)err, v);
++               break;
++            }
++            views++;
++         }
++         if (at_va > base)
++            sceKernelMprotect((void *)(uintptr_t)base, (size_t)(at_va - base), ORBIS_PROT_NONE);
++         mesa_logw("orbis-drm: ARENA_LAZY=2 - ralo de %" PRIu64 " MiB (phys 0x%llx) em %u vistas PROT_NONE cobrindo "
++                   "0x%" PRIx64 "..0x%" PRIx64,
++                   sink >> 20, (unsigned long long)sphys, views, base, at_va);
++      } else {
++         mesa_logw("orbis-drm: ARENA_LAZY=2: sem físico para o ralo (0x%08x) - janela só reservada, como o modo 1",
++                   (unsigned)err);
++      }
++   }
+    orbis_arena_lazy = true;
+    *va_out = rva;
+    *phys_out = phys;
+@@ -5265,6 +5304,15 @@ orbis_lazy_back(uint64_t start, uint64_t bytes)
+       orbis_lazy_backed[c] = 1;
+       orbis_lazy_bytes += ORBIS_LAZY_CHUNK;
+    }
++   {
++      /* Diagnóstico (rodada do travamento com ASTC=gpu): os primeiros mapas que lastreiam pedaços, e todo mapa de
++       * 32 MiB ou mais. */
++      static unsigned said;
++      if (ret == 0 && (bytes >= (32ull << 20) || orbis_budget(&said, 48)))
++         mesa_logw("orbis-drm: ARENA_LAZY: map 0x%" PRIx64 "+%" PRIu64 " KiB, pedaços %" PRIu64 "..%" PRIu64
++                   "; lastreados agora %" PRIu64 " MiB",
++                   start, bytes / 1024, first, last, orbis_lazy_bytes >> 20);
++   }
+    const uint64_t now = orbis_lazy_bytes >> 26; /* 64 MiB */
+    const bool say = now > orbis_lazy_logged;
+    if (say)
+-- 
+2.53.0
+

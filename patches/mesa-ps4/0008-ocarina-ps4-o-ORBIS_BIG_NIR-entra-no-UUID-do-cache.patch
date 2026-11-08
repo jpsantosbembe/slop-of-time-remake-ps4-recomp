@@ -1,0 +1,64 @@
+From c15409e39cfce132c9e454161f100d1201eaf90e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 01:48:34 -0300
+Subject: [PATCH 08/13] ocarina-ps4: o ORBIS_BIG_NIR entra no UUID do cache
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+O mesa-cache do console guarda os shaders compilados; sem o limite na chave,
+um A/B do ORBIS_BIG_NIR no mesmo build leria o resultado da execução anterior.
+Mesmo padrão do ORBIS_VS_STRICT_ALIGN.
+---
+ src/amd/vulkan/radv_physical_device.c | 6 ++++++
+ src/amd/vulkan/radv_shader.c          | 2 +-
+ src/amd/vulkan/radv_shader.h          | 3 +++
+ 3 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 9a7580d..e07e46a 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -368,6 +368,12 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+       const uint8_t strict = ac_orbis_strict_vtx_align();
+       _mesa_blake3_update(&ctx, &strict, sizeof(strict));
+    }
++   /* ocarina-ps4 (frente V): ORBIS_BIG_NIR muda o NIR dos shaders gigantes, então entra na chave pelo mesmo motivo -
++    * sem isso, um A/B no mesmo build leria do mesa-cache o resultado da execução anterior. */
++   {
++      const uint32_t big_nir = radv_orbis_big_nir_limit();
++      _mesa_blake3_update(&ctx, &big_nir, sizeof(big_nir));
++   }
+ 
+    _mesa_blake3_final(&ctx, blake3);
+ 
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 2d7b164..6c1316e 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -186,7 +186,7 @@ radv_can_dump_shader_stats(const struct radv_compiler_info *compiler_info, nir_s
+  * com índice dinâmico), e o resultado do otimizador é o mesmo. ORBIS_BIG_NIR=0 desliga; o padrão está abaixo. */
+ #define RADV_ORBIS_BIG_NIR_DEFAULT 100000
+ 
+-static unsigned
++unsigned
+ radv_orbis_big_nir_limit(void)
+ {
+    static int limit = -1;
+diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
+index de86131..4b22b4c 100644
+--- a/src/amd/vulkan/radv_shader.h
++++ b/src/amd/vulkan/radv_shader.h
+@@ -640,6 +640,9 @@ struct radv_compiler_info {
+ };
+ struct radv_shader_stage;
+ 
++/* ocarina-ps4 (frente V): o limite do ORBIS_BIG_NIR (radv_shader.c); entra no UUID do cache. */
++unsigned radv_orbis_big_nir_limit(void);
++
+ void radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively);
+ void radv_optimize_nir_algebraic_early(nir_shader *shader);
+ void radv_optimize_nir_algebraic_late(nir_shader *shader);
+-- 
+2.53.0
+

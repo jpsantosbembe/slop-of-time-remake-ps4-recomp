@@ -1,0 +1,432 @@
+From 55500a56a2bb31e5a491dadad4f9a1be9d63be8c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 08:06:48 -0300
+Subject: [PATCH 12/13] =?UTF-8?q?ocarina-ps4:=20peda=C3=A7o=20vazio=20da?=
+ =?UTF-8?q?=20arena=20pregui=C3=A7osa=20volta=20ao=20ralo=20(ORBIS=5FLAZY?=
+ =?UTF-8?q?=5FRECLAIM)=20e=20censo=20de=20VA/f=C3=ADsico?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No o13 (Deku Tree) o "com físico" da arena chegou a 1924 MiB de 1983 porque um pedaço de 2 MiB lastreado
+nunca devolvia o físico, e o put_back do GARLIC_RELEASE realocava ONION por baixo de todo BO de VRAM que
+morria (993 MiB no o13). Agora cada pedaço conta os ranges de VA que o tocam; quando o dreno da fila de
+retiro solta o último (e já devolveu os GARLIC), o pedaço volta a ser vista PROT_NONE do ralo e o físico
+volta ao sistema. Tudo ou nada; aceita ONION da arena e GARLIC mantido como lastro (sem entrada na fila);
+com algo ainda na fila sobre o pedaço, tenta no próximo dreno. Só no modo 2. ORBIS_LAZY_RECLAIM=0 desliga.
+
+Linha CENSO (a cada 64 MiB lastreados, a cada 64 MiB devolvidos e nas 3 primeiras "out of device VA"):
+VA vivo x estacionado, buracos e o maior, fila de retiro (mapas e GARLIC esperando), físico da janela,
+GARLIC vivo, devolvidos, label x última submissão.
+---
+ src/amd/common/ac_orbis_drm.c | 313 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 310 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index 01ea8eb..42ebe82 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -1251,6 +1251,30 @@ static uint64_t orbis_lazy_logged;
+ static uint64_t orbis_lazy_head;   /* a fatia privada arredondada a 2 MiB: o físico que nasce com a arena */
+ static simple_mtx_t orbis_lazy_lock = SIMPLE_MTX_INITIALIZER;
+ 
++/* ocarina-ps4 (frente V2, 2026-11-08): O PEDAÇO VAZIO DEVOLVE O FÍSICO (ORBIS_LAZY_RECLAIM, ligado por padrão no modo 2).
++ *
++ * Até aqui um pedaço lastreado ficava lastreado até o fim ("só cresce"), então o "com físico" era o pico do VA já
++ * tocado, não o uso: no o13 (Deku Tree) chegou a 1924 MiB de 1983. E o put_back do GARLIC_RELEASE realocava físico
++ * ONION por baixo de todo BO de VRAM que morria (379 MiB no mesmo lugar + 614 em outro, no o13), mesmo quando
++ * ninguém mais usaria aquele endereço.
++ *
++ * Agora cada pedaço conta os ranges de VA (vivos ou estacionados na fila de retiro) que o tocam. Quando a fila de
++ * retiro solta o último, o pedaço volta a ser vista do ralo (PROT_NONE) e o físico dele volta ao sistema; o próximo
++ * map que cair ali lastreia de novo, como na primeira vez. Contar VA, e não mapas, é o que fecha a corrida: um VA é
++ * alocado antes do map do BO e só some depois que a GPU passou da última submissão, então um pedaço com contador
++ * zero não tem BO, nem GARLIC pendente, nem acesso em voo. Tudo ou nada: se qualquer trecho do pedaço não é físico
++ * ONION da arena (GARLIC mantido como lastro, buraco, ralo), o pedaço fica como está. */
++static uint32_t *orbis_lazy_users;    /* por pedaço: ranges de VA que o tocam */
++static uint64_t  orbis_lazy_sink_phys; /* o ralo do modo 2; sink_bytes 0 = sem ralo, sem devolução */
++static uint64_t  orbis_lazy_sink_bytes;
++static uint64_t  orbis_lazy_sink_base; /* o VA da primeira vista do ralo */
++static uint64_t  orbis_lazy_reclaimed; /* bytes devolvidos ao ralo, total */
++static uint64_t  orbis_lazy_reclaim_logged;
++static unsigned  orbis_lazy_reclaim_aborts;
++static unsigned  orbis_lazy_reclaim_fails; /* sceKernelReleaseDirectMemory != 0 depois da vista do ralo */
++static bool      orbis_lazy_zero_seen; /* algum pedaço chegou a zero desde a última varredura */
++static bool      orbis_lazy_users_add(uint64_t base, uint64_t size, int delta);
++
+ static struct orbis_retire {
+    uint64_t addr;
+    uint64_t size;
+@@ -5259,6 +5283,15 @@ orbis_lazy_setup(uint64_t want, int type, void **va_out, off_t *phys_out)
+          mesa_logw("orbis-drm: ARENA_LAZY=2 - ralo de %" PRIu64 " MiB (phys 0x%llx) em %u vistas PROT_NONE cobrindo "
+                    "0x%" PRIx64 "..0x%" PRIx64,
+                    sink >> 20, (unsigned long long)sphys, views, base, at_va);
++         /* ocarina-ps4 (frente V2): com o ralo cobrindo a janela inteira, um pedaço vazio pode voltar a ele. */
++         if (at_va >= end) {
++            orbis_lazy_users = calloc(orbis_lazy_chunks, sizeof(*orbis_lazy_users));
++            if (orbis_lazy_users != NULL) {
++               orbis_lazy_sink_phys = (uint64_t)sphys;
++               orbis_lazy_sink_bytes = sink;
++               orbis_lazy_sink_base = base;
++            }
++         }
+       } else {
+          mesa_logw("orbis-drm: ARENA_LAZY=2: sem físico para o ralo (0x%08x) - janela só reservada, como o modo 1",
+                    (unsigned)err);
+@@ -5283,6 +5316,8 @@ orbis_lazy_is_backed(uint64_t addr)
+    return c >= orbis_lazy_chunks || orbis_lazy_backed[c] != 0;
+ }
+ 
++static void orbis_lazy_census(const char *why);
++
+ /* Dá físico (zerado, sem acesso) a cada pedaço de 2 MiB que [start, start + bytes) toca e que ainda é só reserva. O
+  * grant que vem logo depois abre o trecho do BO; o resto do pedaço fica PROT_NONE, como a janela antiga. */
+ static int
+@@ -5334,9 +5369,11 @@ orbis_lazy_back(uint64_t start, uint64_t bytes)
+    if (say)
+       orbis_lazy_logged = now;
+    simple_mtx_unlock(&orbis_lazy_lock);
+-   if (say)
++   if (say) {
+       mesa_logw("orbis-drm: ARENA_LAZY: %" PRIu64 " MiB da janela com físico (de %" PRIu64 " MiB reservados)",
+                 p_atomic_read(&orbis_lazy_bytes) >> 20, (orbis_va_end - orbis_va_base) >> 20);
++      orbis_lazy_census("a cada 64 MiB lastreados");
++   }
+    return ret;
+ }
+ 
+@@ -7860,6 +7897,233 @@ orbis_garlic_restore(struct orbis_bo *bo)
+    orbis_garlic_take(bo, &addr, &bytes, &phys, &under);
+    orbis_garlic_put_back(addr, bytes, phys, under);
+ }
++
++/* ---------------------------------------------------------------- ORBIS_LAZY_RECLAIM e o censo (frente V2) */
++
++static bool
++orbis_lazy_reclaim_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *const s = getenv("ORBIS_LAZY_RECLAIM");
++      on = (s != NULL && s[0] == '0') ? 0 : 1;
++      if (orbis_arena_lazy)
++         mesa_logw("orbis-drm: LAZY_RECLAIM=%d - %s", on,
++                   on == 0                      ? "desligado: pedaço lastreado fica lastreado até o fim (o comportamento antigo)"
++                   : orbis_lazy_sink_bytes == 0 ? "sem ralo cobrindo a janela (só o modo 2 tem), então nada volta"
++                                                : "um pedaço sem VA vivo nem estacionado volta ao ralo e devolve o físico");
++   }
++   return on == 1 && orbis_lazy_sink_bytes != 0 && orbis_lazy_users != NULL;
++}
++
++/* Um pedaço com contador zero volta a ser vista do ralo. Com orbis_lazy_lock. Tudo ou nada: primeiro lê do kernel
++ * o que está mapeado em cada trecho; só se tudo for físico direto do tipo da arena (e nada do ralo) é que a vista do
++ * ralo entra (MAP_FIXED, o mapa antigo some) e os físicos lidos voltam ao sistema. */
++static bool
++orbis_lazy_reclaim_chunk(uint64_t c)
++{
++   const uint64_t va0 = orbis_arena_map_base + c * ORBIS_LAZY_CHUNK, va1 = va0 + ORBIS_LAZY_CHUNK;
++   struct {
++      uint64_t phys, len;
++   } seg[ORBIS_LAZY_CHUNK / 16384];
++   unsigned    n = 0;
++   const char *why = NULL;
++   struct orbis_vq q;
++   memset(&q, 0, sizeof(q));
++
++   /* Algo ainda na fila de retiro sobre este pedaço (um mapa, ou um GARLIC esperando o put_back): não é a hora. É
++    * transitório, então o próximo dreno tenta de novo. Sem nada na fila, um GARLIC que esteja aqui é um GARLIC
++    * mantido como lastro (o put_back não achou físico ONION, o que acontece justamente com a memória no fim): sem
++    * VA, sem BO e sem entrada na fila ele não tem dono, e volta ao sistema como o resto. */
++   simple_mtx_lock(&orbis_retire_lock);
++   for (unsigned i = 0; i < orbis_retire_count; ++i) {
++      const struct orbis_retire *const r = &orbis_retire_q[(orbis_retire_head + i) % ORBIS_RETIRE_MAX];
++      if ((r->size != 0 && r->addr < va1 && va0 < r->addr + r->size) ||
++          (r->garlic_bytes != 0 && r->garlic_addr < va1 && va0 < r->garlic_addr + r->garlic_bytes)) {
++         why = "a fila de retiro ainda tem algo aqui";
++         break;
++      }
++   }
++   simple_mtx_unlock(&orbis_retire_lock);
++   if (why != NULL) {
++      orbis_lazy_zero_seen = true; /* tenta de novo no próximo dreno */
++      return false;
++   }
++
++   for (uint64_t at = va0; at < va1;) {
++      if (!orbis_vq_at(at, &q) || !(q.flags & 2) || q.end <= at) {
++         why = "não é memória direta mapeada";
++         break;
++      }
++      if (q.type != orbis_arena_type && q.type != ORBIS_KERNEL_WC_GARLIC) {
++         why = "o tipo não é o da arena nem GARLIC";
++         break;
++      }
++      const uint64_t piece_end = q.end < va1 ? q.end : va1;
++      const uint64_t phys = q.off + (at - q.start);
++      const uint64_t len = piece_end - at;
++      if (phys < orbis_lazy_sink_phys + orbis_lazy_sink_bytes && orbis_lazy_sink_phys < phys + len) {
++         why = "já está sobre o ralo";
++         break;
++      }
++      if (n > 0 && seg[n - 1].phys + seg[n - 1].len == phys) {
++         seg[n - 1].len += len;
++      } else {
++         if (n == ARRAY_SIZE(seg)) {
++            why = "trechos demais";
++            break;
++         }
++         seg[n].phys = phys;
++         seg[n].len = len;
++         n++;
++      }
++      at = piece_end;
++   }
++   if (why == NULL) {
++      void          *v = (void *)(uintptr_t)va0;
++      const uint64_t soff = (va0 - orbis_lazy_sink_base) % orbis_lazy_sink_bytes;
++      const int32_t  err = sceKernelMapDirectMemory(&v, ORBIS_LAZY_CHUNK, ORBIS_GRAPHICS_PROT, ORBIS_MAP_FIXED,
++                                                    (off_t)(orbis_lazy_sink_phys + soff), ORBIS_DIRECT_ALIGN);
++      if (err != 0 || v != (void *)(uintptr_t)va0) {
++         mesa_loge("orbis-drm: LAZY_RECLAIM: a vista do ralo em 0x%" PRIx64 " -> 0x%08x (foi para %p) - a "
++                   "devolução fica DESLIGADA no resto da execução",
++                   va0, (unsigned)err, v);
++         orbis_lazy_sink_bytes = 0; /* desliga: não sei mais o que está em va0 */
++         return false;
++      }
++   }
++   if (why != NULL) {
++      orbis_lazy_reclaim_aborts++;
++      static unsigned said;
++      if (orbis_budget(&said, 4))
++         mesa_logw("orbis-drm: LAZY_RECLAIM: o pedaço %" PRIu64 " (0x%" PRIx64 ") fica lastreado: %s (último mapa "
++                   "lido: start 0x%" PRIx64 " end 0x%" PRIx64 " off 0x%" PRIx64 " tipo %d flags 0x%x; arena tipo %d)",
++                   c, va0, why, q.start, q.end, (uint64_t)q.off, q.type, (unsigned)q.flags, (int)orbis_arena_type);
++      return false;
++   }
++   sceKernelMprotect((void *)(uintptr_t)va0, ORBIS_LAZY_CHUNK, ORBIS_PROT_NONE);
++   for (unsigned i = 0; i < n; ++i) {
++      const int32_t err = sceKernelReleaseDirectMemory((off_t)seg[i].phys, seg[i].len);
++      if (err != 0) {
++         orbis_lazy_reclaim_fails++;
++         static unsigned said;
++         if (orbis_budget(&said, 4))
++            mesa_logw("orbis-drm: LAZY_RECLAIM: sceKernelReleaseDirectMemory(0x%" PRIx64 ", %" PRIu64
++                      " KiB) -> 0x%08x - esse físico fica perdido até o fim",
++                      seg[i].phys, seg[i].len / 1024, (unsigned)err);
++      }
++   }
++   orbis_lazy_backed[c] = 0;
++   orbis_lazy_bytes -= ORBIS_LAZY_CHUNK;
++   orbis_lazy_reclaimed += ORBIS_LAZY_CHUNK;
++   {
++      static bool proved;
++      if (!proved) {
++         proved = true;
++         const bool m = orbis_vq_at(va0, &q) && (q.flags & 2);
++         mesa_logw("orbis-drm: LAZY_RECLAIM prova: pedaço %" PRIu64 " (0x%" PRIx64 ") devolveu %u trecho(s) físico(s); "
++                   "o kernel diz %s off 0x%" PRIx64 " (ralo esperado 0x%" PRIx64 "..0x%" PRIx64 ")",
++                   c, va0, n, m ? "mapeado" : "SEM MAPA", m ? (uint64_t)(q.off + (va0 - q.start)) : 0,
++                   orbis_lazy_sink_phys, orbis_lazy_sink_phys + orbis_lazy_sink_bytes);
++      }
++   }
++   return true;
++}
++
++/* Varre os pedaços fora da fatia privada: lastreado e sem nenhum VA -> volta ao ralo. Chamado do fim do
++ * orbis_retire_ranges, depois que a fila soltou os VAs E devolveu os GARLIC deles (nessa ordem, no mesmo dreno). */
++static void
++orbis_lazy_reclaim_scan(void)
++{
++   if (!orbis_arena_lazy || !orbis_lazy_reclaim_on())
++      return;
++   uint64_t got = 0;
++   bool     say = false;
++   simple_mtx_lock(&orbis_lazy_lock);
++   if (!orbis_lazy_zero_seen) {
++      simple_mtx_unlock(&orbis_lazy_lock);
++      return;
++   }
++   orbis_lazy_zero_seen = false;
++   for (uint64_t c = orbis_lazy_head / ORBIS_LAZY_CHUNK; c < orbis_lazy_chunks && orbis_lazy_sink_bytes != 0; ++c) {
++      if (!orbis_lazy_backed[c] || p_atomic_read(&orbis_lazy_users[c]) != 0)
++         continue;
++      if (orbis_lazy_reclaim_chunk(c))
++         got += ORBIS_LAZY_CHUNK;
++   }
++   /* O aviso de 64 MiB lastreados volta a valer quando o físico desce. */
++   if ((orbis_lazy_bytes >> 26) < orbis_lazy_logged)
++      orbis_lazy_logged = orbis_lazy_bytes >> 26;
++   if (got != 0 && (orbis_lazy_reclaimed >> 26) > orbis_lazy_reclaim_logged) {
++      orbis_lazy_reclaim_logged = orbis_lazy_reclaimed >> 26;
++      say = true;
++   }
++   simple_mtx_unlock(&orbis_lazy_lock);
++   if (say)
++      orbis_lazy_census("devolução ao ralo");
++}
++
++/* Uma linha só com o que separa o VA e o físico da arena do que o VMA diz ter. */
++static void
++orbis_lazy_census(const char *why)
++{
++   if (!orbis_arena_lazy)
++      return;
++   uint64_t live = 0, retired = 0, holes = 0, biggest = 0;
++   unsigned n_live = 0, n_retired = 0, n_holes = 0;
++
++   simple_mtx_lock(&orbis_va_lock);
++   uint64_t at = orbis_va_base;
++   for (const struct amdgpu_va *va = orbis_va_list; va != NULL; va = va->next) {
++      if (va->base >= orbis_va_end)
++         break;
++      if (va->base > at) {
++         const uint64_t gap = va->base - at;
++         holes += gap;
++         n_holes++;
++         if (gap > biggest)
++            biggest = gap;
++      }
++      if (va->retired) {
++         retired += va->size;
++         n_retired++;
++      } else {
++         live += va->size;
++         n_live++;
++      }
++      if (va->base + va->size > at)
++         at = va->base + va->size;
++   }
++   if (orbis_va_end > at) {
++      const uint64_t gap = orbis_va_end - at;
++      holes += gap;
++      n_holes++;
++      if (gap > biggest)
++         biggest = gap;
++   }
++   simple_mtx_unlock(&orbis_va_lock);
++
++   uint64_t q_range = 0, q_garlic = 0;
++   unsigned q_n = 0;
++   simple_mtx_lock(&orbis_retire_lock);
++   for (unsigned i = 0; i < orbis_retire_count; ++i) {
++      const struct orbis_retire *const r = &orbis_retire_q[(orbis_retire_head + i) % ORBIS_RETIRE_MAX];
++      q_range += r->size;
++      q_garlic += r->garlic_bytes;
++      q_n++;
++   }
++   simple_mtx_unlock(&orbis_retire_lock);
++
++   mesa_logw("orbis-drm: CENSO (%s): VA vivo %" PRIu64 " MiB em %u ranges, estacionado (retirado, GPU ainda não "
++             "passou) %" PRIu64 " MiB em %u; livre %" PRIu64 " MiB em %u buracos, o maior %" PRIu64 " MiB; fila de "
++             "retiro %u entradas, %" PRIu64 " MiB de mapas e %" PRIu64 " MiB de GARLIC esperando; físico da janela "
++             "%" PRIu64 " MiB (dos quais %" PRIu64 " MiB trocados por GARLIC vivo); devolvidos ao ralo %" PRIu64
++             " MiB no total (abortos %u, falhas %u); label %u, última submissão %" PRIu64,
++             why, live >> 20, n_live, retired >> 20, n_retired, holes >> 20, n_holes, biggest >> 20, q_n,
++             q_range >> 20, q_garlic >> 20, p_atomic_read(&orbis_lazy_bytes) >> 20,
++             p_atomic_read(&orbis_gr_live) >> 20, orbis_lazy_reclaimed >> 20, orbis_lazy_reclaim_aborts,
++             orbis_lazy_reclaim_fails, *orbis_fence_label, orbis_submit_seq_no);
++}
+ #endif
+ 
+ /* ⚠ ARE THIS CONSOLE'S DIRECT-MEMORY CALLS SAFE TO MAKE CONCURRENTLY? Nobody has ever asked, and
+@@ -8143,6 +8407,7 @@ orbis_retire_ranges(void)
+       struct amdgpu_va *const va = *link;
+       if (va->retired) { /* the GPU has caught up with everything, checked above */
+          *link = va->next;
++         orbis_lazy_users_add(va->base, va->size, -1); /* frente V2 */
+          free(va);
+          continue;
+       }
+@@ -8201,6 +8466,10 @@ orbis_retire_ranges(void)
+    if (run_end != 0)
+       orbis_protect_now(run_addr, run_end - run_addr);
+    simple_mtx_unlock(&orbis_retire_lock);
++
++   /* frente V2: os VAs soltos acima e os GARLIC deles já voltaram; pedaço sem ninguém volta ao ralo. Fora dos dois
++    * locks acima (a ordem deles não inclui o orbis_lazy_lock). */
++   orbis_lazy_reclaim_scan();
+ #endif
+ }
+ 
+@@ -8956,6 +9225,31 @@ ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_
+  * side has nothing else to reach through, which is worth knowing before writing the allocator rather than
+  * after. */
+ 
++/* ocarina-ps4 (frente V2): conta um range de VA nos pedaços de 2 MiB que ele toca (delta +1 na alocação, -1 quando
++ * ele sai da lista de verdade). true se algum pedaço chegou a zero: o fim do dreno da fila de retiro então procura
++ * pedaços lastreados sem ninguém (ORBIS_LAZY_RECLAIM). */
++static bool
++orbis_lazy_users_add(uint64_t base, uint64_t size, int delta)
++{
++#if !defined(__PS4__)
++   (void)base, (void)size, (void)delta;
++   return false; /* o modo preguiçoso só existe no console */
++#else
++   if (!orbis_arena_lazy || orbis_lazy_users == NULL || size == 0 || base < orbis_arena_map_base)
++      return false;
++   const uint64_t first = (base - orbis_arena_map_base) / ORBIS_LAZY_CHUNK;
++   const uint64_t last = (base + size - 1 - orbis_arena_map_base) / ORBIS_LAZY_CHUNK;
++   bool zero = false;
++   for (uint64_t c = first; c <= last && c < orbis_lazy_chunks; ++c) {
++      if (p_atomic_add_return(&orbis_lazy_users[c], delta) == 0)
++         zero = true;
++   }
++   if (zero)
++      orbis_lazy_zero_seen = true;
++   return zero;
++#endif
++}
++
+ static uint64_t
+ orbis_align_up(uint64_t v, uint64_t a)
+ {
+@@ -9078,6 +9372,14 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
+                 no_reuse ? " - with ORBIS_VA_NO_REUSE set, so this is the window being consumed rather than "
+                            "fragmented, and everything measured before this line still stands"
+                          : "");
++#if defined(__PS4__)
++      {
++         /* frente V2: o retrato de VA e físico no momento em que a janela não coube. */
++         static unsigned said_census;
++         if (orbis_budget(&said_census, 3))
++            orbis_lazy_census("out of device VA");
++      }
++#endif
+       return -ENOMEM;
+    }
+ 
+@@ -9131,6 +9433,7 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
+    va->base = candidate;
+    va->next = *link;
+    *link = va;
++   orbis_lazy_users_add(va->base, va->size, +1); /* frente V2: antes de o BO poder ser mapeado */
+    simple_mtx_unlock(&orbis_va_lock);
+ 
+    *va_base_allocated = va->base;
+@@ -9256,8 +9559,10 @@ ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
+                struct amdgpu_va **plink = &orbis_va_list;
+                while (*plink && *plink != old)
+                   plink = &(*plink)->next;
+-               if (*plink != NULL)
++               if (*plink != NULL) {
+                   *plink = old->next;
++                  orbis_lazy_users_add(old->base, old->size, -1); /* frente V2 */
++               }
+                simple_mtx_unlock(&orbis_va_lock);
+                free(old);
+                simple_mtx_lock(&orbis_va_lock);
+@@ -9282,8 +9587,10 @@ ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
+       link = &(*link)->next;
+ 
+    const bool found = *link != NULL;
+-   if (found)
++   if (found) {
+       *link = va_range_handle->next;
++      orbis_lazy_users_add(va_range_handle->base, va_range_handle->size, -1); /* frente V2 */
++   }
+    simple_mtx_unlock(&orbis_va_lock);
+ 
+    if (!found) {
+-- 
+2.53.0
+

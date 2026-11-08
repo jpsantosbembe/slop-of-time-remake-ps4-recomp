@@ -1,0 +1,275 @@
+From 25cb6d45ba17fe203ebea5f50c615ede15b6f2c4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 01:22:43 -0300
+Subject: [PATCH 05/13] =?UTF-8?q?ocarina-ps4:=20arena=20pregui=C3=A7osa=20?=
+ =?UTF-8?q?(ORBIS=5FARENA=5FLAZY=3D1,=20desligada=20por=20padr=C3=A3o)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A arena de 1 GiB nascia alocada e mapeada inteira; o VMA usa ~550 MiB e a cauda
+nunca tocada ficava como memória direta parada (um mapa PROT_NONE de ~619 MiB
+no inventário). Com ORBIS_ARENA_LAZY=1 a arena vira uma reserva de endereço
+(sceKernelReserveVirtualRange) com físico só na fatia privada; cada pedaço de
+2 MiB da janela ganha físico (zerado, PROT_NONE) no primeiro map de BO que o
+toca, mapeado MAP_FIXED dentro da reserva - o padrão que o runtime já usa nas
+pilhas e na memória do jogo. Só cresce. O tamanho da janela e dos heaps não
+muda. Força o caminho por consulta do ORBIS_GARLIC_RELEASE, porque fora da
+fatia privada não há aritmética de arena.
+---
+ src/amd/common/ac_orbis_drm.c | 183 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 180 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index e11807e..5884b00 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -1229,6 +1229,24 @@ static unsigned orbis_gr_fail;      /* sceKernelReleaseDirectMemory != 0 */
+ /* Tipo da arena (ORBIS_ARENA_BUS), o mesmo que a realocação no put_back pede. */
+ static int32_t orbis_arena_type;
+ 
++/* ocarina-ps4 (frente V): ARENA PREGUIÇOSA (ORBIS_ARENA_LAZY=1, desligada por padrão).
++ *
++ * A arena de 1 GiB era alocada e mapeada inteira no setup (sceKernelMapDirectMemory compromete tudo), e o VMA usa
++ * ~543 MiB dela; no console a cauda nunca tocada aparecia como um mapa PROT_NONE de ~619 MiB, memória direta parada.
++ * Com ORBIS_ARENA_LAZY=1 a arena vira só uma reserva de endereço (sceKernelReserveVirtualRange); o físico existe para
++ * a fatia privada e, depois, para cada pedaço de 2 MiB da janela no primeiro map de BO que o toca (alocado e mapeado
++ * MAP_FIXED dentro da reserva - o mesmo padrão provado pelo runtime para as pilhas e para a memória do jogo). Só
++ * cresce: um pedaço lastreado fica até o fim, como antes. O tamanho da janela (e dos heaps) continua o da escada.
++ * Exige o caminho por consulta do ORBIS_GARLIC_RELEASE (a aritmética da arena deixa de valer fora da fatia privada). */
++#define ORBIS_LAZY_CHUNK ORBIS_DIRECT_ALIGN
++static bool     orbis_arena_lazy;
++static uint8_t *orbis_lazy_backed; /* um byte por pedaço de 2 MiB, a partir de orbis_arena_map_base */
++static uint64_t orbis_lazy_chunks;
++static uint64_t orbis_lazy_bytes;  /* físico lastreado na janela, além da fatia privada */
++static uint64_t orbis_lazy_logged;
++static uint64_t orbis_lazy_head;   /* a fatia privada arredondada a 2 MiB: o físico que nasce com a arena */
++static simple_mtx_t orbis_lazy_lock = SIMPLE_MTX_INITIALIZER;
++
+ static struct orbis_retire {
+    uint64_t addr;
+    uint64_t size;
+@@ -5127,6 +5145,134 @@ static int orbis_arena_state; /* 0 = untouched, 1 = up, -1 = tried and failed */
+ 
+ static int orbis_arena_setup_once(void);
+ 
++/* ---------------------------------------------------------------- ORBIS_ARENA_LAZY (frente V) */
++#ifndef ORBIS_MAP_FIXED
++#define ORBIS_MAP_FIXED 0x0010
++#endif
++
++static bool
++orbis_arena_lazy_wanted(void)
++{
++   const char *const s = getenv("ORBIS_ARENA_LAZY");
++   if (s == NULL || s[0] != '1')
++      return false;
++   if (getenv("ORBIS_FLAT_ARENA") != NULL) {
++      mesa_logw("orbis-drm: ORBIS_ARENA_LAZY=1 ignorado: ORBIS_FLAT_ARENA pede a arena inteira mapeada");
++      return false;
++   }
++   return true;
++}
++
++/* Reserva want bytes de endereço e lastreia só a fatia privada (arredondada a 2 MiB). 0 = ok. */
++static int
++orbis_lazy_setup(uint64_t want, int type, void **va_out, off_t *phys_out)
++{
++   const uint64_t head = (ORBIS_ARENA_PRIVATE + ORBIS_LAZY_CHUNK - 1) / ORBIS_LAZY_CHUNK * ORBIS_LAZY_CHUNK;
++   if (want <= head) {
++      mesa_logw("orbis-drm: ARENA_LAZY: arena de %" PRIu64 " MiB não cabe a fatia privada - sem modo preguiçoso",
++                want >> 20);
++      return -1;
++   }
++   void   *rva = NULL;
++   int32_t err = sceKernelReserveVirtualRange(&rva, want, 0, ORBIS_DIRECT_ALIGN);
++   if (err != 0 || rva == NULL) {
++      mesa_logw("orbis-drm: ARENA_LAZY: sceKernelReserveVirtualRange(%" PRIu64 " MiB) -> 0x%08x - arena comum",
++                want >> 20, (unsigned)err);
++      return -1;
++   }
++   off_t phys = 0;
++   err = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), head, ORBIS_DIRECT_ALIGN, type, &phys);
++   if (err != 0) {
++      mesa_logw("orbis-drm: ARENA_LAZY: sem físico para a fatia privada (0x%08x) - arena comum", (unsigned)err);
++      sceKernelMunmap(rva, want);
++      return -1;
++   }
++   void *at = rva;
++   err = sceKernelMapDirectMemory(&at, head, ORBIS_GRAPHICS_PROT, ORBIS_MAP_FIXED, phys, ORBIS_DIRECT_ALIGN);
++   if (err != 0 || at != rva) {
++      mesa_logw("orbis-drm: ARENA_LAZY: mapear a fatia privada em %p dentro da reserva -> 0x%08x (foi para %p) - "
++                "arena comum",
++                rva, (unsigned)err, at);
++      sceKernelReleaseDirectMemory(phys, head);
++      sceKernelMunmap(rva, want);
++      return -1;
++   }
++   orbis_lazy_chunks = want / ORBIS_LAZY_CHUNK;
++   orbis_lazy_backed = calloc(orbis_lazy_chunks, 1);
++   if (orbis_lazy_backed == NULL) {
++      sceKernelMunmap(rva, want);
++      sceKernelReleaseDirectMemory(phys, head);
++      return -1;
++   }
++   memset(orbis_lazy_backed, 1, head / ORBIS_LAZY_CHUNK);
++   orbis_lazy_head = head;
++   orbis_arena_lazy = true;
++   *va_out = rva;
++   *phys_out = phys;
++   mesa_logw("orbis-drm: ARENA_LAZY=1 - %" PRIu64 " MiB de endereço reservados em %p; físico só nos %" PRIu64
++             " MiB da fatia privada (phys 0x%llx); a janela ganha físico em pedaços de 2 MiB no primeiro map",
++             want >> 20, rva, head >> 20, (unsigned long long)phys);
++   return 0;
++}
++
++/* O pedaço de 2 MiB que contém addr já tem físico? Fora da arena, ou sem modo preguiçoso: sim. */
++static bool
++orbis_lazy_is_backed(uint64_t addr)
++{
++   if (!orbis_arena_lazy || addr < orbis_arena_map_base)
++      return true;
++   const uint64_t c = (addr - orbis_arena_map_base) / ORBIS_LAZY_CHUNK;
++   return c >= orbis_lazy_chunks || orbis_lazy_backed[c] != 0;
++}
++
++/* Dá físico (zerado, sem acesso) a cada pedaço de 2 MiB que [start, start + bytes) toca e que ainda é só reserva. O
++ * grant que vem logo depois abre o trecho do BO; o resto do pedaço fica PROT_NONE, como a janela antiga. */
++static int
++orbis_lazy_back(uint64_t start, uint64_t bytes)
++{
++   const uint64_t first = (start - orbis_arena_map_base) / ORBIS_LAZY_CHUNK;
++   const uint64_t last = (start + bytes - 1 - orbis_arena_map_base) / ORBIS_LAZY_CHUNK;
++   int ret = 0;
++
++   simple_mtx_lock(&orbis_lazy_lock);
++   for (uint64_t c = first; c <= last && c < orbis_lazy_chunks; ++c) {
++      if (orbis_lazy_backed[c])
++         continue;
++      off_t   ph = 0;
++      int32_t err = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), ORBIS_LAZY_CHUNK,
++                                                  ORBIS_LAZY_CHUNK, orbis_arena_type, &ph);
++      if (err != 0) {
++         mesa_loge("orbis-drm: ARENA_LAZY: sem memória direta para o pedaço 0x%" PRIx64 " (0x%08x) - o map falha",
++                   (uint64_t)(orbis_arena_map_base + c * ORBIS_LAZY_CHUNK), (unsigned)err);
++         ret = -ENOMEM;
++         break;
++      }
++      void *const want = (void *)(uintptr_t)(orbis_arena_map_base + c * ORBIS_LAZY_CHUNK);
++      void       *at = want;
++      err = sceKernelMapDirectMemory(&at, ORBIS_LAZY_CHUNK, ORBIS_GRAPHICS_PROT, ORBIS_MAP_FIXED, ph, ORBIS_LAZY_CHUNK);
++      if (err != 0 || at != want) {
++         mesa_loge("orbis-drm: ARENA_LAZY: mapear o pedaço em %p -> 0x%08x (foi para %p) - o map falha", want,
++                   (unsigned)err, at);
++         sceKernelReleaseDirectMemory(ph, ORBIS_LAZY_CHUNK);
++         ret = -ENOMEM;
++         break;
++      }
++      memset(at, 0, ORBIS_LAZY_CHUNK);
++      sceKernelMprotect(at, ORBIS_LAZY_CHUNK, ORBIS_PROT_NONE);
++      orbis_lazy_backed[c] = 1;
++      orbis_lazy_bytes += ORBIS_LAZY_CHUNK;
++   }
++   const uint64_t now = orbis_lazy_bytes >> 26; /* 64 MiB */
++   const bool say = now > orbis_lazy_logged;
++   if (say)
++      orbis_lazy_logged = now;
++   simple_mtx_unlock(&orbis_lazy_lock);
++   if (say)
++      mesa_logw("orbis-drm: ARENA_LAZY: %" PRIu64 " MiB da janela com físico (de %" PRIu64 " MiB reservados)",
++                p_atomic_read(&orbis_lazy_bytes) >> 20, (orbis_va_end - orbis_va_base) >> 20);
++   return ret;
++}
++
+ static int
+ orbis_arena_setup(void)
+ {
+@@ -5220,6 +5366,13 @@ orbis_arena_setup_once(void)
+                        : !strcmp(bus, "wb-garlic")      ? ORBIS_KERNEL_WB_GARLIC
+                                                         : ORBIS_KERNEL_WB_ONION;
+ 
++      /* ocarina-ps4 (frente V): ORBIS_ARENA_LAZY=1 - reserva o endereço e lastreia só a fatia privada. */
++      if (i == 0 && orbis_arena_lazy_wanted() && orbis_lazy_setup(want, type, &va, &phys) == 0) {
++         arena = want;
++         orbis_arena_type = type;
++         break;
++      }
++
+       int32_t err = sceKernelAllocateDirectMemory(0, direct_total, want, ORBIS_DIRECT_ALIGN, type, &phys);
+       if (type != ORBIS_KERNEL_WB_ONION && err == 0)
+          mesa_logw("orbis-drm: ORBIS_ARENA_BUS=%s - the arena is on the GARLIC bus (type 0x%x). The GPU "
+@@ -5483,8 +5636,10 @@ orbis_arena_setup_once(void)
+     * Deliberately at the BASE and at the LAST page: a partially-committed mapping - which is a real
+     * possibility on a platform where mmap populates eagerly - passes at one end and fails at the other. */
+    volatile uint32_t *probe_lo = (volatile uint32_t *)(uintptr_t)orbis_va_base;
++   /* ocarina-ps4 (frente V): com ORBIS_ARENA_LAZY só a fatia privada tem físico; o teste alto fica nela. */
+    volatile uint32_t *probe_hi =
+-      (volatile uint32_t *)(uintptr_t)(orbis_va_end - orbis_page_size());
++      (volatile uint32_t *)(uintptr_t)(orbis_arena_lazy ? orbis_arena_map_base + orbis_lazy_head - orbis_page_size()
++                                                        : orbis_va_end - orbis_page_size());
+    mesa_logi("orbis-drm: arena self-test: writing 0x%" PRIx64 " and 0x%" PRIx64,
+              (uint64_t)(uintptr_t)probe_lo, (uint64_t)(uintptr_t)probe_hi);
+    *probe_lo = 0xA5A50001u;
+@@ -5548,6 +5703,22 @@ orbis_arena_setup_once(void)
+     * So: keep one mapping, and take the ACCESS away instead. sceKernelMprotect with no access gives what amdgpu
+     * gives - a stale read or write faults at the instruction that makes it - while the addresses stay ours and
+     * nothing else can move in. It is also far cheaper than map/unmap churn: no kernel object comes or goes. */
++   if (orbis_arena_lazy) {
++      /* O resto da janela é só reserva: nada para proteger, e um acesso lá já falta. Protege o pedaço da janela que
++       * divide os 2 MiB com a fatia privada. */
++      const uint64_t backed_end = orbis_arena_map_base + orbis_lazy_head;
++      const int32_t  err = sceKernelMprotect((void *)(uintptr_t)orbis_va_base, (size_t)(backed_end - orbis_va_base),
++                                             ORBIS_PROT_NONE);
++      if (err != 0) {
++         mesa_loge("orbis-drm: ARENA_LAZY: proteger 0x%" PRIx64 "..0x%" PRIx64 " falhou: 0x%08x", orbis_va_base,
++                   backed_end, (unsigned)err);
++      }
++      orbis_arena_unmapped = true;
++      mesa_logw("orbis-drm: ARENA_LAZY - janela 0x%" PRIx64 "..0x%" PRIx64 " (%" PRIu64 " MiB) é só reserva; "
++                "físico em pedaços de 2 MiB no primeiro map",
++                orbis_va_base, orbis_va_end, (orbis_va_end - orbis_va_base) >> 20);
++      return 0;
++   }
+    {
+       const uint64_t win = orbis_va_end - orbis_va_base;
+       const int32_t  err = sceKernelMprotect((void *)(uintptr_t)orbis_va_base, (size_t)win, ORBIS_PROT_NONE);
+@@ -7204,6 +7375,8 @@ static bool orbis_gr_broken; /* a prova da primeira devolução falhou: consulta
+ static bool
+ orbis_garlic_release_on(void)
+ {
++   if (orbis_arena_lazy)
++      return true; /* a arena preguiçosa não tem aritmética: só o caminho por consulta restaura certo */
+    static int on = -1;
+    if (on < 0) {
+       const char *const s = getenv("ORBIS_GARLIC_RELEASE");
+@@ -7310,14 +7483,14 @@ orbis_gr_prove(const struct orbis_under *u, unsigned i, uint64_t start, off_t gp
+    bool ok = true;
+    char before[128] = "n/a", after[128] = "n/a", mid[128];
+ 
+-   if (va >= orbis_arena_map_base + page) {
++   if (va >= orbis_arena_map_base + page && orbis_lazy_is_backed(va - page)) {
+       const uint64_t a = va - page;
+       const bool m = orbis_vq_at(a, &q) && (q.flags & 2);
+       ok = ok && m;
+       snprintf(before, sizeof(before), "%s off 0x%" PRIx64, m ? "mapeado" : "SEM MAPA",
+                m ? (uint64_t)(q.off + (a - q.start)) : 0);
+    }
+-   if (va + len < orbis_va_end) {
++   if (va + len < orbis_va_end && orbis_lazy_is_backed(va + len)) {
+       const uint64_t a = va + len;
+       const bool m = orbis_vq_at(a, &q) && (q.flags & 2);
+       ok = ok && m;
+@@ -7783,6 +7956,10 @@ orbis_backing_map_locked(struct orbis_bo *bo, uint64_t bo_offset, uint64_t size,
+          orbis_garlic_put_back(g_addr, g_bytes, (off_t)g_phys, g_under);
+       }
+ 
++      /* ocarina-ps4 (frente V): ORBIS_ARENA_LAZY - os pedaços de 2 MiB que o trecho toca ganham físico agora. */
++      if (orbis_arena_lazy && orbis_lazy_back(start, bytes) != 0)
++         return -ENOMEM;
++
+       const int32_t err = sceKernelMprotect((const void *)(uintptr_t)start, (size_t)bytes, ORBIS_GRAPHICS_PROT);
+       if (err != 0) {
+          mesa_loge("orbis-drm: granting access to 0x%" PRIx64 "..0x%" PRIx64 " failed: 0x%08x", start, start + bytes,
+-- 
+2.53.0
+

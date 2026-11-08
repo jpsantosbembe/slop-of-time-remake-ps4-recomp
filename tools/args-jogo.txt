@@ -1,0 +1,20 @@
+# <pasta de dados>/args.txt (/data/slop/<title id>/args.txt): modo jogo (OoT). NOME=valor vira variável de ambiente; o resto vira argumento.
+# Para voltar à sonda, troque estas linhas por: --probe-orbis
+# Sem preempção assíncrona (plat_intr_* é stub no PS4), como no jogar_linux.sh
+TOTK_ASYNC_PREEMPT=0
+# Os mesmos compute shaders pulados no Linux (travam o jogo)
+DKB_SKIP_CS=3bdfe449de832903,909139c13b510f1f,753f8ab880fe7923,c968ad44272dcbb4,785a41d2df6dc095,db8c39bdb420e068,dec1feb3c7fa967a,09931d0c57c6b67f,13cab66ee383c4f4,3f6f2b1d671badcd
+# Memória total que o runtime informa ao jogo (GetInfo 6, TotalMemorySize); o jogo calcula o heap a partir dela.
+# Padrão do runtime: 9 GiB (Switch 2), que dá um heap de 6,2 GiB. Com 8 GiB (0x200000000) um heap interno do jogo não
+# nasceu (ponteiro de heap nulo em main+0xd122a0, 2026-11-07); com o commit preguiçoso os 9 GiB só custam o que o jogo
+# toca, então fica o padrão.
+#TOTK_APP_POOL=0x200000000
+# Dieta de memória (2026-11-07): sem os blocos de VRAM alocados por antecipação (~340 MiB no PS4)
+TOTK_VRAM_HEADROOM=0
+# Sem pré-compilar no boot as bibliotecas de pipeline (3979 compute + variantes): no PS4 cada pipeline fica na memória,
+# e o compilador do Mesa ficou sem malloc. Compilam quando o jogo pede.
+TOTK_LIB_PREBUILD=0
+# Desenvolvimento: FPS no canto superior direito (fps | full | off)
+TOTK_PERF_OVERLAY=fps
+# Alinhamento de SSBO 16 (o cache é gerado com sbuf=16): no 4 da AMD, leituras de 64/128 bits pegam a palavra errada
+TOTK_VK_SSBO_ALIGN=16

@@ -1,0 +1,13 @@
+# Saídas locais: logs do console, resultados e arte extraída da cópia do jogo (nunca no repositório: é da Nintendo)
+out/
+# Qualquer coisa derivada do jogo, se aparecer fora de out/
+*.pkg
+*.nup
+*.pack
+romfs*/
+exefs*/
+# Cópia de trabalho da frente G, já aplicada em loader/ e tools/
+frente-G-pronto/
+# Cache do Python
+__pycache__/
+*.pyc

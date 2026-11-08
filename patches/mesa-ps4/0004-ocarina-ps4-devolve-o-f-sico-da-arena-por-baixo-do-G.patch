@@ -1,0 +1,582 @@
+From 55d44ea79dd5ea2cbc7861fddb877ea52a9a6ba2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Bembe?= <jpbembe@gmail.com>
+Date: Sun, 8 Nov 2026 01:10:29 -0300
+Subject: [PATCH 04/13] =?UTF-8?q?ocarina-ps4:=20devolve=20o=20f=C3=ADsico?=
+ =?UTF-8?q?=20da=20arena=20por=20baixo=20do=20GARLIC=20(ORBIS=5FGARLIC=5FR?=
+ =?UTF-8?q?ELEASE)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+O orbis_garlic_back mapeava memória GARLIC nova por cima do VA da arena e as
+páginas físicas da arena ficavam alocadas sem mapa: memória em dobro (322 a
+507 MiB "sem dono" no inventário do runtime, igual ao total GARLIC).
+
+Agora o garlic_back pergunta ao kernel (sceKernelVirtualQuery) qual físico
+está mapeado em cada pedaço do trecho antes do map FIXED e, depois dele,
+devolve esses pedaços (sceKernelReleaseDirectMemory). Nunca pela aritmética
+arena_phys + off. No put_back cada pedaço tenta o mesmo físico
+(searchStart/searchEnd = o pedaço); se outro dono o pegou, aloca o mesmo
+tamanho em qualquer lugar; se nem isso vier, o GARLIC fica como lastro do VA.
+Todo VA da janela continua sempre com um mapa por baixo.
+
+A primeira devolução é conferida (vizinhos ainda mapeados, o trecho ainda é o
+GARLIC) e diz "GARLIC_RELEASE prova OK"; se falhar, a devolução desliga no
+resto da execução. Contadores a cada 64 MiB devolvidos.
+
+ORBIS_GARLIC_RELEASE=0 volta ao caminho antigo.
+---
+ src/amd/common/ac_orbis_drm.c | 390 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 379 insertions(+), 11 deletions(-)
+
+diff --git a/src/amd/common/ac_orbis_drm.c b/src/amd/common/ac_orbis_drm.c
+index 4d0d451..e11807e 100644
+--- a/src/amd/common/ac_orbis_drm.c
++++ b/src/amd/common/ac_orbis_drm.c
+@@ -429,6 +429,8 @@ struct orbis_bo {
+    off_t    garlic_phys;
+    uint64_t garlic_addr;
+    uint64_t garlic_bytes;
++   /* ocarina-ps4 (frente V): o físico que estava por baixo, se foi devolvido; ver struct orbis_under. */
++   struct orbis_under *garlic_under;
+ };
+ 
+ /* THE uint32_t HANDLE IS NOT DECORATION. Six functions in this layer take a bo_handle rather than an
+@@ -1186,6 +1188,47 @@ static bool orbis_arena_unmapped;
+  * exact bug this exists to prevent. */
+ #define ORBIS_RETIRE_MAX 4096
+ 
++/* ocarina-ps4 (frente V, 2026-11-08): O FÍSICO QUE FICA POR BAIXO DE UM TRECHO RE-LASTREADO COM GARLIC.
++ *
++ * O orbis_garlic_back mapeia memória GARLIC nova (MAP_FIXED) por cima do VA da arena. As páginas físicas da arena
++ * por baixo continuavam alocadas, só que sem mapa: memória em dobro. No console, com o mundo carregando, eram
++ * 322..507 MiB ("sem dono" no inventário do runtime, igual ao total GARLIC), num total de 5120 MiB.
++ *
++ * Agora (ORBIS_GARLIC_RELEASE, ligado por padrão; =0 volta ao comportamento antigo byte a byte) o garlic_back
++ * pergunta ao kernel (sceKernelVirtualQuery) qual físico está mapeado em cada pedaço do trecho ANTES de cobri-lo, e
++ * depois do map FIXED devolve esses pedaços (sceKernelReleaseDirectMemory). Pelo que o kernel diz, nunca pela
++ * aritmética arena_phys + off: depois da primeira devolução, um VA da janela pode estar sobre físico realocado em
++ * outro lugar, ou sobre um GARLIC mantido (abaixo), e a aritmética mentiria.
++ *
++ * Na devolução do trecho (put_back) cada pedaço tenta voltar exatamente para o mesmo físico (searchStart/searchEnd =
++ * o próprio pedaço); se outro dono já o pegou, aloca o mesmo tamanho em qualquer lugar; se nem isso vier, o GARLIC
++ * daquele pedaço fica onde está e passa a ser o lastro do VA (o próximo garlic_back ali o devolve pelo mesmo caminho
++ * da consulta). Invariante: todo VA da janela tem sempre um mapa por baixo; um buraco é o bug do save do OpenGothic
++ * descrito no setup da arena. */
++#define ORBIS_UNDER_MAX 16
++
++struct orbis_under {
++   unsigned n;
++   struct {
++      uint64_t va;
++      uint64_t len;
++      int64_t  phys;     /* o físico que estava mapeado em va, pela consulta ao kernel */
++      bool     released; /* devolvido ao sistema depois do map do GARLIC */
++   } seg[ORBIS_UNDER_MAX];
++};
++
++/* Contadores do ORBIS_GARLIC_RELEASE, em bytes (p_atomic: garlic_back e put_back rodam em threads diferentes). */
++static uint64_t orbis_gr_released;  /* devolvidos ao sistema, total acumulado */
++static uint64_t orbis_gr_live;      /* devolvidos e ainda sob um GARLIC vivo: o ganho no momento */
++static uint64_t orbis_gr_exact;     /* retomados no mesmo físico */
++static uint64_t orbis_gr_moved;     /* retomados em outro físico */
++static uint64_t orbis_gr_kept;      /* GARLIC mantido como lastro (nenhum físico veio) */
++static uint64_t orbis_gr_logged;    /* o último múltiplo de 64 MiB de orbis_gr_released já dito */
++static unsigned orbis_gr_refused;   /* trechos que ficaram sem GARLIC porque a consulta não fechou */
++static unsigned orbis_gr_fail;      /* sceKernelReleaseDirectMemory != 0 */
++/* Tipo da arena (ORBIS_ARENA_BUS), o mesmo que a realocação no put_back pede. */
++static int32_t orbis_arena_type;
++
+ static struct orbis_retire {
+    uint64_t addr;
+    uint64_t size;
+@@ -1202,6 +1245,9 @@ static struct orbis_retire {
+    uint64_t garlic_addr;
+    uint64_t garlic_bytes;
+    int64_t  garlic_phys;
++   /* ocarina-ps4: o físico de baixo, quando o ORBIS_GARLIC_RELEASE o devolveu; NULL = caminho antigo. A entrada é
++    * dona do ponteiro até o put_back, que o libera. */
++   struct orbis_under *garlic_under;
+ } orbis_retire_q[ORBIS_RETIRE_MAX];
+ static unsigned orbis_retire_head, orbis_retire_count;
+ /* ⚠ ONE LOCK FOR THE RING, AND IT USED TO HAVE THREE - WHICH IS THE SAME AS NONE.
+@@ -5200,6 +5246,7 @@ orbis_arena_setup_once(void)
+       }
+ 
+       arena = want;
++      orbis_arena_type = type; /* ocarina-ps4: o put_back do ORBIS_GARLIC_RELEASE realoca com este tipo */
+       break;
+    }
+ 
+@@ -7148,6 +7195,292 @@ static bool orbis_vram_garlic_on(void)
+    return on == 1;
+ }
+ 
++/* ---------------------------------------------------------------- ORBIS_GARLIC_RELEASE (frente V)
++ *
++ * Ver struct orbis_under. Ligado por padrão; ORBIS_GARLIC_RELEASE=0 desliga e o caminho é o antigo, byte a byte
++ * (nenhuma consulta, nenhuma devolução, put_back pela aritmética da arena). */
++static bool orbis_gr_broken; /* a prova da primeira devolução falhou: consulta e restaura, mas não devolve mais */
++
++static bool
++orbis_garlic_release_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *const s = getenv("ORBIS_GARLIC_RELEASE");
++      on = (s != NULL && s[0] == '0') ? 0 : 1;
++      mesa_logw("orbis-drm: ORBIS_GARLIC_RELEASE=%d - %s", on,
++                on ? "o físico da arena por baixo de cada BO em GARLIC volta ao sistema"
++                   : "caminho antigo: a arena fica alocada por baixo do GARLIC (memória em dobro)");
++   }
++   return on == 1;
++}
++
++/* A struct que o sceKernelVirtualQuery preenche, no layout que o inventário do runtime e o
++ * ac_drm_create_bo_from_user_mem já usam no console (o da SDK nomeia os dois primeiros campos unk01/unk02).
++ * flags: bit 0 flexível, bit 1 memória direta. */
++struct orbis_vq {
++   uint64_t start, end, off;
++   int32_t  prot, type;
++   uint8_t  flags;
++   char     name[32];
++};
++
++/* O mapa que contém addr (flags 0). false se não há mapa em addr. */
++static bool
++orbis_vq_at(uint64_t addr, struct orbis_vq *q)
++{
++   memset(q, 0, sizeof(*q));
++   if (sceKernelVirtualQuery((const void *)(uintptr_t)addr, 0, (void *)q, sizeof(*q)) != 0)
++      return false;
++   return q->start <= addr && addr < q->end;
++}
++
++static void
++orbis_gr_report(const char *why)
++{
++   mesa_logw("orbis-drm: GARLIC_RELEASE %s: devolvidos %" PRIu64 " MiB no total, %" PRIu64
++             " MiB agora (sob GARLIC vivo); na volta: %" PRIu64 " MiB no mesmo físico, %" PRIu64
++             " MiB em outro, %" PRIu64 " MiB com o GARLIC mantido; recusas %u, falhas de release %u%s",
++             why, p_atomic_read(&orbis_gr_released) >> 20, p_atomic_read(&orbis_gr_live) >> 20,
++             p_atomic_read(&orbis_gr_exact) >> 20, p_atomic_read(&orbis_gr_moved) >> 20,
++             p_atomic_read(&orbis_gr_kept) >> 20, p_atomic_read(&orbis_gr_refused),
++             p_atomic_read(&orbis_gr_fail), orbis_gr_broken ? " (DESLIGADO pela prova)" : "");
++}
++
++/* Quais físicos estão mapeados em [start, start + bytes), pedaço a pedaço, juntando os contíguos. NULL se algum
++ * pedaço não é memória direta, se há um buraco ou se são mais de ORBIS_UNDER_MAX pedaços: nesse caso o trecho não
++ * ganha GARLIC (fica no que está por baixo), porque sem saber o que está lá o put_back não teria o que restaurar. */
++static struct orbis_under *
++orbis_under_query(uint64_t start, uint64_t bytes)
++{
++   struct orbis_under *u = calloc(1, sizeof(*u));
++   if (u == NULL)
++      return NULL;
++
++   const uint64_t end = start + bytes;
++   for (uint64_t at = start; at < end;) {
++      struct orbis_vq q;
++      if (!orbis_vq_at(at, &q) || !(q.flags & 2) || q.end <= at) {
++         static unsigned said;
++         if (orbis_budget(&said, 4))
++            mesa_logw("orbis-drm: GARLIC_RELEASE: 0x%" PRIx64 " (no trecho 0x%" PRIx64 "+%" PRIu64
++                      " KiB) não é memória direta mapeada (start 0x%" PRIx64 " end 0x%" PRIx64 " flags 0x%x) - "
++                      "este BO fica sem GARLIC",
++                      at, start, bytes / 1024, q.start, q.end, (unsigned)q.flags);
++         free(u);
++         return NULL;
++      }
++      const uint64_t piece_end = q.end < end ? q.end : end;
++      const int64_t  phys = (int64_t)(q.off + (at - q.start));
++      const uint64_t len = piece_end - at;
++
++      if (u->n > 0 && u->seg[u->n - 1].va + u->seg[u->n - 1].len == at &&
++          u->seg[u->n - 1].phys + (int64_t)u->seg[u->n - 1].len == phys) {
++         u->seg[u->n - 1].len += len; /* o kernel parte o mapa da arena em entradas por mprotect */
++      } else {
++         if (u->n == ORBIS_UNDER_MAX) {
++            static unsigned said;
++            if (orbis_budget(&said, 4))
++               mesa_logw("orbis-drm: GARLIC_RELEASE: o trecho 0x%" PRIx64 "+%" PRIu64 " KiB está sobre mais de %u "
++                         "físicos diferentes - este BO fica sem GARLIC",
++                         start, bytes / 1024, (unsigned)ORBIS_UNDER_MAX);
++            free(u);
++            return NULL;
++         }
++         u->seg[u->n].va = at;
++         u->seg[u->n].len = len;
++         u->seg[u->n].phys = phys;
++         u->seg[u->n].released = false;
++         u->n++;
++      }
++      at = piece_end;
++   }
++   return u;
++}
++
++/* A primeira devolução real, conferida: o vizinho de antes e o de depois continuam mapeados, o trecho continua
++ * sendo o GARLIC, e o que o kernel diz do físico devolvido. Uma devolução PARCIAL de uma alocação maior (a arena
++ * nasce como um bloco só) nunca tinha sido exercida neste kernel; esta linha é a prova positiva. */
++static void
++orbis_gr_prove(const struct orbis_under *u, unsigned i, uint64_t start, off_t gphys)
++{
++   const uint64_t page = orbis_page_size();
++   const uint64_t va = u->seg[i].va, len = u->seg[i].len;
++   struct orbis_vq q;
++   bool ok = true;
++   char before[128] = "n/a", after[128] = "n/a", mid[128];
++
++   if (va >= orbis_arena_map_base + page) {
++      const uint64_t a = va - page;
++      const bool m = orbis_vq_at(a, &q) && (q.flags & 2);
++      ok = ok && m;
++      snprintf(before, sizeof(before), "%s off 0x%" PRIx64, m ? "mapeado" : "SEM MAPA",
++               m ? (uint64_t)(q.off + (a - q.start)) : 0);
++   }
++   if (va + len < orbis_va_end) {
++      const uint64_t a = va + len;
++      const bool m = orbis_vq_at(a, &q) && (q.flags & 2);
++      ok = ok && m;
++      snprintf(after, sizeof(after), "%s off 0x%" PRIx64, m ? "mapeado" : "SEM MAPA",
++               m ? (uint64_t)(q.off + (a - q.start)) : 0);
++   }
++   {
++      const bool    m = orbis_vq_at(va, &q) && (q.flags & 2);
++      const int64_t want = (int64_t)gphys + (int64_t)(va - start);
++      const int64_t got = m ? (int64_t)(q.off + (va - q.start)) : -1;
++      ok = ok && m && got == want;
++      snprintf(mid, sizeof(mid), "%s off 0x%" PRIx64 " (GARLIC esperado 0x%" PRIx64 ")", m ? "mapeado" : "SEM MAPA",
++               (uint64_t)got, (uint64_t)want);
++   }
++   struct { int64_t start, end; int32_t type; } d;
++   memset(&d, 0, sizeof(d));
++   const int32_t drc = sceKernelDirectMemoryQuery((off_t)u->seg[i].phys, 0, (void *)&d, sizeof(d));
++
++   if (ok)
++      mesa_logw("orbis-drm: GARLIC_RELEASE prova OK - devolvido o físico 0x%" PRIx64 "+%" PRIu64
++                " KiB de baixo de 0x%" PRIx64 "; vizinho antes %s, depois %s; o trecho %s; DirectMemoryQuery do "
++                "físico devolvido rc 0x%08x [0x%" PRIx64 "..0x%" PRIx64 ") tipo %d",
++                (uint64_t)u->seg[i].phys, len / 1024, va, before, after, mid, (unsigned)drc, (uint64_t)d.start,
++                (uint64_t)d.end, d.type);
++   else {
++      orbis_gr_broken = true;
++      mesa_loge("orbis-drm: GARLIC_RELEASE prova FALHOU - devolvido 0x%" PRIx64 "+%" PRIu64 " KiB de baixo de 0x%" PRIx64
++                "; vizinho antes %s, depois %s; o trecho %s; DirectMemoryQuery rc 0x%08x [0x%" PRIx64 "..0x%" PRIx64
++                ") tipo %d. A devolução fica DESLIGADA no resto da execução; rode com ORBIS_GARLIC_RELEASE=0",
++                (uint64_t)u->seg[i].phys, len / 1024, va, before, after, mid, (unsigned)drc, (uint64_t)d.start,
++                (uint64_t)d.end, d.type);
++   }
++}
++
++/* Depois do map FIXED do GARLIC: o físico de baixo não tem mais mapa e volta ao sistema. */
++static void
++orbis_under_release(struct orbis_under *u, uint64_t start, off_t gphys)
++{
++   static bool proved;
++
++   for (unsigned i = 0; i < u->n; ++i) {
++      if (orbis_gr_broken)
++         return;
++      const int32_t err = sceKernelReleaseDirectMemory((off_t)u->seg[i].phys, u->seg[i].len);
++      if (err != 0) {
++         p_atomic_inc(&orbis_gr_fail);
++         static unsigned said;
++         if (orbis_budget(&said, 4))
++            mesa_logw("orbis-drm: GARLIC_RELEASE: sceKernelReleaseDirectMemory(0x%" PRIx64 ", %" PRIu64
++                      " KiB) -> 0x%08x - este pedaço fica alocado e volta ao lugar no put_back",
++                      (uint64_t)u->seg[i].phys, u->seg[i].len / 1024, (unsigned)err);
++         continue;
++      }
++      u->seg[i].released = true;
++      p_atomic_add(&orbis_gr_released, u->seg[i].len);
++      p_atomic_add(&orbis_gr_live, u->seg[i].len);
++      if (!proved) {
++         proved = true;
++         orbis_gr_prove(u, i, start, gphys);
++      }
++   }
++
++   const uint64_t step = 64ull << 20;
++   const uint64_t now = p_atomic_read(&orbis_gr_released) / step;
++   const uint64_t was = p_atomic_read(&orbis_gr_logged);
++   if (now > was && p_atomic_cmpxchg(&orbis_gr_logged, was, now) == was)
++      orbis_gr_report("a cada 64 MiB");
++}
++
++/* O put_back com o físico de baixo conhecido. Cada pedaço: o mesmo físico (searchStart/searchEnd = o pedaço), senão
++ * o mesmo tamanho em qualquer lugar, senão o GARLIC daquele pedaço fica como lastro. O GARLIC volta ao sistema só
++ * nos pedaços que ganharam outro mapa. Consome u. */
++static void
++orbis_under_restore(uint64_t addr, uint64_t bytes, off_t gphys, struct orbis_under *u)
++{
++   static bool proved_back;
++   const uint64_t page = orbis_page_size();
++   bool kept[ORBIS_UNDER_MAX];
++   unsigned n_kept = 0;
++
++   for (unsigned i = 0; i < u->n; ++i) {
++      const uint64_t va = u->seg[i].va, len = u->seg[i].len;
++      off_t phys = (off_t)u->seg[i].phys;
++      bool have = !u->seg[i].released; /* não devolvido: as páginas ainda são nossas, só voltam ao lugar */
++      bool exact = false;
++
++      if (!have) {
++         off_t   got = 0;
++         int32_t err = sceKernelAllocateDirectMemory(phys, phys + (off_t)len, len, page, orbis_arena_type, &got);
++         if (err == 0 && got == phys) {
++            have = exact = true;
++         } else {
++            if (err == 0) /* não pode acontecer com a busca do tamanho exato, mas não fica alocado à toa */
++               sceKernelReleaseDirectMemory(got, len);
++            err = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), len, page, orbis_arena_type, &got);
++            if (err == 0) {
++               phys = got;
++               have = true;
++            } else {
++               static unsigned said;
++               if (orbis_budget(&said, 4))
++                  mesa_logw("orbis-drm: GARLIC_RELEASE: sem memória direta para devolver %" PRIu64 " KiB a 0x%" PRIx64
++                            " (0x%08x) - o GARLIC fica como lastro desse VA",
++                            len / 1024, va, (unsigned)err);
++            }
++         }
++      }
++
++      if (have) {
++         void         *at = (void *)(uintptr_t)va;
++         const int32_t err = sceKernelMapDirectMemory(&at, len, ORBIS_GRAPHICS_PROT, ORBIS_MAP_FIXED, phys, page);
++         if (err != 0 || (uintptr_t)at != va) {
++            mesa_loge("orbis-drm: GARLIC_RELEASE: não consegui mapear o físico 0x%" PRIx64 " em 0x%" PRIx64
++                      " (%" PRIu64 " KiB) -> 0x%08x, foi para %p - o GARLIC fica como lastro",
++                      (uint64_t)phys, va, len / 1024, (unsigned)err, at);
++            sceKernelReleaseDirectMemory(phys, len);
++            have = false;
++         }
++      }
++
++      kept[i] = !have;
++      if (u->seg[i].released)
++         p_atomic_add(&orbis_gr_live, -(int64_t)len);
++      if (!have) {
++         n_kept++;
++         p_atomic_add(&orbis_gr_kept, len);
++      } else if (u->seg[i].released) {
++         p_atomic_add(exact ? &orbis_gr_exact : &orbis_gr_moved, len);
++         if (!proved_back) {
++            proved_back = true;
++            struct orbis_vq q;
++            const bool m = orbis_vq_at(va, &q) && (q.flags & 2);
++            mesa_logw("orbis-drm: GARLIC_RELEASE volta: 0x%" PRIx64 "+%" PRIu64 " KiB %s no físico 0x%" PRIx64
++                      "; o kernel diz %s off 0x%" PRIx64,
++                      va, len / 1024, exact ? "no MESMO lugar" : "em OUTRO lugar", (uint64_t)phys,
++                      m ? "mapeado" : "SEM MAPA", m ? (uint64_t)(q.off + (va - q.start)) : 0);
++         }
++      }
++   }
++
++   if (n_kept == 0) {
++      sceKernelReleaseDirectMemory(gphys, bytes);
++   } else {
++      /* Só os pedaços do GARLIC que ganharam outro mapa; os mantidos seguem mapeados e são do VA agora. */
++      for (unsigned i = 0; i < u->n;) {
++         if (kept[i]) {
++            ++i;
++            continue;
++         }
++         unsigned j = i;
++         uint64_t len = 0;
++         while (j < u->n && !kept[j])
++            len += u->seg[j++].len;
++         sceKernelReleaseDirectMemory(gphys + (off_t)(u->seg[i].va - addr), len);
++         i = j;
++      }
++      static unsigned said;
++      if (orbis_budget(&said, 2))
++         orbis_gr_report("GARLIC mantido como lastro");
++   }
++   free(u);
++}
++
+ static bool
+ orbis_garlic_back(struct orbis_bo *bo, uint64_t start, uint64_t bytes)
+ {
+@@ -7160,6 +7493,16 @@ orbis_garlic_back(struct orbis_bo *bo, uint64_t start, uint64_t bytes)
+    if (bo->garlic_bytes != 0)
+       return false;
+ 
++   /* ocarina-ps4 (frente V): o que está por baixo, perguntado ao kernel ANTES do map FIXED. */
++   struct orbis_under *under = NULL;
++   if (orbis_garlic_release_on()) {
++      under = orbis_under_query(start, bytes);
++      if (under == NULL) {
++         p_atomic_inc(&orbis_gr_refused);
++         return false;
++      }
++   }
++
+    off_t gphys = 0;
+    int32_t err = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bytes,
+                                                orbis_page_size(), ORBIS_KERNEL_WC_GARLIC, &gphys);
+@@ -7168,6 +7511,7 @@ orbis_garlic_back(struct orbis_bo *bo, uint64_t start, uint64_t bytes)
+       if (orbis_budget(&said, 4))
+          mesa_logw("orbis-drm: no GARLIC for %llu KiB -> 0x%08x - this BO stays on the coherent bus",
+                    (unsigned long long)(bytes / 1024), (unsigned)err);
++      free(under);
+       return false;
+    }
+ 
+@@ -7180,12 +7524,18 @@ orbis_garlic_back(struct orbis_bo *bo, uint64_t start, uint64_t bytes)
+       mesa_loge("orbis-drm: GARLIC map at 0x%" PRIx64 " (%llu KiB) -> 0x%08x, landed at %p",
+                 start, (unsigned long long)(bytes / 1024), (unsigned)err, at);
+       sceKernelReleaseDirectMemory(gphys, bytes);
++      free(under);
+       return false;
+    }
+ 
+    bo->garlic_phys = gphys;
+    bo->garlic_addr = start;
+    bo->garlic_bytes = bytes;
++   if (under != NULL) {
++      /* O físico de baixo ficou sem mapa: volta ao sistema (ORBIS_GARLIC_RELEASE). */
++      orbis_under_release(under, start, gphys);
++      bo->garlic_under = under;
++   }
+ 
+    static unsigned said;
+    if (orbis_budget(&said, 4))
+@@ -7211,10 +7561,18 @@ orbis_garlic_back(struct orbis_bo *bo, uint64_t start, uint64_t bytes)
+  * Split out of orbis_garlic_restore so the queue can run it from an entry rather than from a
+  * struct orbis_bo, which by then may have been freed. */
+ static void
+-orbis_garlic_put_back(uint64_t garlic_addr, uint64_t garlic_bytes, off_t garlic_phys)
++orbis_garlic_put_back(uint64_t garlic_addr, uint64_t garlic_bytes, off_t garlic_phys, struct orbis_under *under)
+ {
+-   if (garlic_bytes == 0)
++   if (garlic_bytes == 0) {
++      free(under);
+       return;
++   }
++   /* ocarina-ps4 (frente V): com o físico de baixo conhecido, nunca a aritmética - ele pode ter sido devolvido e já
++    * ser de outro dono, ou nem ser da arena. */
++   if (under != NULL) {
++      orbis_under_restore(garlic_addr, garlic_bytes, garlic_phys, under);
++      return;
++   }
+ 
+    void *at = (void *)(uintptr_t)garlic_addr;
+    const off_t phys = (off_t)(orbis_arena_phys + (garlic_addr - orbis_arena_map_base));
+@@ -7231,20 +7589,23 @@ orbis_garlic_put_back(uint64_t garlic_addr, uint64_t garlic_bytes, off_t garlic_
+ /* Detach the chunk from the BO without touching the mapping. The caller owns it afterwards - either
+  * to park on the retire queue or to put back at once. */
+ static void
+-orbis_garlic_take(struct orbis_bo *bo, uint64_t *addr, uint64_t *bytes, off_t *phys)
++orbis_garlic_take(struct orbis_bo *bo, uint64_t *addr, uint64_t *bytes, off_t *phys, struct orbis_under **under)
+ {
+    *addr = 0;
+    *bytes = 0;
+    *phys = 0;
++   *under = NULL;
+    if (bo == NULL || bo->garlic_bytes == 0)
+       return;
+ 
+    *addr = bo->garlic_addr;
+    *bytes = bo->garlic_bytes;
+    *phys = bo->garlic_phys;
++   *under = bo->garlic_under;
+    bo->garlic_phys = 0;
+    bo->garlic_addr = 0;
+    bo->garlic_bytes = 0;
++   bo->garlic_under = NULL;
+ }
+ 
+ /* Put the arena's own pages back where they were, NOW. See orbis_garlic_put_back for when that is
+@@ -7254,9 +7615,10 @@ orbis_garlic_restore(struct orbis_bo *bo)
+ {
+    uint64_t addr, bytes;
+    off_t phys;
++   struct orbis_under *under;
+ 
+-   orbis_garlic_take(bo, &addr, &bytes, &phys);
+-   orbis_garlic_put_back(addr, bytes, phys);
++   orbis_garlic_take(bo, &addr, &bytes, &phys, &under);
++   orbis_garlic_put_back(addr, bytes, phys, under);
+ }
+ #endif
+ 
+@@ -7358,8 +7720,8 @@ orbis_backing_map_locked(struct orbis_bo *bo, uint64_t bo_offset, uint64_t size,
+       const char *const slack_s = getenv("ORBIS_SLACK_PAGES");
+       const uint64_t    slack = slack_s != NULL ? strtoull(slack_s, NULL, 10) * page : 0;
+       const uint64_t bytes = ((addr + size + page - 1) & ~(page - 1)) - start + slack;
+-      const off_t    phys = (off_t)(orbis_arena_phys + (start - orbis_arena_map_base));
+-      void          *at = (void *)(uintptr_t)start;
++      /* ocarina-ps4 (frente V): o phys/at aritméticos que ficavam aqui não eram usados (o grant é só mprotect) e,
++       * com ORBIS_GARLIC_RELEASE, a aritmética da arena deixou de dizer o que está por baixo de um VA. */
+ 
+       /* ⚠ A MAP CANCELS ANY PARKED TEARDOWN OF THE SAME RANGE, AND FORGETTING THAT PRODUCED SEVEN WRITE FAULTS.
+        *
+@@ -7390,6 +7752,7 @@ orbis_backing_map_locked(struct orbis_bo *bo, uint64_t bo_offset, uint64_t size,
+       for (;;) {
+          uint64_t g_addr = 0, g_bytes = 0;
+          int64_t  g_phys = 0;
++         struct orbis_under *g_under = NULL;
+ 
+          simple_mtx_lock(&orbis_retire_lock);
+          for (unsigned i = 0; i < orbis_retire_count; ++i) {
+@@ -7405,9 +7768,11 @@ orbis_backing_map_locked(struct orbis_bo *bo, uint64_t bo_offset, uint64_t size,
+                g_addr = r->garlic_addr;
+                g_bytes = r->garlic_bytes;
+                g_phys = r->garlic_phys;
++               g_under = r->garlic_under;
+                r->garlic_addr = 0;
+                r->garlic_bytes = 0;
+                r->garlic_phys = 0;
++               r->garlic_under = NULL;
+                break; /* out of the scan, so the kernel call happens without the lock */
+             }
+          }
+@@ -7415,7 +7780,7 @@ orbis_backing_map_locked(struct orbis_bo *bo, uint64_t bo_offset, uint64_t size,
+ 
+          if (g_bytes == 0)
+             break;
+-         orbis_garlic_put_back(g_addr, g_bytes, (off_t)g_phys);
++         orbis_garlic_put_back(g_addr, g_bytes, (off_t)g_phys, g_under);
+       }
+ 
+       const int32_t err = sceKernelMprotect((const void *)(uintptr_t)start, (size_t)bytes, ORBIS_GRAPHICS_PROT);
+@@ -7568,7 +7933,7 @@ orbis_retire_ranges(void)
+        * A coalesced run cannot interleave the two wrongly. Runs only merge ranges that touch, so a
+        * chunk restored here belongs either to the run being built - whose protect is issued after
+        * this entry is popped - or to a run that does not overlap it at all. */
+-      orbis_garlic_put_back(r->garlic_addr, r->garlic_bytes, (off_t)r->garlic_phys);
++      orbis_garlic_put_back(r->garlic_addr, r->garlic_bytes, (off_t)r->garlic_phys, r->garlic_under);
+ 
+       if (r->size != 0) {
+          if (run_end != 0 && r->addr <= run_end && r->addr + r->size >= run_addr) {
+@@ -7629,7 +7994,8 @@ orbis_backing_unmap_locked(uint64_t addr, uint64_t size, struct orbis_bo *bo)
+          }
+          const struct orbis_retire *const old_r = &orbis_retire_q[orbis_retire_head];
+          /* Same order as the drain: the pages come back first, then the rights go away. */
+-         orbis_garlic_put_back(old_r->garlic_addr, old_r->garlic_bytes, (off_t)old_r->garlic_phys);
++         orbis_garlic_put_back(old_r->garlic_addr, old_r->garlic_bytes, (off_t)old_r->garlic_phys,
++                               old_r->garlic_under);
+          if (old_r->size != 0)
+             orbis_protect_now(old_r->addr, old_r->size);
+          orbis_retire_head = (orbis_retire_head + 1) % ORBIS_RETIRE_MAX;
+@@ -7647,10 +8013,12 @@ orbis_backing_unmap_locked(uint64_t addr, uint64_t size, struct orbis_bo *bo)
+       {
+          uint64_t g_addr, g_bytes;
+          off_t    g_phys;
+-         orbis_garlic_take(bo, &g_addr, &g_bytes, &g_phys);
++         struct orbis_under *g_under;
++         orbis_garlic_take(bo, &g_addr, &g_bytes, &g_phys, &g_under);
+          orbis_retire_q[slot].garlic_addr = g_addr;
+          orbis_retire_q[slot].garlic_bytes = g_bytes;
+          orbis_retire_q[slot].garlic_phys = (int64_t)g_phys;
++         orbis_retire_q[slot].garlic_under = g_under;
+       }
+       ++orbis_retire_count;
+       simple_mtx_unlock(&orbis_retire_lock);
+-- 
+2.53.0
+
