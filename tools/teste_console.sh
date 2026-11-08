@@ -10,6 +10,9 @@
 #     --quadros-de-captura K   quantas capturas shot_N.png baixar (padrão 4; 0 = nenhuma)
 #     --saida <pasta>          onde gravar log, capturas e resumo (padrão out/testes/<data-hora>)
 #
+# Exemplo: teste_console.sh tools/args-jogo.txt --elf --minutos 5
+#          teste_console.sh tools/args-jogo.txt --save ~/ocarina-ps4/saves/deku-entrada/slot_00
+#
 # Pasta de dados: /data/slop/0400486024dec000 (ou SLOP_DATA_DIR). Log: logs/totk.log; capturas: logs/shot_N.png.
 # Se o carregador não responder "ok reload", o app é aberto pelo ps4_lancar.py SLOP78577.
 # O teste termina no primeiro ^FATAL, no primeiro "preparar-compute: fim", em N minutos ou com o log parado por 4 min.
@@ -37,6 +40,9 @@ uso: teste_console.sh <args.txt local> [--save <pasta slot no IdeaPad>] [--elf] 
 
 Termina no primeiro ^FATAL, no primeiro "preparar-compute: fim", em N minutos ou com o log parado por 4 minutos.
 Código de saída: 0 sem FATAL, 1 com FATAL, 2 erro de operação.
+
+exemplo: teste_console.sh tools/args-jogo.txt --elf --minutos 5
+         teste_console.sh tools/args-jogo.txt --save ~/ocarina-ps4/saves/deku-entrada/slot_00
 EOF
 }
 
@@ -106,8 +112,10 @@ python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$MINUTOS"
 
 DATA=${SLOP_DATA_DIR:-$DATA_PADRAO}
 [[ "$DATA" == /data/?* ]] || erro "pasta de dados inválida: '$DATA'"
+export SLOP_DATA_DIR="$DATA"   # os outros tools usam a mesma pasta
 
-ARGS_TXT=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$ARGS_TXT")
+ARGS_TXT=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$ARGS_TXT") \
+  || erro "não consegui resolver o caminho de $ARGS_TXT"
 if [ -z "$SAIDA" ]; then
   SAIDA="$L/out/testes/$(date +%Y-%m-%d_%H-%M-%S)"
 elif [[ "$SAIDA" != /* ]]; then
@@ -166,9 +174,9 @@ def baixar(f, caminho):
     return b.getvalue()
 
 
-def ler_inicio(f, caminho, n):
-    """Lê só os primeiros n bytes do arquivo, sem baixar o log inteiro."""
-    conn = f.transfercmd('RETR ' + caminho)
+def ler_trecho(f, caminho, deslocamento, n):
+    """Lê só n bytes a partir de deslocamento, sem baixar o log inteiro."""
+    conn = f.transfercmd('RETR ' + caminho, rest=deslocamento)
     b = bytearray()
     try:
         while len(b) < n:
@@ -186,6 +194,10 @@ def ler_inicio(f, caminho, n):
         except Exception:
             pass
     return bytes(b)
+
+
+def ler_inicio(f, caminho, n):
+    return ler_trecho(f, caminho, 0, n)
 
 
 def cmd_enviar(ps4, dados, origem):
@@ -216,15 +228,32 @@ def cmd_estado(ps4, dados, work):
     f = conectar(ps4)
     try:
         n = tamanho(f, caminho)
-        prefixo = ler_inicio(f, caminho, min(n, 4096)) if n else b''
     finally:
         fechar(f)
-    estado = {'tamanho': n, 'prefixo_n': len(prefixo),
-              'prefixo_sha': hashlib.sha256(prefixo).hexdigest()}
+
+    # Guarda o começo e o fim do log antigo: se o app reescrever o arquivo e ele já crescer além do tamanho
+    # anterior antes da primeira leitura, o tamanho sozinho não denuncia o log novo; os dois hashes denunciam.
+    tam = min(n, 4096)
+    prefixo = b''
+    cauda = b''
+    if tam:
+        f = conectar(ps4)
+        try:
+            prefixo = ler_inicio(f, caminho, tam)
+        finally:
+            fechar(f)
+        f = conectar(ps4)
+        try:
+            cauda = ler_trecho(f, caminho, n - tam, tam)
+        finally:
+            fechar(f)
+    estado = {'tamanho': n,
+              'prefixo_n': len(prefixo), 'prefixo_sha': hashlib.sha256(prefixo).hexdigest(),
+              'cauda_n': len(cauda), 'cauda_sha': hashlib.sha256(cauda).hexdigest()}
     with open(os.path.join(work, 'estado.json'), 'w') as fh:
         json.dump(estado, fh)
     print(f'[estado] log antigo: {n} bytes'
-          + (f', guardei o prefixo de {len(prefixo)} B para detectar o log novo' if prefixo else ''))
+          + (f', guardei {len(prefixo)} B do começo e do fim para detectar o log novo' if prefixo else ''))
 
 
 def cmd_monitorar(ps4, dados, work, minutos, intervalo=20.0, ocioso=240.0):
@@ -234,6 +263,8 @@ def cmd_monitorar(ps4, dados, work, minutos, intervalo=20.0, ocioso=240.0):
     base = est['tamanho']
     prefixo_n = est['prefixo_n']
     prefixo_sha = est['prefixo_sha']
+    cauda_n = est['cauda_n']
+    cauda_sha = est['cauda_sha']
 
     total = float(minutos) * 60.0
     boot_limite = min(total, 240.0)
@@ -269,21 +300,24 @@ def cmd_monitorar(ps4, dados, work, minutos, intervalo=20.0, ocioso=240.0):
         encolheu = tamanho_atual < base
         prefixo_mudou = bool(prefixo_n and tamanho_atual >= prefixo_n
                              and hashlib.sha256(texto[:prefixo_n]).hexdigest() != prefixo_sha)
+        cauda_mudou = bool(cauda_n and tamanho_atual >= base
+                           and hashlib.sha256(texto[base - cauda_n:base]).hexdigest() != cauda_sha)
         pos_boot = texto.rfind(BOOT)
         boot_novo = pos_boot >= 0 and (base == 0 or pos_boot >= base)
 
         if not novo:
-            if encolheu or prefixo_mudou or boot_novo:
+            if encolheu or prefixo_mudou or cauda_mudou or boot_novo:
                 novo = True
                 como = ('o arquivo encolheu' if encolheu else
-                        'o começo do arquivo mudou' if prefixo_mudou else 'a linha de boot apareceu')
+                        'o começo do arquivo mudou' if prefixo_mudou else
+                        'o fim do arquivo mudou' if cauda_mudou else 'a linha de boot apareceu')
                 print(f'[monitor] log novo detectado em {decorrido:.0f} s ({como})', flush=True)
                 ultimo_cambio = agora
 
         if novo:
             if pos_boot >= 0:
                 trecho = texto[pos_boot:]
-            elif encolheu or prefixo_mudou:
+            elif encolheu or prefixo_mudou or cauda_mudou:
                 trecho = texto
             else:
                 trecho = texto[base:]
@@ -386,12 +420,15 @@ def montar_resumo(linhas, nota, deslocamento, fim, capturas, args_txt, saida):
         partes.append('== ' + titulo + ' ==')
         partes.extend(itens if itens else ['(nenhum)'])
 
+    motivos = {'fatal': 'FATAL', 'preparo': 'preparo terminado (preparar-compute: fim)',
+               'tempo': 'teto de tempo', 'parado': 'log parado por 4 min',
+               'sem-log-novo': 'sem log novo', 'ftp': 'FTP caiu'}
     partes = ['Resumo do teste no console']
     partes.append('data: ' + time.strftime('%Y-%m-%d %H:%M:%S'))
     motivo = fim.get('motivo', 'desconhecido')
     segundos = fim.get('segundos')
     quando = f' ({segundos:.0f} s)' if isinstance(segundos, (int, float)) else ''
-    partes.append(f'motivo do fim: {motivo}{quando}')
+    partes.append(f'motivo do fim: {motivos.get(motivo, motivo)}{quando}')
     partes.append('args: ' + args_txt)
     partes.append('pasta: ' + saida)
     partes.append('log: ' + nota)
@@ -404,11 +441,12 @@ def montar_resumo(linhas, nota, deslocamento, fim, capturas, args_txt, saida):
         partes.append('')
         plural = 's' if len(fatais) > 1 else ''
         partes.append(f'== FATAL ({len(fatais)} ocorrência{plural}) ==')
-        for i, inicio in fatais:
+        for k, (i, inicio) in enumerate(fatais):
+            if k:
+                partes.append('')
             partes.append(f'--- FATAL na linha {numero(i)} (com as 5 linhas anteriores) ---')
             for j in range(inicio, i + 1):
                 partes.append(f'{numero(j)}: {linhas[j]}')
-            partes.append('')
     else:
         secao('FATAL', ['nenhuma linha FATAL'])
 
@@ -536,6 +574,7 @@ if __name__ == '__main__':
         print(f'teste_console: erro: {e}', file=sys.stderr)
         sys.exit(2)
 PY
+[ -s "$WORK/console.py" ] || erro "não consegui preparar a parte Python"
 
 echo "[teste] console $PS4 (FTP 2121), dados $DATA"
 echo "[teste] args: $ARGS_TXT"
@@ -554,6 +593,7 @@ fi
 echo "[teste] 3/7 args.txt -> $DATA/args.txt"
 python3 "$WORK/console.py" enviar "$PS4" "$DATA" "$ARGS_TXT" || erro "não consegui enviar o args.txt"
 
+# O log antigo pode continuar no FTP por um tempo depois do reload: guarda o estado antes para reconhecer o novo.
 echo "[teste] estado do log antes do reload"
 python3 "$WORK/console.py" estado "$PS4" "$DATA" "$WORK" || erro "não consegui ler o estado do log"
 
