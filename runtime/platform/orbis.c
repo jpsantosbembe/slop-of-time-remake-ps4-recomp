@@ -1489,8 +1489,8 @@ static int map_placeholder(Resv *r, uint64_t a);
 //    lê a vaga. Sem memória livre, map_window despeja ali mesmo (caminho síncrono, o que segura a carga do New Game).
 // Tudo sob vm_lock; o fundo despeja de 4 em 4 janelas para não segurar as faltas. A GPU nunca vê janela trocada no
 // meio de um uso: só sai o que ela não usa há 3 s, e o que ela vai usar passa antes pelo prefault.
-// Ajustes: OCARINA_SWAP=0 desliga; OCARINA_GUEST_MIB = orçamento das janelas do jogo (padrão 2304); o fundo despeja
-// acima de 85% até 80%, e também quando o maior trecho livre da memória direta cai abaixo de 128 MiB.
+// Ajustes: OCARINA_SWAP=0 desliga; OCARINA_GUEST_MIB = orçamento das janelas do jogo (padrão 2560); o fundo despeja
+// acima de 85% até 80%, e mais 128 MiB quando a memória direta livre (somada) cai abaixo de 128 MiB.
 static size_t win_count(const Resv *r) { return (size_t)((up(r->end, WIN) - r->win_base) / WIN); }
 static void win_span(const Resv *r, size_t i, uint64_t *at, uint64_t *end) {
     uint64_t w = r->win_base + (uint64_t)i * WIN;
@@ -1664,6 +1664,21 @@ static int touch_locked(Resv *r, uint64_t a, int *fresh) {
     return 1;
 }
 
+// A memória direta livre somada (o total menos os blocos alocados, pelo sceKernelDirectMemoryQuery). O
+// sceKernelAvailableDirectMemorySize dá só o maior trecho contíguo, que a fragmentação deixa pequeno com muito livre.
+extern int32_t sceKernelDirectMemoryQuery(int64_t offset, int32_t flags, void *info, size_t size);
+static uint64_t dmem_free_total(void) {
+    struct { int64_t start, end; int32_t type; } d;
+    uint64_t total = sceKernelGetDirectMemorySize(), alloc = 0;
+    for (int64_t at = 0, k = 0; k < 100000; k++) {
+        memset(&d, 0, sizeof d);
+        if (sceKernelDirectMemoryQuery(at, 1, &d, sizeof d) || d.end <= d.start || d.end <= at) break;
+        alloc += (uint64_t)(d.end - d.start);
+        at = d.end;
+    }
+    return alloc < total ? total - alloc : 0;
+}
+
 static void *pager_thread(void *arg) {
     (void)arg;
     for (;;) {
@@ -1671,12 +1686,8 @@ static void *pager_thread(void *arg) {
         uint32_t t = __atomic_add_fetch(&pg_tick, 1, __ATOMIC_RELAXED);
         uint64_t m = __atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED), target = 0;
         if (m > pg_budget * 85 / 100) target = m - pg_budget * 80 / 100;
-        if (!(t & 3)) {   // a cada 1 s: memória direta quase no fim para os outros (VMA, malloc)
-            int64_t st = 0;
-            size_t dfree = 0;
-            sceKernelAvailableDirectMemorySize(0, (int64_t)sceKernelGetDirectMemorySize(), 0x4000, &st, &dfree);
-            if (dfree < (128u << 20) && m > (512u << 20) && target < (256u << 20)) target = 256u << 20;
-        }
+        if (!(t & 3) && m > (512u << 20) && target < (128u << 20) && dmem_free_total() < (128u << 20))
+            target = 128u << 20;   // a cada 1 s: memória direta quase no fim para os outros (VMA, malloc)
         if (m < pg_budget * 7 / 10 && !target) continue;   // sem pressão
         if (!(t & 3)) {
             plat_mutex_lock(&vm_lock);
@@ -1697,7 +1708,7 @@ static void *pager_thread(void *arg) {
 static void pg_init(void) {
     char v[32];
     pg_on = !(plat_getenv("OCARINA_SWAP", v, sizeof v) && v[0] == '0');
-    uint64_t mib = 2304;
+    uint64_t mib = 2560;
     if (plat_getenv("OCARINA_GUEST_MIB", v, sizeof v) && strtoull(v, NULL, 10) >= 256) mib = strtoull(v, NULL, 10);
     pg_budget = mib << 20;
     if (!pg_on) {
