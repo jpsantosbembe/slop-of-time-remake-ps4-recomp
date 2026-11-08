@@ -411,6 +411,11 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources += [out / 'modules.c']
     if ORBIS and not runtime_lib:
         sources += ORBIS['extra_src']   # o vkloader do kit: a ABI C do Vulkan sobre os três símbolos ICD do RADV
+        # A identidade do RADV ligado (o vk_device.c põe o mesa-cache numa subpasta dela): o build-id do mesa-ps4 é
+        # fixo (radv-build-id no meson), então o UUID do cache não muda quando o mesa é recompilado, e a execução seguinte
+        # lia do mesa-cache objetos gravados por outro build (2026-11-08: shaders[0] lixo em
+        # radv_compute_pipeline_cache_search, #GP no lock incl). Só regrava o arquivo quando o hash muda.
+        sources += [orbis_mesa_id(out)]
     for src in sources:
         o = runtime_object(out, src)
         if src.suffix == '.rc':   # windres writes no depfile: the files totk.rc embeds are listed by hand
@@ -816,6 +821,20 @@ def orbis_setup(args):
                     ['-lc++', '-lm', '-lc', '-lkernel', cmd_path(oo / 'lib' / 'crt1.o')])
     EXE = 'ocarina.elf'
     print(f'build_game: alvo PS4 (bundle {sdk}, mesa {mesa}, kit {kit}, deps {deps})')
+
+
+def orbis_mesa_id(out):
+    """<out>/mesa_id.c com o SHA-256 (16 hex) do libvulkan_radeon.a ligado; reescrito só quando muda."""
+    h = hashlib.sha256()
+    with open(ORBIS['link_deps'][0], 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    src = out / 'mesa_id.c'
+    text = f'const char ocarina_mesa_id[] = "{h.hexdigest()[:16]}";\n'
+    if not src.is_file() or src.read_text() != text:
+        out.mkdir(parents=True, exist_ok=True)
+        src.write_text(text)
+    return src
 
 
 def orbis_check_segments(elf):

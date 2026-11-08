@@ -51,6 +51,16 @@ static void mesa_cache_beside_exe(void) {
     char *cut = len ? plat_last_sep(dir) : NULL;
     if (!cut) return;
     strcpy(cut + 1, "mesa-cache");
+#ifdef __ORBIS__
+    // Uma subpasta por build do RADV ligado (mesa_id.c, gerado pelo build_game.py): o build-id do mesa-ps4 é fixo, e
+    // um mesa-cache de outro build devolvia objetos de pipeline com outro layout (queda em
+    // radv_compute_pipeline_cache_search, 2026-11-08). As pastas de builds antigos ficam; apagar à mão.
+    {
+        extern const char ocarina_mesa_id[];
+        size_t n = strlen(dir);
+        snprintf(dir + n, sizeof dir - n, "/%s", ocarina_mesa_id);
+    }
+#endif
     plat_setenv("MESA_SHADER_CACHE_DIR", dir);
 }
 
