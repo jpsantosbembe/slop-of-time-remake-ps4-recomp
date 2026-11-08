@@ -1078,6 +1078,7 @@ typedef struct {
     uint32_t *gt, *pt;      // paginador: tique do último uso da GPU/E/S e da sonda
     int32_t *slot;          // paginador: vaga da janela trocada no swap.bin (-1: zerada, nada gravado)
     uint32_t *zl;           // paginador: bytes gravados na vaga (== tamanho da janela: crua)
+    uint8_t *wq;            // write-watch: 1 na janela que plat_mem_written já rearmou (vigiada por página)
 } Resv;
 
 static void fault_install(void);   // o tratador do write-watch (abaixo)
@@ -1338,7 +1339,7 @@ void plat_log_line(const char *line, size_t n) {
 extern int32_t sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t align, int64_t *out_start,
                                                   size_t *out_size);
 extern int32_t sceKernelAvailableFlexibleMemorySize(size_t *size);
-static void mem_inventory(void);
+static void mem_inventory(int blocks_too);
 static void mem_report(const char *why) {
     int64_t st = 0;
     size_t dfree = 0, ffree = 0;
@@ -1395,8 +1396,10 @@ static void *mem_monitor(void *arg) {
         int64_t st = 0;
         size_t dfree = 0;
         sceKernelAvailableDirectMemorySize(0, (int64_t)sceKernelGetDirectMemorySize(), 0x4000, &st, &dfree);
-        if (!inv_said || m > inv_last + (512ull << 20) || m + (512ull << 20) < inv_last || (dfree < (64u << 20) && inv_said < 40)) {
-            mem_inventory();
+        static int inv_full;
+        int low = dfree < (64u << 20);
+        if (!inv_said || m > inv_last + (512ull << 20) || m + (512ull << 20) < inv_last || (low && inv_said < 40)) {
+            mem_inventory(!inv_said || (low && inv_full++ < 3));
             inv_last = m;
             inv_said++;
         }
@@ -1841,17 +1844,17 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
             r.win = calloc(nw, 1);
             r.woff = malloc(nw * sizeof *r.woff);
             r.pgf = calloc(nw, 1), r.gt = calloc(nw, sizeof *r.gt), r.pt = calloc(nw, sizeof *r.pt);
-            r.slot = malloc(nw * sizeof *r.slot), r.zl = calloc(nw, sizeof *r.zl);
+            r.slot = malloc(nw * sizeof *r.slot), r.zl = calloc(nw, sizeof *r.zl), r.wq = calloc(nw, 1);
             if (r.slot)
                 for (size_t k = 0; k < nw; k++) r.slot[k] = -1;
-            if (r.sub && r.win && r.woff && r.pgf && r.gt && r.pt && r.slot && r.zl && (!watch || r.ww)) {
+            if (r.sub && r.win && r.woff && r.pgf && r.gt && r.pt && r.slot && r.zl && r.wq && (!watch || r.ww)) {
                 memset(r.sub, SS_RESERVED, n / SUB);
                 for (size_t k = 0; k < nw; k++) r.woff[k] = -1;
                 resv[nresv] = r;
                 __atomic_store_n(&nresv, nresv + 1, __ATOMIC_RELEASE);
                 ok = 1;
             } else {
-                free(r.sub), free(r.ww), free(r.win), free(r.woff), free(r.pgf), free(r.gt), free(r.pt), free(r.slot), free(r.zl);
+                free(r.sub), free(r.ww), free(r.win), free(r.woff), free(r.pgf), free(r.gt), free(r.pt), free(r.slot), free(r.zl), free(r.wq);
                 sceKernelMunmap(a, n);
             }
         } else if (!e) {
@@ -2011,6 +2014,8 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     Resv *r = resv_of_range(addr, n);
     if (!r || !r->ww) return UINT64_MAX;
     plat_mutex_lock(&vm_lock);
+    if (reset && r->wq)   // daqui em diante a janela é vigiada página a página (ww_window_fault)
+        for (uint64_t w = down(addr, WIN); w < addr + n; w += WIN) __atomic_store_n(&r->wq[(w - r->win_base) / WIN], 1, __ATOMIC_RELEASE);
     uint64_t got = 0, end = addr + n, rearm_lo = 0, rearm_hi = 0;
     for (uint64_t pg = down(addr, KPAGE); pg < end && got < max; pg += KPAGE) {
         uint8_t *w = &r->ww[(pg - r->base) / KPAGE];
@@ -2064,9 +2069,35 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 static int (*fault_hook)(uint64_t addr);
 static void (*crash_fn)(const PlatCrash *c);
 
+// Janela que ninguém consultou ainda (frente N, 2026-11-07): a primeira escrita marca a janela inteira como escrita e
+// libera todas as páginas RW dela de uma vez. Com a vigia por página de 16 KiB, cada escrita esparsa no heap partia o
+// mapa do kernel (medido no console: ~158 mil entradas só no jogo, uma por página, que custam memória do kernel e
+// deixam lentos o VirtualQuery e o mmap). Reportar a mais é seguro; só as janelas que plat_mem_written rearma (as das
+// texturas e pools que o back end confere) seguem vigiadas página a página. OCARINA_WW_PAGE=1 volta ao antigo.
+static int ww_window_fault(Resv *r, uint64_t a) {
+    static int page = -1;
+    if (page < 0) {
+        char v[8];
+        page = plat_getenv("OCARINA_WW_PAGE", v, sizeof v) && v[0] == '1';
+    }
+    size_t i = (size_t)((a - r->win_base) / WIN);
+    if (page || !r->wq || __atomic_load_n(&r->wq[i], __ATOMIC_ACQUIRE)) return 0;
+    uint64_t w = down(a, WIN), at = w > r->base ? w : r->base, end = w + WIN < r->end ? w + WIN : r->end;
+    plat_mutex_lock(&vm_lock);
+    int ok = win_mapped(r, a) && !r->wq[i];
+    if (ok) {
+        for (uint64_t pg = at; pg < end; pg += KPAGE)
+            if (page_req(r, pg) == PLAT_PROT_RW) __atomic_store_n(&r->ww[(pg - r->base) / KPAGE], WW_DIRTY, __ATOMIC_RELEASE);
+        apply_range(r, at, end);
+    }
+    plat_mutex_unlock(&vm_lock);
+    return ok && page_req(r, down(a, KPAGE)) == PLAT_PROT_RW;
+}
+
 static int ww_fault(uint64_t a) {
     Resv *r = resv_of(a);
     if (!r || !r->ww || !win_mapped(r, a)) return 0;
+    if (ww_window_fault(r, a)) return 1;
     uint64_t pg = down(a, KPAGE);
     uint8_t *w = &r->ww[(pg - r->base) / KPAGE];
     // Pedida RW e faltou: a proteção do hardware está atrasada em qualquer estado, inclusive DIRTY (um apply_range
@@ -2200,46 +2231,32 @@ typedef struct {
 } KVQuery;
 
 // ---- inventário da memória direta (frente N, 2026-11-07). A linha "orbis mem" só conta o que o runtime sabe (janelas
-// do jogo, VMA, pilhas); no console a soma ficou ~1,1 GB abaixo dos 5120 MiB com a memória direta esgotada. Aqui:
-// (1) o alocado de verdade, somando os blocos do sceKernelDirectMemoryQuery; (2) cada mapa do processo
-// (sceKernelVirtualQuery, FIND_NEXT) com memória direta, agrupado por dono, contando a memória física sem repetir (o
-// coringa aparece mapeado em muitos endereços e conta uma vez); (3) a memória direta alocada que nenhum mapa mostra.
-// Os grupos: jogo (as reservas do guest), coringa, pilhas (área preguiçosa), e os demais pelo nome que o kernel guarda
-// no mapa, ou "sem nome <prot>" com o maior trecho, para achar o dono pelo endereço. Os mapas flexíveis vão num total à
-// parte. Roda no monitor, no início e a cada 512 MiB de mudança; OCARINA_MEM_INVENTORY=0 desliga.
+// do jogo, VMA, pilhas); no console a soma ficou ~1,1 GB abaixo dos 5120 MiB com a memória direta esgotada. A conta:
+// (1) o alocado de verdade, os blocos do sceKernelDirectMemoryQuery (o kernel junta alocações vizinhas num bloco);
+// (2) a memória física de cada dono: as janelas do jogo pela tabela das reservas (woff; sem varrer os mapas delas, que
+// a proteção por página de 16 KiB parte em ~160 mil entradas), o coringa, e os demais mapas do processo
+// (sceKernelVirtualQuery, FIND_NEXT, pulando as reservas do jogo) pelo nome que o kernel guarda, ou "sem nome <prot>";
+// (3) por bloco: quanto é de cada dono e quanto não é de ninguém que tenha mapa (alocada sem mapa). Os mapas flexíveis
+// vão num total à parte. Linha de resumo no início, a cada 512 MiB de mudança e com a memória quase no fim; os blocos
+// um a um no início e nas 3 primeiras vezes com a memória quase no fim. OCARINA_MEM_INVENTORY=0 desliga.
 extern int32_t sceKernelDirectMemoryQuery(int64_t offset, int32_t flags, void *info, size_t size);
 typedef struct { int64_t start, end; int32_t type; } KDMQuery;
 #define INV_GROUPS 24
-#define INV_IV 16384
+#define INV_IV 32768
+#define INV_BLK 128
 typedef struct { char name[40]; uint64_t phys, virt, big_at, big_len; int n; } InvGroup;
 static InvGroup inv_g[INV_GROUPS];
-static struct { int64_t lo, hi; int g; } inv_iv[INV_IV];   // trechos físicos mapeados (por grupo)
+static struct { int64_t lo, hi; int g; } inv_iv[INV_IV];   // trechos físicos (por dono)
+static KDMQuery inv_blk[INV_BLK];
+static int inv_n;
 
 static int iv_cmp(const void *x, const void *y) {
     const int64_t a = *(const int64_t *)x, b = *(const int64_t *)y;
     return a < b ? -1 : a > b;
 }
 
-// Soma de trechos [lo, hi) sem contar a sobreposição; ordena em p.
-static uint64_t iv_union(void *p, int n, size_t stride) {
-    qsort(p, (size_t)n, stride, iv_cmp);
-    uint64_t sum = 0;
-    int64_t cl = 0, ch = -1;
-    for (int i = 0; i < n; i++) {
-        const int64_t *e = (const int64_t *)((const char *)p + (size_t)i * stride);
-        if (e[0] > ch) {
-            if (ch > cl) sum += (uint64_t)(ch - cl);
-            cl = e[0], ch = e[1];
-        } else if (e[1] > ch) {
-            ch = e[1];
-        }
-    }
-    if (ch > cl) sum += (uint64_t)(ch - cl);
-    return sum;
-}
-
 static int inv_group(const char *name) {
-    for (int i = 0; i < INV_GROUPS; i++) {
+    for (int i = 0; i < INV_GROUPS - 1; i++) {
         if (!inv_g[i].name[0]) {
             snprintf(inv_g[i].name, sizeof inv_g[i].name, "%s", name);
             return i;
@@ -2249,7 +2266,29 @@ static int inv_group(const char *name) {
     return INV_GROUPS - 1;   // o último junta o resto
 }
 
-static void mem_inventory(void) {
+static void inv_add(int g, int64_t lo, int64_t hi, uint64_t va) {
+    uint64_t len = (uint64_t)(hi - lo);
+    inv_g[g].virt += len;
+    inv_g[g].n++;
+    if (len > inv_g[g].big_len) inv_g[g].big_len = len, inv_g[g].big_at = va;
+    if (inv_n < INV_IV) inv_iv[inv_n].lo = lo, inv_iv[inv_n].hi = hi, inv_iv[inv_n].g = g, inv_n++;
+}
+
+// Bytes de [lo, hi) cobertos pelos trechos (ordenados pelo início), sem repetir; por dono em per (com repetição).
+static uint64_t inv_cover(int64_t lo, int64_t hi, uint64_t *per) {
+    uint64_t sum = 0;
+    int64_t cl = lo, ch = lo;
+    for (int i = 0; i < inv_n && inv_iv[i].lo < hi; i++) {
+        int64_t a = inv_iv[i].lo > lo ? inv_iv[i].lo : lo, b = inv_iv[i].hi < hi ? inv_iv[i].hi : hi;
+        if (b <= a) continue;
+        if (per) per[inv_iv[i].g] += (uint64_t)(b - a);
+        if (a > ch) sum += (uint64_t)(ch - cl), cl = a, ch = b;
+        else if (b > ch) ch = b;
+    }
+    return sum + (uint64_t)(ch - cl);
+}
+
+static void mem_inventory(int blocks_too) {
     static int off = -1;
     if (off < 0) {
         char v[8];
@@ -2257,22 +2296,45 @@ static void mem_inventory(void) {
     }
     if (off) return;
     uint64_t total = sceKernelGetDirectMemorySize(), alloc = 0;
-    int blocks = 0;
+    int nb = 0, more = 0;
     KDMQuery d;
-    for (int64_t at = 0; blocks < 100000; blocks++) {
+    for (int64_t at = 0;; ) {
         memset(&d, 0, sizeof d);
         if (sceKernelDirectMemoryQuery(at, 1, &d, sizeof d) || d.end <= d.start || d.end <= at) break;
         alloc += (uint64_t)(d.end - d.start);
+        if (nb < INV_BLK) inv_blk[nb++] = d;
+        else more++;
         at = d.end;
     }
     memset(inv_g, 0, sizeof inv_g);
     snprintf(inv_g[INV_GROUPS - 1].name, sizeof inv_g[0].name, "outros");
-    int niv = 0, nmaps = 0;
-    uint64_t flex = 0, ph_lo = ph_off >= 0 ? (uint64_t)ph_off : UINT64_MAX;
+    inv_n = 0;
+    // As janelas reais do jogo, pela tabela (vm_lock: a tabela não muda no meio).
+    plat_mutex_lock(&vm_lock);
+    int gj = inv_group("jogo (janelas)");
+    for (int k = 0, nr = __atomic_load_n(&nresv, __ATOMIC_ACQUIRE); k < nr; k++) {
+        Resv *r = &resv[k];
+        if (!r->woff) continue;
+        for (size_t i = 0, nw = (size_t)((up(r->end, WIN) - r->win_base) / WIN); i < nw; i++) {
+            if (r->woff[i] < 0) continue;
+            uint64_t w = r->win_base + (uint64_t)i * WIN, at = w > r->base ? w : r->base, end = w + WIN < r->end ? w + WIN : r->end;
+            inv_add(gj, r->woff[i], r->woff[i] + (int64_t)(end - at), at);
+        }
+    }
+    if (ph_off >= 0) inv_add(inv_group("coringa"), ph_off, ph_off + (int64_t)WIN, 0);
+    plat_mutex_unlock(&vm_lock);
+    // Os demais mapas, pulando as reservas do jogo.
+    int nmaps = 0;
+    uint64_t flex = 0;
     KVQuery q;
-    for (uint64_t a = 0; nmaps < 200000; nmaps++) {
+    for (uint64_t a = 0; nmaps < 400000; nmaps++) {
         memset(&q, 0, sizeof q);
         if (sceKernelVirtualQuery((void *)(uintptr_t)a, 1, &q, sizeof q) || q.end <= q.start || q.end <= a) break;
+        Resv *r = resv_of(q.start);
+        if (r && r->woff) {
+            a = r->end > q.end ? r->end : q.end;
+            continue;
+        }
         a = q.end;
         uint64_t len = q.end - q.start;
         if (!(q.flags & 2)) {   // não é memória direta
@@ -2280,41 +2342,39 @@ static void mem_inventory(void) {
             continue;
         }
         char key[40];
-        Resv *r = resv_of(q.start);
-        if (q.off >= ph_lo && q.off < ph_lo + WIN) snprintf(key, sizeof key, "coringa");
-        else if (r) snprintf(key, sizeof key, "jogo");
+        if (r) snprintf(key, sizeof key, "runtime (plat_mem_alloc)");
         else if (ls_arena > 1 && q.start >= ls_arena && q.start < ls_arena + LS_SLOT * LS_SLOTS) snprintf(key, sizeof key, "pilhas");
         else if (q.name[0]) snprintf(key, sizeof key, "%.31s", q.name);
         else snprintf(key, sizeof key, "sem nome prot %#x", (unsigned)q.prot);
-        int g = inv_group(key);
-        inv_g[g].virt += len;
-        inv_g[g].n++;
-        if (len > inv_g[g].big_len) inv_g[g].big_len = len, inv_g[g].big_at = q.start;
-        if (niv < INV_IV) {
-            inv_iv[niv].lo = (int64_t)q.off, inv_iv[niv].hi = (int64_t)(q.off + len), inv_iv[niv].g = g;
-            niv++;
-        }
+        inv_add(inv_group(key), (int64_t)q.off, (int64_t)(q.off + len), q.start);
     }
-    uint64_t mapped = iv_union(inv_iv, niv, sizeof inv_iv[0]);   // ordena por início
-    // Por grupo: os trechos do grupo, sem repetir dentro dele (copiados para o começo de um vetor de apoio).
-    static struct { int64_t lo, hi; } tmp[INV_IV];
-    for (int g = 0; g < INV_GROUPS && inv_g[g].name[0]; g++) {
-        int k = 0;
-        for (int i = 0; i < niv; i++)
-            if (inv_iv[i].g == g) tmp[k].lo = inv_iv[i].lo, tmp[k].hi = inv_iv[i].hi, k++;
-        inv_g[g].phys = iv_union(tmp, k, sizeof tmp[0]);
-    }
-    rt_log("orbis inventário: memória direta %llu MiB, alocada %llu MiB em %d blocos (livre %llu), mapeada %llu MiB "
-           "(física, sem repetir), alocada sem mapa %llu MiB; flexível mapeada %llu MiB; %d mapas%s",
-           (unsigned long long)(total >> 20), (unsigned long long)(alloc >> 20), blocks,
-           (unsigned long long)((total - alloc) >> 20), (unsigned long long)(mapped >> 20),
-           (unsigned long long)((alloc > mapped ? alloc - mapped : 0) >> 20), (unsigned long long)(flex >> 20), nmaps,
-           niv == INV_IV ? " (trechos demais: a soma por grupo é parcial)" : "");
-    for (int g = 0; g < INV_GROUPS && inv_g[g].name[0]; g++)
+    qsort(inv_iv, (size_t)inv_n, sizeof inv_iv[0], iv_cmp);
+    uint64_t known = 0, per_all[INV_GROUPS] = {0};
+    for (int b = 0; b < nb; b++) known += inv_cover(inv_blk[b].start, inv_blk[b].end, per_all);
+    rt_log("orbis inventário: memória direta %llu MiB, alocada %llu MiB em %d blocos (livre %llu); com dono conhecido "
+           "%llu MiB, alocada sem mapa (sem dono) %llu MiB; flexível mapeada %llu MiB; %d mapas fora do jogo%s",
+           (unsigned long long)(total >> 20), (unsigned long long)(alloc >> 20), nb + more,
+           (unsigned long long)((total - alloc) >> 20), (unsigned long long)(known >> 20),
+           (unsigned long long)((alloc - known) >> 20), (unsigned long long)(flex >> 20), nmaps,
+           inv_n == INV_IV ? " (trechos demais: a conta é parcial)" : "");
+    for (int g = 0; g < INV_GROUPS; g++)
         if (inv_g[g].n)
-            rt_log("orbis inventário:   %-32s %6llu MiB físicos, %7llu MiB de endereço em %d mapas (maior %#llx+%llu MiB)",
-                   inv_g[g].name, (unsigned long long)(inv_g[g].phys >> 20), (unsigned long long)(inv_g[g].virt >> 20),
+            rt_log("orbis inventário:   %-32s %6llu MiB nos blocos, %7llu MiB de endereço em %d mapas (maior %#llx+%llu MiB)",
+                   inv_g[g].name, (unsigned long long)(per_all[g] >> 20), (unsigned long long)(inv_g[g].virt >> 20),
                    inv_g[g].n, (unsigned long long)inv_g[g].big_at, (unsigned long long)(inv_g[g].big_len >> 20));
+    if (!blocks_too) return;
+    for (int b = 0; b < nb; b++) {
+        uint64_t per[INV_GROUPS] = {0}, len = (uint64_t)(inv_blk[b].end - inv_blk[b].start);
+        uint64_t cov = inv_cover(inv_blk[b].start, inv_blk[b].end, per);
+        char line[600];
+        int k = snprintf(line, sizeof line, "orbis inventário: bloco %d %#llx+%llu MiB tipo %d:", b,
+                         (unsigned long long)inv_blk[b].start, (unsigned long long)(len >> 20), (int)inv_blk[b].type);
+        for (int g = 0; g < INV_GROUPS && k < (int)sizeof line - 80; g++)
+            if (per[g] >= (1u << 20))
+                k += snprintf(line + k, sizeof line - k, " %s %llu,", inv_g[g].name, (unsigned long long)(per[g] >> 20));
+        snprintf(line + k, sizeof line - k, " sem dono %llu MiB", (unsigned long long)((len - cov) >> 20));
+        rt_log("%s", line);
+    }
 }
 
 static int range_readable(uint64_t addr, uint64_t n) {
