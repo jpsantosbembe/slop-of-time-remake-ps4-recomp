@@ -700,7 +700,8 @@ void vk_exec_image_gone(VkImage image) {
 // the 2048-slot direct-mapped table this replaced missed 3% of them on conflicts.
 #define SHADER_SETS 2048
 #define SHADER_WAYS 4
-typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const GfxShader *s; } ShaderEnt;
+typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const GfxShader *s; uint64_t retry; } ShaderEnt;
+#define SHADER_FAIL_RETRY 600   // frames a failed lookup stays memoised (shader_for)
 static ShaderEnt shader_tab[SHADER_SETS][SHADER_WAYS];
 
 static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
@@ -908,6 +909,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     uint64_t serial = ex->prog->serial;
     answers_for(ex, st, ctl, slot_mask_of(serial, st), &a);
     ShaderEnt *set = NULL;
+    int refresh = 0;   // set[0] is an expired failure, looked up again: replaced in place
     if (serial) {
         uint64_t h = (serial * 0x9E3779B97F4A7C15ull ^ (uint64_t)st) ^ nvn_hm_hash(&a, sizeof a);   // a is zero-padded
         set = shader_tab[(h ^ h >> 29) & (SHADER_SETS - 1)];
@@ -918,6 +920,10 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                 ShaderEnt hit = *e;
                 memmove(&set[1], &set[0], w * sizeof *set);
                 set[0] = hit;
+            }
+            if (!set[0].s && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= set[0].retry) {
+                refresh = 1;   // look again
+                break;
             }
             return set[0].s;
         }
@@ -945,12 +951,14 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                    (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
         }
     }
-    // A failure is memoised as well (s NULL): it is final (known_failed / X.waits), and without the entry every draw or
-    // dispatch of the program rebuilt the request, a SHA-256 over the control section and the whole code (frente P,
-    // 2026-11-07: ~88% of the render thread on the title movie, with SHA-NI missing on the Jaguar as on this Intel).
+    // A failure is memoised as well (s NULL), for SHADER_FAIL_RETRY frames: most are final (known_failed / X.waits), but
+    // an out-of-memory one (malloc in req_init or the queue) is not, so it is looked up again now and then. Without the
+    // entry every draw or dispatch of the program rebuilt the request, a SHA-256 over the control section and the whole
+    // code (frente P, 2026-11-07: ~88% of the render thread on the title movie; no SHA-NI on the Jaguar or this Intel).
     if (set) {   // in front, the least recently used way drops out
-        memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
-        set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s};
+        if (!refresh) memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
+        set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s,
+                             .retry = s ? 0 : __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + SHADER_FAIL_RETRY};
     }
     return s;
 }
