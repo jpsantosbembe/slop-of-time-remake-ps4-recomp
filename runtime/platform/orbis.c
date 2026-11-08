@@ -1204,6 +1204,38 @@ static int32_t dmem_alloc(size_t len, size_t align, int64_t *off) {
 // Aloca e mapeia a janela que contém a, recortada na reserva, e a zera. vm_lock seguro. A CONFIRMAR NO CONSOLE: a sonda
 // só provou mapas de 2 MiB alinhados; uma janela recortada (janela do host de 1 MiB, fim da janela dos módulos) usa
 // alinhamento de 16 KiB.
+// Visões próprias da memória direta (frente N, 2026-11-08): o paginador lê a janela que sai e preenche a que volta
+// por uma segunda visão da mesma memória. Sem endereço (va = NULL), o kernel do PS4 só procura lugar numa faixa baixa e
+// limitada, a mesma que os carve-outs do malloc disputam (no console: EINVAL 0x80020016 com memória livre); então a
+// visão vai numa vaga fixa, VIEW_VA, reservada uma vez e reservada de novo depois de cada uso. Só sob vm_lock (um
+// usuário por vez). Sem a vaga, o caminho antigo.
+#define VIEW_VA 0x6e00000000ull
+#define VIEW_LEN (4ull << 20)
+static uint64_t view_va;   // 0 ainda não tentou; 1 sem vaga; senão a vaga, reservada
+
+static int view_reserve(void) {
+    void *a = (void *)(uintptr_t)VIEW_VA;
+    int32_t e = sceKernelReserveVirtualRange(&a, VIEW_LEN, K_MAP_FIXED | K_MAP_NO_OVERWRITE, 0);
+    if (!e && a == (void *)(uintptr_t)VIEW_VA) return 1;
+    if (!e) sceKernelMunmap(a, VIEW_LEN);
+    return 0;
+}
+
+static void *view_map(int64_t off, size_t len, int32_t prot, size_t align) {
+    if (!view_va) view_va = view_reserve() ? VIEW_VA : 1;
+    void *v = (void *)(uintptr_t)view_va;
+    if (view_va > 1 && len <= VIEW_LEN && !sceKernelMapDirectMemory(&v, len, prot, K_MAP_FIXED, off, align) &&
+        v == (void *)(uintptr_t)view_va)
+        return v;
+    v = NULL;
+    return sceKernelMapDirectMemory(&v, len, prot, 0, off, align) ? NULL : v;
+}
+
+static void view_unmap(void *v, size_t len) {
+    sceKernelMunmap(v, len);
+    if (view_va > 1 && v == (void *)(uintptr_t)view_va && !view_reserve()) view_va = 1;   // a vaga voltou a ser nossa?
+}
+
 // Preenche a janela ANTES de ela aparecer no endereço do jogo (frente N, 2026-11-07): a memória nova é zerada (s < 0)
 // ou recebe a vaga s do swap.bin (zl bytes) por uma visão própria, e só então entra no endereço do jogo, sem acesso da
 // CPU; quem chama aplica as proteções (apply_range) ainda com vm_lock. Antes a janela entrava com CPU RW e era zerada
@@ -1224,8 +1256,8 @@ static int map_window_fill(Resv *r, uint64_t a, int32_t s, uint32_t zl) {
                 (unsigned long long)start, len);
         return 0;
     }
-    void *v = NULL;
-    if (sceKernelMapDirectMemory(&v, len, K_PROT_CPU_R | K_PROT_CPU_W, 0, off, align)) {
+    void *v = view_map(off, len, K_PROT_CPU_R | K_PROT_CPU_W, align);
+    if (!v) {
         fprintf(stderr, "platform: visão da memória direta nova (%#zx) falhou\n", len);
         sceKernelReleaseDirectMemory(off, len);
         return 0;
@@ -1253,7 +1285,7 @@ static int map_window_fill(Resv *r, uint64_t a, int32_t s, uint32_t zl) {
         }
         r->hs[i] = 0;
     }
-    sceKernelMunmap(v, len);
+    view_unmap(v, len);
     void *va = (void *)(uintptr_t)start;
     e = sceKernelMapDirectMemory(&va, len, K_PROT_GPU, K_MAP_FIXED, off, align);
     if (e || va != (void *)(uintptr_t)start) {
@@ -1566,6 +1598,7 @@ static void census_report(void) {
 }
 
 static void mem_inventory(int blocks_too);
+static void mem_va_map(const char *why);
 static void mem_report(const char *why) {
     int64_t st = 0;
     size_t dfree = 0, ffree = 0;
@@ -1624,6 +1657,18 @@ static void *mem_monitor(void *arg) {
         int64_t st = 0;
         size_t dfree = 0;
         sceKernelAvailableDirectMemorySize(0, (int64_t)sceKernelGetDirectMemorySize(), 0x4000, &st, &dfree);
+        // O mapa de endereços: com 1 GiB do jogo mapeado, e quando a flexível cai 16 MiB abaixo da primeira leitura
+        // (o malloc saiu dos carve-outs: o overlay não achou lugar para um carve-out novo).
+        static int va_said;
+        static size_t ffree0;
+        size_t ffree = 0;
+        sceKernelAvailableFlexibleMemorySize(&ffree);
+        if (!ffree0) ffree0 = ffree ? ffree : 1;
+        int flex_low = ffree + (16u << 20) < ffree0;
+        if ((!(va_said & 1) && m > (1ull << 30)) || (!(va_said & 2) && flex_low)) {
+            va_said |= (m > (1ull << 30) ? 1 : 0) | (flex_low ? 2 : 0);
+            mem_va_map(flex_low ? "a flexível caiu: malloc fora dos carve-outs" : "jogo passou de 1 GiB");
+        }
         static int inv_full;
         int low = dfree < (64u << 20);
         if (!inv_said || m > inv_last + (512ull << 20) || m + (512ull << 20) < inv_last || (low && inv_said < 40)) {
@@ -1780,8 +1825,8 @@ static int evict_locked(Resv *r, size_t i) {
     if (off < 0 || __atomic_load_n(&r->win[i], __ATOMIC_ACQUIRE) != 1) return 0;
     if (pg_safe && (r->pgf[i] & PG_IO)) return 0;   // OCARINA_SWAP_SAFE: só o que a GPU e o kernel nunca usaram
     if (!(r->pgf[i] & PG_PROBE)) probe_locked(r, i);   // ninguém escreve enquanto copiamos: falta e espera a trava
-    void *v = NULL;
-    if (sceKernelMapDirectMemory(&v, len, K_PROT_CPU_R, 0, off, KPAGE)) {
+    void *v = view_map(off, len, K_PROT_CPU_R, KPAGE);
+    if (!v) {
         pg_fail++;
         return 0;
     }
@@ -1798,7 +1843,7 @@ static int evict_locked(Resv *r, size_t i) {
         if (ZSTD_isError(zn) || zn >= len) zn = len, src = v;   // não comprime: vai crua
         if ((s = slot_get()) < 0 || pwrite(pg_fd, src, zn, (off_t)s * (off_t)WIN) != (ssize_t)zn) {
             slot_put(s);
-            sceKernelMunmap(v, len);
+            view_unmap(v, len);
             pg_fail++;
             return 0;
         }
@@ -1809,10 +1854,10 @@ static int evict_locked(Resv *r, size_t i) {
         if (said++ < 16) rt_log("orbis: paginador: VERIFICAÇÃO: a janela %#llx mudou durante o despejo (GPU ou kernel "
                                 "escrevendo nela sem prefault); despejo cancelado", (unsigned long long)at);
         slot_put(s);
-        sceKernelMunmap(v, len);
+        view_unmap(v, len);
         return 0;
     }
-    sceKernelMunmap(v, len);
+    view_unmap(v, len);
     if (!map_placeholder(r, at)) {
         slot_put(s);
         pg_fail++;
@@ -2631,6 +2676,50 @@ static void mem_inventory(int blocks_too) {
         snprintf(line + k, sizeof line - k, " sem dono %llu MiB", (unsigned long long)((len - cov) >> 20));
         rt_log("%s", line);
     }
+}
+
+// Mapa do espaço de endereço (frente N, 2026-11-08): para achar quem ocupa a faixa onde o kernel põe os mapas sem
+// endereço. Percorre [4 GiB, módulos+) com sceKernelVirtualQuery (FIND_NEXT), junta os trechos vizinhos do mesmo dono
+// (as reservas do runtime numa linha cada) e loga os trechos de 16 MiB ou mais e os buracos livres de 64 MiB ou mais.
+static void mem_va_map(const char *why) {
+    rt_log("orbis endereços (%s): trechos >= 16 MiB e buracos livres >= 64 MiB entre 0x100000000 e 0x7100000000", why);
+    uint64_t a = 0x100000000ull, lim = 0x7100000000ull, run_lo = 0, run_hi = 0, prev_end = a;
+    char run_key[64] = "", key[64];
+    int lines = 0;
+    KVQuery q;
+    for (int n = 0; a < lim && n < 400000 && lines < 80; n++) {
+        memset(&q, 0, sizeof q);
+        if (sceKernelVirtualQuery((void *)(uintptr_t)a, 1, &q, sizeof q) || q.end <= q.start || q.end <= a) break;
+        uint64_t st = q.start, en = q.end;
+        Resv *r = resv_of(st);
+        if (r) {
+            snprintf(key, sizeof key, "reserva do runtime %#llx", (unsigned long long)r->base);
+            en = r->end > en ? r->end : en;
+        } else {
+            snprintf(key, sizeof key, "%.31s prot %#x tipo %d flags %#x", q.name[0] ? q.name : "(sem nome)", (unsigned)q.prot,
+                     (int)q.type, (unsigned)q.flags);
+        }
+        if (st >= lim) break;
+        if (run_hi && (strcmp(key, run_key) || st != run_hi)) {   // fecha o trecho anterior
+            if (run_hi - run_lo >= (16ull << 20) && lines++ < 80)
+                rt_log("orbis endereços:   %#llx..%#llx %6llu MiB  %s", (unsigned long long)run_lo, (unsigned long long)run_hi,
+                       (unsigned long long)((run_hi - run_lo) >> 20), run_key);
+            run_hi = 0;
+        }
+        if (st > prev_end && st - prev_end >= (64ull << 20) && lines++ < 80)
+            rt_log("orbis endereços:   %#llx..%#llx %6llu MiB  LIVRE", (unsigned long long)prev_end, (unsigned long long)st,
+                   (unsigned long long)((st - prev_end) >> 20));
+        if (!run_hi) run_lo = st, snprintf(run_key, sizeof run_key, "%s", key);
+        run_hi = en;
+        prev_end = en;
+        a = en;
+    }
+    if (run_hi && run_hi - run_lo >= (16ull << 20))
+        rt_log("orbis endereços:   %#llx..%#llx %6llu MiB  %s", (unsigned long long)run_lo, (unsigned long long)run_hi,
+               (unsigned long long)((run_hi - run_lo) >> 20), run_key);
+    if (prev_end < lim && lim - prev_end >= (64ull << 20))
+        rt_log("orbis endereços:   %#llx..%#llx %6llu MiB  LIVRE (até o fim da busca)", (unsigned long long)prev_end,
+               (unsigned long long)lim, (unsigned long long)((lim - prev_end) >> 20));
 }
 
 static int range_readable(uint64_t addr, uint64_t n) {

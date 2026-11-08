@@ -1,0 +1,75 @@
+--- src/orbis_mmap.cpp.antes-faixa	2026-11-08 03:24:22.343642488 -0300
++++ src/orbis_mmap.cpp	2026-11-08 03:24:22.354940696 -0300
+@@ -172,6 +172,42 @@
+   return nullptr;
+   }
+ 
++// ocarina-ps4 (frente N, 2026-11-08): uma faixa própria de endereço para os carve-outs. Sem endereço
++// (va = NULL), o kernel do PS4 só procura lugar numa faixa baixa e limitada (medido: depois do bloco do guest
++// do runtime, da arena do mesa-ps4 e dos outros, o 5o carve-out dava EINVAL 0x80020016 com 1 GB de memória
++// direta livre, e o malloc caía na flexível). A faixa é reservada no primeiro carve-out em ORBIS_MMAP_VA_BASE
++// (sceKernelReserveVirtualRange, fixo e sem sobrescrever) e cada carve-out é mapeado FIXO dentro dela, em
++// sequência (carve-outs nunca voltam). Sem a faixa (ocupada) ou cheia, o caminho antigo, sem endereço.
++#ifndef ORBIS_MMAP_VA_BASE
++#define ORBIS_MMAP_VA_BASE 0x6800000000ull
++#endif
++#ifndef ORBIS_MMAP_VA_SIZE
++#define ORBIS_MMAP_VA_SIZE (16ull << 30)
++#endif
++constexpr int32_t KMapFixed = 0x10, KMapNoOverwrite = 0x80;
++uint64_t vaNext = 0, vaEnd = 0;
++int vaState = 0;   // 0 ainda não tentou, 1 faixa reservada, -1 sem faixa
++
++void vaInitLocked() {
++  if(vaState!=0)
++    return;
++  void* a = reinterpret_cast<void*>(uintptr_t(ORBIS_MMAP_VA_BASE));
++  const int32_t e = sceKernelReserveVirtualRange(&a,size_t(ORBIS_MMAP_VA_SIZE),KMapFixed|KMapNoOverwrite,0);
++  if(e==0 && reinterpret_cast<uintptr_t>(a)==uintptr_t(ORBIS_MMAP_VA_BASE)) {
++    vaNext = ORBIS_MMAP_VA_BASE;
++    vaEnd  = ORBIS_MMAP_VA_BASE+ORBIS_MMAP_VA_SIZE;
++    vaState = 1;
++    orbis_log("mem mmap-direct: carve-outs mapped FIXED in their own range 0x%llx..0x%llx",
++              (unsigned long long)vaNext,(unsigned long long)vaEnd);
++    } else {
++    if(e==0)
++      sceKernelMunmap(a,size_t(ORBIS_MMAP_VA_SIZE));
++    vaState = -1;
++    orbis_log("mem mmap-direct: own range at 0x%llx refused (0x%08x, got %p) - carve-outs go where the kernel puts them",
++              (unsigned long long)ORBIS_MMAP_VA_BASE,unsigned(e),a);
++    }
++  }
++
+ bool addCarveLocked(uint64_t need) {
+   if(carves>=MaxCarves) {
+     orbis_log("mem mmap-direct: REFUSED %llu KiB - all %u carve-outs taken (%llu KiB held). "
+@@ -207,9 +243,26 @@
+   // WB_ONION and CPU_RW, not the 0x33 gnmallocator.cpp uses: this is CPU heap and the GPU
+   // has no business in it. Write-combined GARLIC would be correct for a surface and ruinous
+   // for a malloc arena, which is read back constantly.
+-  void*         va   = nullptr;
+-  const int32_t errM = sceKernelMapDirectMemory(&va,size_t(len),ORBIS_KERNEL_PROT_CPU_RW,0,
+-                                                phys,size_t(DirectAlign));
++  void*   va   = nullptr;
++  int32_t errM = -1;
++  vaInitLocked();
++  if(vaState==1 && vaNext+len<=vaEnd) {
++    va   = reinterpret_cast<void*>(uintptr_t(vaNext));
++    errM = sceKernelMapDirectMemory(&va,size_t(len),ORBIS_KERNEL_PROT_CPU_RW,KMapFixed,phys,size_t(DirectAlign));
++    if(errM==0 && reinterpret_cast<uintptr_t>(va)==vaNext) {
++      vaNext += len;
++      } else {
++      orbis_log("mem mmap-direct: FIXED map at 0x%llx failed 0x%08x (got %p) - trying without an address",
++                (unsigned long long)vaNext,unsigned(errM),va);
++      if(errM==0)
++        sceKernelMunmap(va,size_t(len));
++      errM = -1;
++      }
++    }
++  if(errM!=0) {
++    va   = nullptr;
++    errM = sceKernelMapDirectMemory(&va,size_t(len),ORBIS_KERNEL_PROT_CPU_RW,0,phys,size_t(DirectAlign));
++    }
+   if(errM!=0) {
+     orbis_log("mem mmap-direct: sceKernelMapDirectMemory(%llu KiB, phys 0x%llx) failed 0x%08x",
+             (unsigned long long)(len/1024),(unsigned long long)phys,unsigned(errM));
