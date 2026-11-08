@@ -1416,7 +1416,7 @@ static CPtr *c_ptr;
 static int c_nst;
 static int64_t c_live;   // estimado, todas as pilhas
 static PlatMutex c_lock = PLAT_MUTEX_INIT;
-static __thread int64_t c_left = CENSUS_SAMPLE;
+static __thread int64_t c_used;   // zero inicial: o TLS fica todo em .tbss (o carregador de dev não aceita .tdata)
 static __thread int c_in;
 
 static uint32_t cptr_slot(void *p) { return (uint32_t)(((uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull >> 47) & (CENSUS_PTRS - 1); }
@@ -1439,9 +1439,9 @@ static int census_stack(uint32_t *pc) {
 
 static void census_note(void *p, size_t n) {
     if (!p || c_in) return;
-    c_left -= (int64_t)n;
-    if (c_left > 0) return;
-    c_left = CENSUS_SAMPLE;
+    c_used += (int64_t)n;
+    if (c_used < CENSUS_SAMPLE) return;
+    c_used = 0;
     c_in = 1;
     int64_t w = n > CENSUS_SAMPLE ? (int64_t)n : (int64_t)CENSUS_SAMPLE;
     uint32_t pc[CENSUS_DEPTH] = {0};
