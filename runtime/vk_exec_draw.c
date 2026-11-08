@@ -579,9 +579,16 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     default: ok = img->type == VK_IMAGE_TYPE_2D; break;
     }
     if (!ok) return VK_NULL_HANDLE;
-    uint32_t l0 = hv && v->set_levels ? v->base_level : 0;
+    uint32_t l0 = hv && v->set_levels ? v->base_level : 0, nl;
+    if (img->lod_drop) {   // OCARINA_TEX_MIP_DROP: texture levels below the drop read the image's largest one
+        uint32_t g1 = hv && v->set_levels && v->nlevels ? l0 + v->nlevels : img->levels + img->lod_drop;
+        l0 = l0 > img->lod_drop ? l0 - img->lod_drop : 0;
+        nl = g1 > img->lod_drop ? g1 - img->lod_drop - l0 : 1;
+        if (!nl) nl = 1;
+    } else {
+        nl = hv && v->set_levels && v->nlevels ? v->nlevels : img->levels - l0;
+    }
     if (l0 >= img->levels) return VK_NULL_HANDLE;
-    uint32_t nl = hv && v->set_levels && v->nlevels ? v->nlevels : img->levels - l0;
     if (l0 + nl > img->levels) nl = img->levels - l0;
     if (storage) nl = 1;
     uint32_t y0 = 0, ny = 1;
@@ -1522,6 +1529,11 @@ typedef struct { VkImage image; uint32_t l0, l1, a0, a1; } SubRange;
 static SubRange sub_of(const VkTexImage *img, const view_t *v, int hv) {
     SubRange r = {img->image, 0, img->levels, 0, img->layers};
     if (hv && v->set_levels) r.l0 = v->base_level, r.l1 = v->base_level + (v->nlevels ? v->nlevels : img->levels);
+    if (img->lod_drop) {   // OCARINA_TEX_MIP_DROP: image levels
+        r.l0 = r.l0 > img->lod_drop ? r.l0 - img->lod_drop : 0;
+        r.l1 = r.l1 > img->lod_drop ? r.l1 - img->lod_drop : 1;
+        if (r.l1 <= r.l0) r.l1 = r.l0 + 1;
+    }
     if (hv && v->set_layers) r.a0 = v->min_layer, r.a1 = v->min_layer + (v->nlayers ? v->nlayers : img->layers);
     return r;
 }
@@ -1946,8 +1958,9 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
 }
 
 static void support_in(const VkExec *ex, float in[3]) {   // what support_fill reads: viewport size, point size
-    in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] : (float)ex->pass_w;
-    in[1] = ex->in_pass && ex->has_vp ? ex->vp[0][3] : (float)ex->pass_h;
+    float k = ex->in_pass && ex->has_vp && ex->pass_div > 1 ? (float)ex->pass_div : 1.0f;   // OCARINA_DEPTH_SCALE
+    in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] / k : (float)ex->pass_w;
+    in[1] = ex->in_pass && ex->has_vp ? ex->vp[0][3] / k : (float)ex->pass_h;
     in[2] = ex->point_size > 0 ? ex->point_size : 1.0f;
 }
 
@@ -2554,6 +2567,10 @@ static void record_fixed(VkExec *ex) {
     if (ex->dirty & VK_EXEC_DIRTY_VIEWPORT) {
         float x = 0, y = 0, w = (float)ex->pass_w, h = (float)ex->pass_h;
         if (ex->has_vp) x = ex->vp[0][0], y = ex->vp[0][1], w = ex->vp[0][2], h = ex->vp[0][3];
+        if (ex->has_vp && ex->pass_div > 1) {   // OCARINA_DEPTH_SCALE: the target is that much smaller
+            float k = (float)ex->pass_div;
+            x /= k, y /= k, w /= k, h /= k;
+        }
         if (w < 1) w = 1;
         if (h < 1) h = 1;
         VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height

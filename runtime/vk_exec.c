@@ -274,8 +274,9 @@ static int bc_target(const tex_t *t, const view_t *v, int has_v, const VkTexImag
         return 0;
     VkFormat fmt;
     BcStandIn s;
-    uint32_t level = has_v && v->set_levels ? v->base_level : 0;
-    if (level >= img->levels) {
+    int have_level;
+    uint32_t level = vk_tex_level(img, has_v && v->set_levels ? v->base_level : 0, &have_level);
+    if (!have_level || level >= img->levels) {
         warn_once(W_LEVEL, "render target level %u of a %u-level texture: left out", level, img->levels);
         return 1;
     }
@@ -315,8 +316,9 @@ static void resolve_target(const tex_t *t, const view_t *v, int has_v, int depth
                   t->d.format, t->d.target, t->d.width, t->d.height);
         return;
     }
-    uint32_t level = has_v && v->set_levels ? v->base_level : 0;
-    if (level >= img->levels) {
+    int have_level;
+    uint32_t level = vk_tex_level(img, has_v && v->set_levels ? v->base_level : 0, &have_level);
+    if (!have_level || level >= img->levels) {
         warn_once(W_LEVEL, "render target level %u of a %u-level texture: left out", level, img->levels);
         return;
     }
@@ -421,6 +423,25 @@ static void resolve_rt(VkExec *ex) {
             logged++, rt_log("vk_exec: pass without attachments %ux%u for viewport %g,%g %gx%g", w, h, ex->vp[0][0],
                              ex->vp[0][1], ex->vp[0][2], ex->vp[0][3]);
     }
+    // OCARINA_DEPTH_SCALE: the attachments' common scale (vk_texture.c depth_div)
+    uint32_t div = 0;
+    int mixed = 0;
+    for (int i = 0; i < 9; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : d;
+        if (!t->image) continue;
+        uint32_t k = t->img && t->img->rt_div > 1 ? t->img->rt_div : 1;
+        if (!div) div = k;
+        else if (k != div) mixed = 1;
+    }
+    if (!div) div = 1;
+    if (mixed) {
+        static int n_mixed;
+        if (n_mixed++ < 4)
+            rt_log("vk_exec: a pass mixes targets made at different scales (OCARINA_DEPTH_SCALE): drawn at full scale");
+        div = 1;
+    }
+    if (div != (ex->pass_div ? ex->pass_div : 1)) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
+    ex->pass_div = div;
     ex->pass_w = w, ex->pass_h = h, ex->pass_layers = layers;
     ex->pass_ncolor = (uint32_t)n;
     ex->pass_samples = samples ? samples : 1;
@@ -733,6 +754,11 @@ VkRect2D vk_exec_scissor(const VkExec *ex) {
     if (!ex->has_scissor) return (VkRect2D){{0, 0}, {(uint32_t)w, (uint32_t)h}};
     int64_t x0 = ex->scissor.x, y0 = ex->scissor.y;
     int64_t x1 = x0 + ex->scissor.w, y1 = y0 + ex->scissor.h;
+    if (ex->pass_div > 1) {   // OCARINA_DEPTH_SCALE
+        int64_t k = ex->pass_div;
+        x0 = x0 >= 0 ? x0 / k : -((-x0 + k - 1) / k), y0 = y0 >= 0 ? y0 / k : -((-y0 + k - 1) / k);
+        x1 = x1 >= 0 ? (x1 + k - 1) / k : -(-x1 / k), y1 = y1 >= 0 ? (y1 + k - 1) / k : -(-y1 / k);
+    }
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > w) x1 = w;

@@ -107,6 +107,9 @@ typedef struct VkExec {
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
+    // Frente O (OCARINA_DEPTH_SCALE): the open pass draws into targets made at 1/pass_div of their size; viewports,
+    // scissors and the support buffer's viewport size are divided by it (0, 1: full size).
+    uint32_t pass_div;
 } VkExec;
 
 typedef void (*VkExecWorkFn)(VkExec *ex, void *context);
