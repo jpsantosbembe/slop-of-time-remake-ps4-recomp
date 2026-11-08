@@ -240,7 +240,14 @@ static void cache_path_init(void) {
     char *cut = plat_last_sep(exe);
     if (!cut) return;
     *cut = 0;
+#ifdef __ORBIS__
+    // Um arquivo por build do RADV ligado, como o mesa-cache (vk_device.c): o pipelineCacheUUID do mesa-ps4 não muda
+    // entre builds (radv-build-id fixo), então o cabeçalho não barra o cache de outro build.
+    extern const char ocarina_mesa_id[];
+    snprintf(P.cache_path, sizeof P.cache_path, "%s/pipeline-cache-%s.bin", exe, ocarina_mesa_id);
+#else
     snprintf(P.cache_path, sizeof P.cache_path, "%s/pipeline-cache.bin", exe);
+#endif
 }
 
 // Cache data whose header names another device or driver is dropped before Vulkan sees it.
