@@ -276,7 +276,15 @@ static int alloc_physical(VkCtx *c, PoolRec *r) {
 int vk_fix_zero(void) {
     static int on = -1;
     if (on < 0) {
+#ifdef __ORBIS__
+        // PS4: ligado por padrão. A arena de memória da GPU reaproveita físico sem zerar (no Linux o driver entrega
+        // páginas zeradas), e o lixo de uma imagem nova vira NaN nos volumes temporais da névoa volumétrica, que apagava
+        // a cena 3D inteira (Deku Tree, 2026-11-08: TOTK_DUMP mostrou o volume 100% NaN). TOTK_FIX_ZERO=0 desliga.
+        const char *v = cfg_get("TOTK_FIX_ZERO");
+        on = v && *v ? cfg_bool("TOTK_FIX_ZERO") : 1;
+#else
         on = cfg_bool("TOTK_FIX_ZERO");
+#endif
     }
     return on;
 }
