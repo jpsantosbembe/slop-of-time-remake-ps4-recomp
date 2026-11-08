@@ -64,7 +64,7 @@ extern int orbis_lazy_stack_span(uint64_t a, uint64_t *end) __attribute__((weak)
 #define PROF_DEPTH 24        // quadros por cadeia, a rip primeiro
 #define STK_COPY (8u << 10)  // bytes de pilha copiados por amostra (como o tratador de falta: candidatos a retorno)
 #define STALL_NS 2000000ull  // um sinal atendido depois disto vira tstall
-#define DEAD_NS 200000000ull // a primeira amostra de uma thread que não chega nisto: o sinal não chega a ela
+#define LATE_NS 200000000ull // a primeira amostra de uma thread que não chega nisto vai para o log (uma vez)
 #define RING_N 4096u         // TOTK_PROFILE_SLOW: ~1,3 s de três threads a 1 kHz
 #define STALL_N 512u
 #define SLOW_DUMPS 64
@@ -76,6 +76,7 @@ extern int orbis_lazy_stack_span(uint64_t a, uint64_t *end) __attribute__((weak)
 // recalibrado aqui). Palavras do mcontext do FreeBSD amd64:
 #define MC_RIP 20
 #define MC_CS 21
+#define MC_RFLAGS 22
 #define MC_RSP 23
 #define MC_SS 24
 
@@ -110,7 +111,8 @@ typedef struct {
     // só a thread prof
     uint32_t taken;      // último gen recolhido
     uint32_t seen_tid;   // a thread do papel na última volta (trocou: recomeça)
-    int answered, dead;  // já respondeu alguma vez; desistiu dela
+    int answered, dead;  // já respondeu alguma vez; desistiu dela (pthread_kill falhou)
+    int warned;          // o primeiro pedido atrasou e isso foi para o log
     uint64_t n, in_exe;  // amostras recolhidas e quantas com a rip no executável
 } Target;
 
@@ -162,12 +164,16 @@ static void prof_handler(int sig, siginfo_t *si, void *ucv) {
     (void)sig, (void)si;
     int saved = errno;
     const uint64_t *uc = ucv;
-    if (calibrating && mc < 0) {   // a primeira vez, na própria thread prof: acha o mcontext pelo par cs/ss
-        for (int i = 0; i < 64; i++)
-            if (uc[i + MC_CS] == 0x43 && uc[i + MC_SS] == 0x3b) {
+    if (calibrating && mc < 0) {   // a prova, na thread que chamou prof_sampler_start: acha o mcontext pelo par cs/ss
+        // (com rflags plausível: IF e o bit 1 ligados), primeiro em uc[8], onde o orbis-compat o mediu
+        for (int k = 0; k < 64; k++) {
+            int i = k == 0 ? 8 : k == 8 ? 0 : k;
+            if (uc[i + MC_CS] == 0x43 && uc[i + MC_SS] == 0x3b && (uc[i + MC_RFLAGS] & 0x202) == 0x202 &&
+                uc[i + MC_RFLAGS] < 0x100000) {
                 mc = i;
                 break;
             }
+        }
     }
     int m = mc;
     pthread_t self = pthread_self();
@@ -415,18 +421,19 @@ static void sampler_main(void *arg) {
             if (t->tid != t->seen_tid) {   // outra thread no papel: o pedido pendente era da anterior e não volta
                 t->seen_tid = t->tid;
                 t->taken = t->gen;
-                t->answered = t->dead = 0;
+                t->answered = t->dead = t->warned = 0;
             }
             if (t->dead) continue;
             int dup = 0;   // dois papéis na mesma thread: um sinal só
             for (int j = 0; j < i; j++)
                 if (want[j] && tg[j].have && !tg[j].dead && tg[j].tid == t->tid) dup = 1;
             if (dup) continue;
-            if (t->taken != t->gen) {   // o pedido anterior ainda não foi atendido
-                if (!t->answered && now - t->sent_ns > DEAD_NS) {
-                    t->dead = 1;
-                    rt_log("prof: o sinal %d não chega à thread %s (tid %u) em %.0f ms; deixo de amostrá-la", sig_no,
-                           role_name[i], t->tid, (now - t->sent_ns) / 1e6);
+            if (t->taken != t->gen) {   // o pedido anterior ainda não foi atendido: continua esperando, sem desistir
+                // (uma espera longa no kernel é justamente o que se procura; quando o sinal chegar vira tstall)
+                if (!t->answered && !t->warned && now - t->sent_ns > LATE_NS) {
+                    t->warned = 1;
+                    rt_log("prof: a thread %s (tid %u) ainda não atendeu o primeiro sinal %d (%.0f ms); se nunca atender, "
+                           "o sinal não chega a ela", role_name[i], t->tid, sig_no, (now - t->sent_ns) / 1e6);
                 }
                 continue;
             }
