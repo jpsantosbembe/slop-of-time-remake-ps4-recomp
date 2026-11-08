@@ -1522,7 +1522,18 @@ static void census_forget(void *p) {
     }
 }
 
+// Pedido de 64 MiB ou mais: o chamador exato (endereço de retorno do embrulho), sem depender da varredura de pilha do
+// censo. Pedidos de 256 e 512 MiB esgotaram os carve-outs do malloc (2026-11-08) e a pilha varrida apontava lixo.
+static void big_note(size_t n, void *ra, const char *fn) {
+    if (n < (64u << 20) || c_in) return;
+    c_in = 1;
+    rt_log("orbis malloc: %s de %zu MiB, chamado de totk+%llx", fn, n >> 20,
+           (unsigned long long)((uintptr_t)ra - (uintptr_t)__text_start));
+    c_in = 0;
+}
+
 void *__wrap_malloc(size_t n) {
+    big_note(n, __builtin_return_address(0), "malloc");
     void *p = __real_malloc(n);
     if (census_on) census_note(p, n);
     return p;
@@ -1532,27 +1543,32 @@ void __wrap_free(void *p) {
     __real_free(p);
 }
 void *__wrap_calloc(size_t a, size_t b) {
+    big_note(a * b, __builtin_return_address(0), "calloc");
     void *p = __real_calloc(a, b);
     if (census_on) census_note(p, a * b);
     return p;
 }
 void *__wrap_realloc(void *p, size_t n) {
+    big_note(n, __builtin_return_address(0), "realloc");
     if (census_on) census_forget(p);
     void *q = __real_realloc(p, n);
     if (census_on) census_note(q, n);
     return q;
 }
 void *__wrap_aligned_alloc(size_t al, size_t n) {
+    big_note(n, __builtin_return_address(0), "aligned_alloc");
     void *p = __real_aligned_alloc(al, n);
     if (census_on) census_note(p, n);
     return p;
 }
 int __wrap_posix_memalign(void **out, size_t al, size_t n) {
+    big_note(n, __builtin_return_address(0), "posix_memalign");
     int r = __real_posix_memalign(out, al, n);
     if (census_on && !r) census_note(*out, n);
     return r;
 }
 void *__wrap_memalign(size_t al, size_t n) {
+    big_note(n, __builtin_return_address(0), "memalign");
     void *p = __real_memalign(al, n);
     if (census_on) census_note(p, n);
     return p;
