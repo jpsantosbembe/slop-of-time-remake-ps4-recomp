@@ -4013,7 +4013,27 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                                   .srcOffsets = {{0, 0, 0}, {(int32_t)movie_rgb->width, (int32_t)movie_rgb->height, 1}},
                                   .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                   .dstOffsets = {{0, 0, 0}, {(int32_t)written->width, (int32_t)written->height, 1}}};
-                vkCmdBlitImage(ex->cb, movie_rgb->image, VK_IMAGE_LAYOUT_GENERAL, written->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+                // ocarina-ps4: o quadro do filme (rgba8 UNORM) já vem codificado em sRGB e a imagem da janela é rgba8 SRGB;
+                // o blit reaplicaria a curva sRGB (imagem lavada, clara demais). Com o mesmo tamanho e formatos da mesma
+                // classe, copia os bytes; senão fica o blit (com o gamma dobrado).
+                int same = movie_rgb->width == written->width && movie_rgb->height == written->height;
+                int f1 = (int)movie_rgb->format, f2 = (int)written->format;
+                int rgba8 = (f1 == VK_FORMAT_R8G8B8A8_UNORM || f1 == VK_FORMAT_R8G8B8A8_SRGB) &&
+                            (f2 == VK_FORMAT_R8G8B8A8_UNORM || f2 == VK_FORMAT_R8G8B8A8_SRGB);
+                static int said;
+                if (!said) {
+                    said = 1;
+                    rt_log("vk: filme sem a rede de upscale: %ux%u formato %d -> %ux%u formato %d por %s", movie_rgb->width,
+                           movie_rgb->height, f1, written->width, written->height, f2,
+                           same && rgba8 ? "cópia de bytes" : "blit (gamma dobrado se o destino for sRGB)");
+                }
+                if (same && rgba8) {
+                    VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                      .extent = {movie_rgb->width, movie_rgb->height, 1}};
+                    vkCmdCopyImage(ex->cb, movie_rgb->image, VK_IMAGE_LAYOUT_GENERAL, written->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+                } else
+                    vkCmdBlitImage(ex->cb, movie_rgb->image, VK_IMAGE_LAYOUT_GENERAL, written->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
                 ex->recorded++;
                 vk_exec_barrier(ex);
             }
