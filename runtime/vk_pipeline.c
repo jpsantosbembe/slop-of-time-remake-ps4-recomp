@@ -1190,13 +1190,30 @@ static uint32_t *spv_override(const uint32_t *w, uint64_t words, uint64_t *out_w
 // console: a material's min(0 * (1 / 0), 1) came out NaN on NVIDIA and left the world black. A copy of the module, or NULL
 // when nothing changes. ponytail: not compute shaders, so their big upscaler stays in the driver's cache; add them if a
 // compute pass shows NaN.
+// ocarina-ps4 (2026-11-08): OCARINA_NAN_MINMAX_CS (padrão 1 no PS4, 0 no resto) estende a troca aos compute shaders. Na GCN
+// (RADV/ACO), FMax/FMin com NaN deixam o NaN passar; a névoa volumétrica da Deku Tree (compute de 115 mil palavras) saneava
+// 0/0 e log2(0) com max(x, -1022) e gravava NaN em ~16% dos froxels, que viravam blocos pretos (frente OpenCode, análise
+// do SPIR-V; no Linux/NVIDIA o mesmo shader sai limpo).
+static int nan_minmax_cs(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OCARINA_NAN_MINMAX_CS");
+#ifdef __ORBIS__
+        on = e && *e ? atoi(e) != 0 : 1;
+#else
+        on = e && *e ? atoi(e) != 0 : 0;
+#endif
+    }
+    return on;
+}
+
 static uint32_t *spirv_nan_minmax(const uint32_t *w, uint64_t n) {
     uint32_t glsl = 0;
     uint32_t *o = NULL;
     for (uint64_t i = 5; i < n && w[i] >> 16;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (i + len > n) break;
-        if (op == 15 && w[i + 1] == 5) {   // OpEntryPoint GLCompute
+        if (op == 15 && w[i + 1] == 5 && !nan_minmax_cs()) {   // OpEntryPoint GLCompute
             free(o);
             return NULL;
         }
