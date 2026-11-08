@@ -82,6 +82,12 @@ static void cmd_reserve(cmd_t *o, size_t need) {
     size_t cap = o->seg ? (size_t)(o->end - o->seg) : 0;
     if (!cap) cap = 64 << 10;
     while (used + need + OP_RESERVE > cap) cap *= 2;
+    // ocarina-ps4 (2026-11-08): uma gravação chegou a pedir 512 MiB no PS4 (o11, o25) e esgotou a memória. Cada dobra a
+    // partir de 16 MiB vai para o log com o que dá para identificar o buffer e o padrão de uso.
+    if (cap >= (16u << 20))
+        rt_log("nvn: command buffer %p cresce para %zu MiB (usados %zu MiB, pedidos %zu bytes; gravando %d, cmd_used %llu, "
+               "rec_start %llu, ctl_used %llu)", (void *)o, cap >> 20, used >> 20, need, o->recording,
+               (unsigned long long)o->cmd_used, (unsigned long long)o->rec_start, (unsigned long long)o->ctl_used);
     uint8_t *b = realloc(o->seg, cap);
     // A block this size fails only without commit (the fatal report states it) or when seg is no block of ours: a
     // command buffer object the game overwrote or copied shows a wrong magic or more used than its old size.
