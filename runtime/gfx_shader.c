@@ -334,7 +334,7 @@ static void init_paths(void *param) {
     else if (root[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s/build/xlate/totk_xlate" PLAT_EXE_SUFFIX, root);
 #ifdef __ORBIS__
     // ocarina-ps4: o PS4 não roda o tradutor, mas a identidade dele entra nas chaves do cache: o totk_xlate.id do PC
-    // (build/xlate/totk_xlate.id) vai para /data/ocarina, ao lado do eboot "virtual" (plat_exe_path), e é lido por
+    // (build/xlate/totk_xlate.id) vai para a pasta de dados, ao lado do eboot "virtual" (plat_exe_path), e é lido por
     // xlate_identity como no PC. O tradutor em si nunca existe ali, então nenhum processo é aberto (xlate_absent).
     else if (exe_dir[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s/totk_xlate", exe_dir);
 #endif

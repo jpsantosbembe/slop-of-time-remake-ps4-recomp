@@ -779,15 +779,37 @@ void plat_cond_broadcast(PlatCond *c) {
 
 // ---- caminhos. O processo não tem diretório de trabalho (getcwd dá ENOSYS e um open relativo dá EINVAL:
 // orbis-compat orbis_paths.h). Os dados do app estão em /app0 (somente leitura); o que o runtime grava vai para
-// /data/ocarina, que também ancora os caminhos relativos.
-#define ORBIS_DATA_DIR "/data/ocarina"
+// a pasta de dados do jogo, que também ancora os caminhos relativos. Nada do jogo fixo aqui: a pasta é
+// /data/slop/<title id do Switch> (docs/frente-G.md do ocarina-ps4). O carregador de dev passa no argv[0] o caminho do
+// ELF que carregou (<pasta>/game.elf), e a pasta é a dele; sem carregador (o runtime como eboot.bin, argv[0] relativo)
+// vale rt_orbis_data_dir, gerado pelo tools/build_game.py a partir do Program ID do main.npdm do build.
+extern const char rt_orbis_data_dir[];
+static char g_data_dir[256];
 
-// ---- argumentos: o PS4 não passa linha de comando a um app. orbis_boot_args lê ORBIS_DATA_DIR/args.txt (uma entrada
+static void orbis_data_dir_init(const char *argv0) {
+    const char *slash = argv0 && !strncmp(argv0, "/data/", 6) ? strrchr(argv0, '/') : NULL;
+    size_t n = slash ? (size_t)(slash - argv0) : 0;
+    if (n > 6 && n < sizeof g_data_dir) {
+        memcpy(g_data_dir, argv0, n);
+        g_data_dir[n] = 0;
+    } else {
+        snprintf(g_data_dir, sizeof g_data_dir, "%s", rt_orbis_data_dir);
+    }
+}
+
+const char *orbis_data_dir(void) {
+    if (!g_data_dir[0]) orbis_data_dir_init(NULL);
+    return g_data_dir;
+}
+
+// ---- argumentos: o PS4 não passa linha de comando a um app. orbis_boot_args lê <pasta de dados>/args.txt (uma entrada
 // por linha; vazias e as começadas por # são ignoradas): NOME=valor vira variável de ambiente (setenv, valendo para o
 // cfg_get, o TOTK_* e os knobs do Mesa, todos neste executável), e o resto vira argumentos, separados por espaço
 // ("--probe-orbis", "--seconds 30"). main.c chama isto antes de tudo, antes do mem_init. Sem o arquivo, nada muda.
 int orbis_boot_args(int *argc, char ***argv) {
-    FILE *f = fopen(ORBIS_DATA_DIR "/args.txt", "r");
+    char path[300];
+    snprintf(path, sizeof path, "%s/args.txt", orbis_data_dir());
+    FILE *f = fopen(path, "r");
     if (!f) return 0;
     enum { MAX_ARGS = 64 };
     static char *av[MAX_ARGS + 1];
@@ -816,7 +838,7 @@ int orbis_boot_args(int *argc, char ***argv) {
 
 int plat_full_path(const char *path, char *out, size_t cap) {
     if (path[0] == '/') return snprintf(out, cap, "%s", path) < (int)cap;
-    return snprintf(out, cap, "%s/%s", ORBIS_DATA_DIR, path) < (int)cap;
+    return snprintf(out, cap, "%s/%s", orbis_data_dir(), path) < (int)cap;
 }
 
 // ---- arquivos. POSIX: open, pread e afins vão direto à libkernel; as constantes O_* do SDK já são as do FreeBSD.
@@ -911,7 +933,7 @@ static void sync_dir_of(const char *path) {
     char *slash = strrchr(dir, '/');
     if (slash == dir) slash[1] = 0;
     else if (slash) *slash = 0;
-    else snprintf(dir, sizeof dir, "%s", ORBIS_DATA_DIR);
+    else snprintf(dir, sizeof dir, "%s", orbis_data_dir());
     int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd >= 0) {
         fsync(fd);
@@ -1884,7 +1906,7 @@ int plat_fs_rmdir(const char *path) {
 int plat_fs_unlink(const char *path) { return unlink(path) ? fs_err(errno) : PLAT_FS_OK; }
 
 // Sem renameat2(RENAME_NOREPLACE) no FreeBSD: confere antes. Outro processo poderia correr entre a conferência e o
-// rename, mas no console só este processo mexe em /data/ocarina.
+// rename, mas no console só este processo mexe na pasta de dados.
 int plat_fs_rename(const char *from, const char *to, int durable) {
     if (plat_fs_kind(to) != PLAT_FS_MISSING) return PLAT_FS_EXISTS;
     if (rename(from, to)) return fs_err(errno);
@@ -1962,22 +1984,24 @@ int plat_file_set_size(PlatFile *f, uint64_t size) { return ftruncate(fd_of(f), 
 
 int plat_file_fsync(PlatFile *f) { return fsync(fd_of(f)) == 0; }
 
-// Temporários em /data/ocarina/tmp (criado na primeira chamada): /tmp não é gravável para um app do PS4.
+// Temporários em <pasta de dados>/tmp (criado na primeira chamada): /tmp não é gravável para um app do PS4.
 int plat_temp_dir(char *out, size_t cap) {
     static int made;
+    char dir[300];
+    snprintf(dir, sizeof dir, "%s/tmp", orbis_data_dir());
     if (!made) {
-        plat_file_mkdir_p(ORBIS_DATA_DIR "/tmp");
+        plat_file_mkdir_p(dir);
         made = 1;
     }
-    return snprintf(out, cap, "%s", ORBIS_DATA_DIR "/tmp") < (int)cap;
+    return snprintf(out, cap, "%s", dir) < (int)cap;
 }
 
 // O executável é /app0/eboot.bin, mas /app0 é somente leitura e o PKG só leva o eboot. O runtime usa plat_exe_path
 // apenas para achar a pasta "ao lado do executável" (totk.ini, shader-cache, pipeline-cache.bin, romfs-index.bin,
-// romfs-patches, exefs/romfs/profile portáteis, mesa-cache, logs): no PS4 essa pasta é /data/ocarina, então o caminho
+// romfs-patches, exefs/romfs/profile portáteis, mesa-cache, logs): no PS4 essa pasta é a de dados (orbis_data_dir), então o caminho
 // devolvido é o de um eboot.bin que estaria lá. Ninguém lê o arquivo em si (plat_exe_base e plat_module_of não usam
 // isto). A alternativa seria um TOTK_* por caminho no args.txt.
-int plat_exe_path(char *out, size_t cap) { return snprintf(out, cap, ORBIS_DATA_DIR "/eboot.bin") < (int)cap; }
+int plat_exe_path(char *out, size_t cap) { return snprintf(out, cap, "%s/eboot.bin", orbis_data_dir()) < (int)cap; }
 
 // Sem dladdr: o início do .text pelo símbolo do script de ligação.
 uintptr_t plat_exe_base(void) { return (uintptr_t)__text_start; }
@@ -2047,7 +2071,7 @@ void plat_exit(int code) { orbis_idle_exit(code); }
 // O main do runtime (main.c, renomeado para rt_main no PS4) volta por vários caminhos; aqui ele nunca retorna.
 int rt_main(int argc, char **argv);
 // O stderr do processo (o do runtime antes do log abrir, o do Mesa, com o dump de GPU travada) não vai a lugar nenhum no
-// PS4: vira /data/ocarina/logs/stderr.log, um por execução.
+// PS4: vira <pasta de dados>/logs/stderr.log, um por execução.
 // O log do overlay orbis-compat (recusas do alocador de memória direta, falhas do pool de threads) vai para o totk.log.
 extern void orbis_set_log(void (*fn)(const char *fmt, va_list ap));
 static void overlay_log(const char *fmt, va_list ap) {
@@ -2058,9 +2082,13 @@ static void overlay_log(const char *fmt, va_list ap) {
 
 int main(int argc, char **argv) {
     orbis_set_log(overlay_log);
-    mkdir(ORBIS_DATA_DIR, 0755);
-    mkdir(ORBIS_DATA_DIR "/logs", 0755);
-    int fd = open(ORBIS_DATA_DIR "/logs/stderr.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    orbis_data_dir_init(argc > 0 ? argv[0] : NULL);   // antes de tudo: args.txt, stderr e log moram nela
+    char path[300];
+    plat_file_mkdir_p(orbis_data_dir());   // /data/slop/<title id>: a raiz /data/slop pode não existir ainda
+    snprintf(path, sizeof path, "%s/logs", orbis_data_dir());
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, "%s/logs/stderr.log", orbis_data_dir());
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         dup2(fd, 2);
         close(fd);
