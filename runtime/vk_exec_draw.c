@@ -4013,25 +4013,60 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                                   .srcOffsets = {{0, 0, 0}, {(int32_t)movie_rgb->width, (int32_t)movie_rgb->height, 1}},
                                   .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                   .dstOffsets = {{0, 0, 0}, {(int32_t)written->width, (int32_t)written->height, 1}}};
-                // ocarina-ps4: o quadro do filme (rgba8 UNORM) já vem codificado em sRGB e a imagem da janela é rgba8 SRGB;
-                // o blit reaplicaria a curva sRGB (imagem lavada, clara demais). Com o mesmo tamanho e formatos da mesma
-                // classe, copia os bytes; senão fica o blit (com o gamma dobrado).
-                int same = movie_rgb->width == written->width && movie_rgb->height == written->height;
+                // ocarina-ps4: o quadro do filme (rgba8 UNORM) já vem codificado em sRGB e a imagem da janela é rgba8 SRGB
+                // (2560x1440 no título); o blit direto reaplicaria a curva sRGB (imagem lavada, clara demais). Os bytes do
+                // quadro vão para uma imagem SRGB do mesmo tamanho (cópia, sem conversão) e o blit sai SRGB -> SRGB.
+                static VkImage srgb_img;
+                static VmaAllocation srgb_alloc;
+                static uint32_t srgb_w, srgb_h;
+                static int srgb_bad, srgb_new;
                 int f1 = (int)movie_rgb->format, f2 = (int)written->format;
-                int rgba8 = (f1 == VK_FORMAT_R8G8B8A8_UNORM || f1 == VK_FORMAT_R8G8B8A8_SRGB) &&
-                            (f2 == VK_FORMAT_R8G8B8A8_UNORM || f2 == VK_FORMAT_R8G8B8A8_SRGB);
+                int fix = f1 == VK_FORMAT_R8G8B8A8_UNORM && f2 == VK_FORMAT_R8G8B8A8_SRGB && !srgb_bad;
+                if (fix && (srgb_w != movie_rgb->width || srgb_h != movie_rgb->height)) {
+                    VkCtx *c = vk_ctx();
+                    if (srgb_img) vmaDestroyImage(c->vma, srgb_img, srgb_alloc), srgb_img = VK_NULL_HANDLE;
+                    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                            .format = VK_FORMAT_R8G8B8A8_SRGB,
+                                            .extent = {movie_rgb->width, movie_rgb->height, 1}, .mipLevels = 1,
+                                            .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+                    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+                    if (vmaCreateImage(c->vma, &ci, &ai, &srgb_img, &srgb_alloc, NULL) != VK_SUCCESS) {
+                        srgb_bad = 1, fix = 0, srgb_img = VK_NULL_HANDLE;
+                        rt_log("vk: filme: imagem sRGB intermediária não foi criada; fica o blit com o gamma dobrado");
+                    } else
+                        srgb_w = movie_rgb->width, srgb_h = movie_rgb->height, srgb_new = 1;
+                }
                 static int said;
                 if (!said) {
                     said = 1;
                     rt_log("vk: filme sem a rede de upscale: %ux%u formato %d -> %ux%u formato %d por %s", movie_rgb->width,
                            movie_rgb->height, f1, written->width, written->height, f2,
-                           same && rgba8 ? "cópia de bytes" : "blit (gamma dobrado se o destino for sRGB)");
+                           fix ? "cópia para sRGB + blit sRGB" : "blit direto");
                 }
-                if (same && rgba8) {
+                if (fix) {
+                    if (srgb_new) {
+                        srgb_new = 0;
+                        VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                                    .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+                                                    .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                    .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = srgb_img,
+                                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                                               .pImageMemoryBarriers = &ib};
+                        vkCmdPipelineBarrier2(ex->cb, &di);
+                    }
                     VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                       .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                       .extent = {movie_rgb->width, movie_rgb->height, 1}};
-                    vkCmdCopyImage(ex->cb, movie_rgb->image, VK_IMAGE_LAYOUT_GENERAL, written->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+                    vkCmdCopyImage(ex->cb, movie_rgb->image, VK_IMAGE_LAYOUT_GENERAL, srgb_img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+                    vk_exec_barrier(ex);
+                    vkCmdBlitImage(ex->cb, srgb_img, VK_IMAGE_LAYOUT_GENERAL, written->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
                 } else
                     vkCmdBlitImage(ex->cb, movie_rgb->image, VK_IMAGE_LAYOUT_GENERAL, written->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
                 ex->recorded++;
