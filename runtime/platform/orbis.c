@@ -1433,11 +1433,15 @@ static int lazy_fault(uint64_t a) {
         // Janela real sem sonda: ou a falta é de verdade (write-watch, gancho, crash), ou é velha: entre a falta e
         // este tratador, outra thread mapeou, trouxe da troca ou tirou a sonda da janela (console, 2026-11-07: leitura
         // do TLR em 0x7010000110 caiu assim). Página liberada para leitura e escrita agora: só pode ser velha, repete.
-        // Só leitura: repete até 2 vezes no mesmo endereço (pode ser uma escrita vigiada, que segue para o
-        // write-watch na terceira); sem acesso: falta de verdade.
-        static __thread uint64_t last;
+        // Só leitura: repete até 2 vezes seguidas no mesmo endereço (pode ser uma escrita vigiada, que segue para o
+        // write-watch na terceira); sem acesso: falta de verdade. "Seguidas" = a menos de 1 ms uma da outra: um laço
+        // quente que lê o mesmo endereço só de leitura (nn::os::YieldThread no RELRO do sdk, console 2026-11-07)
+        // pega uma falta velha a cada passada da sonda e não pode acumular até cair.
+        static __thread uint64_t last, last_ns;
         static __thread int n;
-        if (a != last) last = a, n = 0;
+        uint64_t now = plat_now_ns();
+        if (a != last || now - last_ns > 1000000) n = 0;
+        last = a, last_ns = now;
         int32_t p = page_kprot(r, down(a, KPAGE));
         if (((p & K_PROT_CPU_W) && n < 8) || ((p & K_PROT_CPU_R) && n < 2)) {
             n++;
@@ -1625,7 +1629,8 @@ static void pg_probe_pass_locked(void) {
         if (!r->pgf || !r->woff) continue;
         for (size_t i = 0, n = win_count(r); i < n; i++)
             if (r->woff[i] >= 0 && !(r->pgf[i] & PG_PROBE) && __atomic_load_n(&r->win[i], __ATOMIC_ACQUIRE) == 1 &&
-                (uint32_t)(pg_tick - __atomic_load_n(&r->gt[i], __ATOMIC_RELAXED)) >= PG_IO_TICKS)
+                (uint32_t)(pg_tick - __atomic_load_n(&r->gt[i], __ATOMIC_RELAXED)) >= PG_IO_TICKS &&
+                (uint32_t)(pg_tick - r->pt[i]) >= PG_COLD_TICKS)
                 probe_locked(r, i);
     }
 }
@@ -1670,6 +1675,7 @@ static int touch_locked(Resv *r, uint64_t a, int *fresh) {
     if (st == 1) {
         if (r->pgf && (r->pgf[i] & PG_PROBE)) {
             r->pgf[i] &= (uint8_t)~PG_PROBE;
+            r->pt[i] = pg_tick;   // a sonda volta só depois de 2 s (pg_probe_pass_locked)
             apply_range(r, at, end);
             pg_hits++;
         }
