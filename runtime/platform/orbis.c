@@ -1310,6 +1310,7 @@ void plat_log_line(const char *line, size_t n) {
 extern int32_t sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t align, int64_t *out_start,
                                                   size_t *out_size);
 extern int32_t sceKernelAvailableFlexibleMemorySize(size_t *size);
+static void mem_inventory(void);
 static void mem_report(const char *why) {
     int64_t st = 0;
     size_t dfree = 0, ffree = 0;
@@ -1353,6 +1354,16 @@ static void *mem_monitor(void *arg) {
         if (m > last + (64ull << 20) || m + (64ull << 20) < last) {
             mem_report("mudou");
             last = m;
+        }
+        static uint64_t inv_last;
+        static int inv_said;
+        int64_t st = 0;
+        size_t dfree = 0;
+        sceKernelAvailableDirectMemorySize(0, (int64_t)sceKernelGetDirectMemorySize(), 0x4000, &st, &dfree);
+        if (!inv_said || m > inv_last + (512ull << 20) || m + (512ull << 20) < inv_last || (dfree < (64u << 20) && inv_said < 40)) {
+            mem_inventory();
+            inv_last = m;
+            inv_said++;
         }
     }
     return NULL;
@@ -1853,6 +1864,124 @@ typedef struct {
     uint8_t flags;
     char name[32];
 } KVQuery;
+
+// ---- inventário da memória direta (frente N, 2026-11-07). A linha "orbis mem" só conta o que o runtime sabe (janelas
+// do jogo, VMA, pilhas); no console a soma ficou ~1,1 GB abaixo dos 5120 MiB com a memória direta esgotada. Aqui:
+// (1) o alocado de verdade, somando os blocos do sceKernelDirectMemoryQuery; (2) cada mapa do processo
+// (sceKernelVirtualQuery, FIND_NEXT) com memória direta, agrupado por dono, contando a memória física sem repetir (o
+// coringa aparece mapeado em muitos endereços e conta uma vez); (3) a memória direta alocada que nenhum mapa mostra.
+// Os grupos: jogo (as reservas do guest), coringa, pilhas (área preguiçosa), e os demais pelo nome que o kernel guarda
+// no mapa, ou "sem nome <prot>" com o maior trecho, para achar o dono pelo endereço. Os mapas flexíveis vão num total à
+// parte. Roda no monitor, no início e a cada 512 MiB de mudança; OCARINA_MEM_INVENTORY=0 desliga.
+extern int32_t sceKernelDirectMemoryQuery(int64_t offset, int32_t flags, void *info, size_t size);
+typedef struct { int64_t start, end; int32_t type; } KDMQuery;
+#define INV_GROUPS 24
+#define INV_IV 16384
+typedef struct { char name[40]; uint64_t phys, virt, big_at, big_len; int n; } InvGroup;
+static InvGroup inv_g[INV_GROUPS];
+static struct { int64_t lo, hi; int g; } inv_iv[INV_IV];   // trechos físicos mapeados (por grupo)
+
+static int iv_cmp(const void *x, const void *y) {
+    const int64_t a = *(const int64_t *)x, b = *(const int64_t *)y;
+    return a < b ? -1 : a > b;
+}
+
+// Soma de trechos [lo, hi) sem contar a sobreposição; ordena em p.
+static uint64_t iv_union(void *p, int n, size_t stride) {
+    qsort(p, (size_t)n, stride, iv_cmp);
+    uint64_t sum = 0;
+    int64_t cl = 0, ch = -1;
+    for (int i = 0; i < n; i++) {
+        const int64_t *e = (const int64_t *)((const char *)p + (size_t)i * stride);
+        if (e[0] > ch) {
+            if (ch > cl) sum += (uint64_t)(ch - cl);
+            cl = e[0], ch = e[1];
+        } else if (e[1] > ch) {
+            ch = e[1];
+        }
+    }
+    if (ch > cl) sum += (uint64_t)(ch - cl);
+    return sum;
+}
+
+static int inv_group(const char *name) {
+    for (int i = 0; i < INV_GROUPS; i++) {
+        if (!inv_g[i].name[0]) {
+            snprintf(inv_g[i].name, sizeof inv_g[i].name, "%s", name);
+            return i;
+        }
+        if (!strcmp(inv_g[i].name, name)) return i;
+    }
+    return INV_GROUPS - 1;   // o último junta o resto
+}
+
+static void mem_inventory(void) {
+    static int off = -1;
+    if (off < 0) {
+        char v[8];
+        off = plat_getenv("OCARINA_MEM_INVENTORY", v, sizeof v) && v[0] == '0';
+    }
+    if (off) return;
+    uint64_t total = sceKernelGetDirectMemorySize(), alloc = 0;
+    int blocks = 0;
+    KDMQuery d;
+    for (int64_t at = 0; blocks < 100000; blocks++) {
+        memset(&d, 0, sizeof d);
+        if (sceKernelDirectMemoryQuery(at, 1, &d, sizeof d) || d.end <= d.start || d.end <= at) break;
+        alloc += (uint64_t)(d.end - d.start);
+        at = d.end;
+    }
+    memset(inv_g, 0, sizeof inv_g);
+    snprintf(inv_g[INV_GROUPS - 1].name, sizeof inv_g[0].name, "outros");
+    int niv = 0, nmaps = 0;
+    uint64_t flex = 0, ph_lo = ph_off >= 0 ? (uint64_t)ph_off : UINT64_MAX;
+    KVQuery q;
+    for (uint64_t a = 0; nmaps < 200000; nmaps++) {
+        memset(&q, 0, sizeof q);
+        if (sceKernelVirtualQuery((void *)(uintptr_t)a, 1, &q, sizeof q) || q.end <= q.start || q.end <= a) break;
+        a = q.end;
+        uint64_t len = q.end - q.start;
+        if (!(q.flags & 2)) {   // não é memória direta
+            if (q.flags & 1) flex += len;
+            continue;
+        }
+        char key[40];
+        Resv *r = resv_of(q.start);
+        if (q.off >= ph_lo && q.off < ph_lo + WIN) snprintf(key, sizeof key, "coringa");
+        else if (r) snprintf(key, sizeof key, "jogo");
+        else if (ls_arena > 1 && q.start >= ls_arena && q.start < ls_arena + LS_SLOT * LS_SLOTS) snprintf(key, sizeof key, "pilhas");
+        else if (q.name[0]) snprintf(key, sizeof key, "%.31s", q.name);
+        else snprintf(key, sizeof key, "sem nome prot %#x", (unsigned)q.prot);
+        int g = inv_group(key);
+        inv_g[g].virt += len;
+        inv_g[g].n++;
+        if (len > inv_g[g].big_len) inv_g[g].big_len = len, inv_g[g].big_at = q.start;
+        if (niv < INV_IV) {
+            inv_iv[niv].lo = (int64_t)q.off, inv_iv[niv].hi = (int64_t)(q.off + len), inv_iv[niv].g = g;
+            niv++;
+        }
+    }
+    uint64_t mapped = iv_union(inv_iv, niv, sizeof inv_iv[0]);   // ordena por início
+    // Por grupo: os trechos do grupo, sem repetir dentro dele (copiados para o começo de um vetor de apoio).
+    static struct { int64_t lo, hi; } tmp[INV_IV];
+    for (int g = 0; g < INV_GROUPS && inv_g[g].name[0]; g++) {
+        int k = 0;
+        for (int i = 0; i < niv; i++)
+            if (inv_iv[i].g == g) tmp[k].lo = inv_iv[i].lo, tmp[k].hi = inv_iv[i].hi, k++;
+        inv_g[g].phys = iv_union(tmp, k, sizeof tmp[0]);
+    }
+    rt_log("orbis inventário: memória direta %llu MiB, alocada %llu MiB em %d blocos (livre %llu), mapeada %llu MiB "
+           "(física, sem repetir), alocada sem mapa %llu MiB; flexível mapeada %llu MiB; %d mapas%s",
+           (unsigned long long)(total >> 20), (unsigned long long)(alloc >> 20), blocks,
+           (unsigned long long)((total - alloc) >> 20), (unsigned long long)(mapped >> 20),
+           (unsigned long long)((alloc > mapped ? alloc - mapped : 0) >> 20), (unsigned long long)(flex >> 20), nmaps,
+           niv == INV_IV ? " (trechos demais: a soma por grupo é parcial)" : "");
+    for (int g = 0; g < INV_GROUPS && inv_g[g].name[0]; g++)
+        if (inv_g[g].n)
+            rt_log("orbis inventário:   %-32s %6llu MiB físicos, %7llu MiB de endereço em %d mapas (maior %#llx+%llu MiB)",
+                   inv_g[g].name, (unsigned long long)(inv_g[g].phys >> 20), (unsigned long long)(inv_g[g].virt >> 20),
+                   inv_g[g].n, (unsigned long long)inv_g[g].big_at, (unsigned long long)(inv_g[g].big_len >> 20));
+}
 
 static int range_readable(uint64_t addr, uint64_t n) {
     uint64_t end = addr + (n ? n : 1);
