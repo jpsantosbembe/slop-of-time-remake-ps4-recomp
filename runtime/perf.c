@@ -1,5 +1,5 @@
 // Frame timing (TOTK_TRACE=perf, the frame-time summary, the performance overlay's counts), the A/B switches (rt_ab,
-// rt_knob) and TOTK_ONE_PER_CORE. The sampling profiler (TOTK_PROFILE) is the OS's (prof_win.c); without one the weak
+// rt_knob) and TOTK_ONE_PER_CORE. The sampling profiler (TOTK_PROFILE) is the OS's (prof_win.c, platform/prof_orbis.c); without one the weak
 // prof_sampler_* below do nothing.
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +22,7 @@ __attribute__((weak)) int prof_sampler_start(void) {
 }
 __attribute__((weak)) void prof_sampler_write(void) {}
 __attribute__((weak)) void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) { (void)frame, (void)now, (void)d; }
+__attribute__((weak)) void prof_sampler_thread(int role) { (void)role; }
 
 // TOTK_TRACE=perf, TOTK_FLIGHT=1 or the full performance overlay: event counts are taken. Wait times are always taken
 // (frame-time summary). perf_base: the part fixed at start.
@@ -65,8 +66,14 @@ static uint64_t wait_ns[PERF_N], frame_ns[PERF_N], worst_ns[PERF_N];   // window
 
 uint64_t perf_begin(void) { return kern_now_ns(); }
 
-void perf_replay_thread(void) { prof_replay_tid = plat_thread_id(); }
-void perf_main_thread(void) { prof_main_tid = plat_thread_id(); }
+void perf_replay_thread(void) {
+    prof_replay_tid = plat_thread_id();
+    prof_sampler_thread(PROF_ROLE_REPLAY);
+}
+void perf_main_thread(void) {
+    prof_main_tid = plat_thread_id();
+    prof_sampler_thread(PROF_ROLE_MAIN);
+}
 
 void perf_end(int kind, uint64_t t0) {
     if (!t0) return;
@@ -264,7 +271,11 @@ static void cpu_placement(void) {
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     static int64_t win_prev[PERF_CNT_N];
-    prof_render_tid = plat_thread_id();
+    uint32_t me = plat_thread_id();
+    if (me != prof_render_tid) {   // a new render thread: the sampler (prof_orbis.c) keeps its handle
+        prof_render_tid = me;
+        prof_sampler_thread(PROF_ROLE_RENDER);
+    }
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
     prof_sampler_frame(frame, now, last ? d : 0);

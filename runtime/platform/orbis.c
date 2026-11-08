@@ -198,6 +198,25 @@ static int lazy_stack_fault(uint64_t a) {
     return 0;
 }
 
+// Para o perfilador (prof_orbis.c), de dentro de um tratador de sinal: sem trava e sem falta. 1 quando a está numa pilha
+// preguiçosa viva; *end é então o fim do trecho mapeado contínuo a partir do pedaço de a (a própria a se o pedaço não
+// está mapeado: ler ali faltaria, e o lazy_stack_fault toma ls_lock, que a thread interrompida pode estar segurando).
+// 0: a não está numa pilha preguiçosa. A pilha da thread interrompida não é liberada enquanto ela roda nela.
+int orbis_lazy_stack_span(uint64_t a, uint64_t *end) {
+    int n = __atomic_load_n(&nlstk, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        LStack *st = &lstk[i];
+        if (!__atomic_load_n(&st->live, __ATOMIC_ACQUIRE) || a < st->base || a >= st->end) continue;
+        const int64_t *off = st->off;
+        uint64_t c = off ? (a - st->base) / LS_CHUNK : 0, top = (st->end - st->base) / LS_CHUNK;
+        while (off && c < top && __atomic_load_n(&off[c], __ATOMIC_RELAXED) >= 0) c++;
+        uint64_t e = st->base + c * LS_CHUNK;
+        *end = e > a ? e : a;
+        return 1;
+    }
+    return 0;
+}
+
 static void ls_release(LStack *st, uint64_t total_va, size_t total) {
     for (uint64_t a = st->base; a < st->end; a += LS_CHUNK) {
         int64_t *o = &st->off[(a - st->base) / LS_CHUNK];
