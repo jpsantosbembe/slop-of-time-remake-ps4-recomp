@@ -3065,6 +3065,31 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out) {
     return n;
 }
 
+// ocarina-ps4 (frente C): a lista do --preparar-compute (vk_pipeline_prepare_big_compute). Lê o arquivo direto, sem
+// depender de RC.on: no modo de preparo o vk_pipeline não abre o pipeline-keys.bin.
+size_t gfx_shader_recorded_list(const char *dir, uint8_t (**out)[32]) {
+    *out = NULL;
+    char ans_path[PATH_CAP + 32];
+    snprintf(ans_path, sizeof ans_path, "%s/shader-answers.bin", dir);
+    uint8_t *ab = NULL;
+    size_t an = 0;
+    plat_mutex_lock(&rec_io);
+    int ok = answers_read(ans_path, &ab, &an, 0);
+    plat_mutex_unlock(&rec_io);
+    if (!ok) return 0;
+    size_t na = an / ANS_REC, n = 0;
+    uint8_t (*e)[32] = calloc(na + 1, 32);
+    Set64 seen = {0};
+    for (size_t i = 0; e && i < na; i++) {
+        const uint8_t *r = ab + i * ANS_REC;
+        if (set_add(&seen, hash8(r + 36))) memcpy(e[n++], r + 36, 32);
+    }
+    free(seen.v), free(ab);
+    if (!n) free(e), e = NULL;
+    *out = e;
+    return n;
+}
+
 // ---- semente NVN 2 offline (Ocarina; tools/oot/oot_shader_seed.py)
 // <dir>/seed-nvn2.bin: "OOTNVN2S", u32 versão 1, u32 contagem; registros: u32 tamanho do controle, u32 tamanho do código,
 // u8 prioridade, 3 bytes zero, controle, código — cada estágio NVN 2 cru, como o jogo o passa a nvnProgramSetShaders.

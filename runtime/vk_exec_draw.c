@@ -4118,10 +4118,11 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                     }
                 }
             }
+            vk_pipeline_big_compute_skipped(cs, origin);
             return;
         }
     }
-    if (big_compute_blit(ex, cs)) return;
+    if (big_compute_blit(ex, cs)) return vk_pipeline_big_compute_skipped(cs, 0);
     if (!vk_pipeline_compute_ready(cs)) return;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);

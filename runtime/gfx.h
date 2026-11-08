@@ -87,6 +87,9 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs);
 int gfx_shader_seed_nvn2(const char *dir);
 typedef struct { uint8_t iid[32]; uint8_t stage, prio; } GfxWarmEnt;   // prio 0: met in play; 1..3: prepared
 size_t gfx_shader_warm_list(GfxWarmEnt **out);              // malloc'd; recorded first, then prepared; needs recording on
+// ocarina-ps4 (frente C): os input ids gravados em jogo em <dir>/shader-answers.bin, sem repetição, na ordem do arquivo.
+// Não precisa da gravação ligada. malloc'd (32 bytes cada); 0 sem o arquivo.
+size_t gfx_shader_recorded_list(const char *dir, uint8_t (**out)[32]);
 // Disk-cache load the caller owns (*owned 1: release it), or the memory cache's entry (*owned 0). NULL if not cached.
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);

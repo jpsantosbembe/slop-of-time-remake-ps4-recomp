@@ -3664,6 +3664,33 @@ static uint64_t big_cs_words(void) {
 }
 
 static _Thread_local VkPipelineCache cs_build_cache;   // the big compute worker's own cache, see big_cs_worker
+// ocarina-ps4 (frente C): do último compute gigante criado nesta thread. cs_last_key: FNV-1a do que entra no
+// vkCreateComputePipelines (SPIR-V, flags, subgrupo, bindings do layout), igual no jogo e no --preparar-compute quando o
+// pipeline é o mesmo. cs_last_hit: 1 achado no cache (VkPipelineCreationFeedback), 0 compilado, -1 sem resposta.
+static _Thread_local uint64_t cs_last_key;
+static _Thread_local int cs_last_hit;
+
+static uint64_t fnv_mix(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+// A chave de layout: o que layout_get põe no VkDescriptorSetLayout e no VkPipelineLayout.
+static uint64_t layout_key(const Layout *l) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    int32_t f[5] = {l->push, (int32_t)l->n, l->push1, (int32_t)l->n0, l->emu};
+    h = fnv_mix(h, f, sizeof f);
+    uint8_t s1 = l->set1 != VK_NULL_HANDLE;
+    h = fnv_mix(h, &s1, 1);
+    for (uint32_t i = 0; i < l->n; i++) {
+        uint32_t b[5] = {l->b[i].binding, (uint32_t)l->b[i].descriptorType, l->b[i].descriptorCount,
+                         (uint32_t)l->b[i].stageFlags, l->b[i].pImmutableSamplers != NULL};
+        h = fnv_mix(h, b, sizeof b);
+    }
+    return h;
+}
+
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
@@ -3687,6 +3714,23 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         gfx_shader_local_size(cs, ls);
         if (ci.stage.pNext && ls[0] && ls[0] % vk_caps.sg_size == 0) ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     }
+    // ocarina-ps4 (frente C): nos gigantes, a chave do pedido e se o driver achou o pipeline no cache. O feedback não
+    // entra no hash do pipeline; a chave é a do primeiro pedido (o retry sem otimização é outro pipeline).
+    VkPipelineCreationFeedback fb_pipe = {0};
+    VkPipelineCreationFeedbackCreateInfo fb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
+                                               .pPipelineCreationFeedback = &fb_pipe};
+    int big = words >= big_cs_words();
+    uint64_t spv_key = 0, lay_key = 0;
+    if (big) {
+        ci.pNext = &fb;
+        spv_key = spv_fnv(code, words), lay_key = layout_key(l);
+        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *rq = ci.stage.pNext;
+        uint32_t f[3] = {(uint32_t)ci.flags, (uint32_t)ci.stage.flags, rq ? rq->requiredSubgroupSize : 0};
+        uint64_t h = fnv_mix(0xcbf29ce484222325ull, &spv_key, 8);
+        h = fnv_mix(h, &lay_key, 8);
+        cs_last_key = fnv_mix(h, f, sizeof f);
+        cs_last_hit = -1;
+    }
     VkPipeline pipe = VK_NULL_HANDLE;
     if (!cs_build_cache) plat_mutex_lock_shared(&cache_access);
     if (vkCreateComputePipelines(P.device, cs_build_cache ? cs_build_cache : P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
@@ -3696,6 +3740,14 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         rt_log("vk_pipeline: compute pipeline built again without optimization: %s", pipe ? "ok" : "failed too");
     }
     if (!cs_build_cache) plat_mutex_unlock_shared(&cache_access);
+    if (big) {
+        if (pipe && (fb_pipe.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT))
+            cs_last_hit = (fb_pipe.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0;
+        rt_log("vk_pipeline: compute gigante: %llu palavras, chave %016llx (spirv %016llx, layout %016llx, %u bindings, "
+               "flags %#x, estágio %#x): %s", (unsigned long long)words, (unsigned long long)cs_last_key,
+               (unsigned long long)spv_key, (unsigned long long)lay_key, l->n, (unsigned)ci.flags, (unsigned)ci.stage.flags,
+               !pipe ? "falhou" : cs_last_hit > 0 ? "achado no cache" : cs_last_hit == 0 ? "compilado" : "sem feedback");
+    }
     if (pipe && rt_knob("CRUMBS_LOG", "0")) {
         uint64_t h = 1469598103934665603ull;   // FNV-1a do SPIR-V, como no create_graphics
         for (uint64_t j = 0; j < words; j++) h = (h ^ code[j]) * 1099511628211ull;
@@ -3764,6 +3816,33 @@ static struct { const GfxShader *cs; volatile int done; } big_cs[BIG_CS_N];
 static volatile int big_cs_n;
 static int big_cs_thread;
 
+// ocarina-ps4 (frente C): o caminho de um compute gigante, o MESMO no jogo (big_cs_worker) e no --preparar-compute:
+// layout pelo compute_layout, um cache privado semeado do P.cache, compute_create e a publicação no P.cache. Devolve o
+// pipeline (VK_NULL_HANDLE se falhou) e o layout em *lo.
+static VkPipeline big_cs_compile(const GfxShader *cs, Bindings *B, Layout **lo) {
+    const char *why = NULL;
+    plat_mutex_lock(&P.lock);
+    Layout *l = compute_layout(cs, B, &why);
+    plat_mutex_unlock(&P.lock);
+    *lo = why ? NULL : l;
+    // A cache of its own: a compile of minutes inside the shared cache held every other pipeline on the replay thread
+    // behind it, and the game froze for over a minute.
+    VkPipelineCache own = cache_private();
+    cs_build_cache = own;
+    cs_last_hit = -1;
+    VkPipeline pipe = why ? VK_NULL_HANDLE : compute_create(cs, l);
+    cs_build_cache = VK_NULL_HANDLE;
+    if (own) {
+        if (pipe) cache_publish(own);
+        else vkDestroyPipelineCache(P.device, own, NULL);
+    }
+    return pipe;
+}
+
+static const char *cs_hit_text(void) {
+    return cs_last_hit > 0 ? " (achado no cache)" : cs_last_hit == 0 ? " (compilado)" : "";
+}
+
 static void big_cs_worker(void *arg) {
     (void)arg;
     for (int next = 0;;) {
@@ -3772,18 +3851,10 @@ static void big_cs_worker(void *arg) {
             continue;
         }
         const GfxShader *cs = big_cs[next].cs;
-        const char *why = NULL;
         Bindings B = {0};
-        plat_mutex_lock(&P.lock);
-        Layout *l = compute_layout(cs, &B, &why);
-        plat_mutex_unlock(&P.lock);
+        Layout *l = NULL;
         uint64_t t0 = plat_now_ns();
-        // A cache of its own: a compile of minutes inside the shared cache held every other pipeline on the replay thread
-        // behind it, and the game froze for over a minute.
-        VkPipelineCache own = cache_private();
-        cs_build_cache = own;
-        VkPipeline pipe = why ? VK_NULL_HANDLE : compute_create(cs, l);
-        cs_build_cache = VK_NULL_HANDLE;
+        VkPipeline pipe = big_cs_compile(cs, &B, &l);
         // Kept, as lb_compute keeps its pipelines: built again on the replay thread, the driver's cache missed and the game froze for
         // the whole compile a second time (62 s after big compute shader 31, a 21-minute run).
         int built = pipe != VK_NULL_HANDLE;
@@ -3799,14 +3870,57 @@ static void big_cs_worker(void *arg) {
             plat_mutex_unlock(&P.lock);
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
         }
-        rt_log("vk_pipeline: big compute shader %d built in %.1f s%s", next, (double)(plat_now_ns() - t0) / 1e9, built ? "" : " (failed)");
+        rt_log("vk_pipeline: big compute shader %d built in %.1f s%s%s", next, (double)(plat_now_ns() - t0) / 1e9,
+               built ? "" : " (failed)", built ? cs_hit_text() : "");
         __atomic_store_n(&big_cs[next].done, 1, __ATOMIC_RELEASE);
-        if (own) {
-            if (built) cache_publish(own);
-            else vkDestroyPipelineCache(P.device, own, NULL);
-        }
         next++;
     }
+}
+
+// ocarina-ps4 (frente C): <pasta do cache>/big-compute.txt, um input id (64 hex) e o número de palavras por linha, de
+// cada compute gigante que o jogo enfileirou; o --preparar-compute começa por eles. Só o replay chama.
+static void big_cs_dir(char *dir, size_t cap) {
+    snprintf(dir, cap, "%s", P.cache_path);
+    char *a = strrchr(dir, '/'), *b = strrchr(dir, '\\');
+    if (b > a) a = b;
+    if (a) *a = 0;
+    else snprintf(dir, cap, ".");
+}
+
+static void hex_of(const uint8_t *b, size_t n, char *out) {
+    for (size_t i = 0; i < n; i++) snprintf(out + 2 * i, 3, "%02x", b[i]);
+}
+
+static void big_cs_note(const GfxShader *cs, uint64_t words, const char *extra) {
+    if (!P.cache_path[0]) return;
+    char dir[PLAT_PATH_MAX * 2], path[PLAT_PATH_MAX * 2 + 32], hex[65];
+    big_cs_dir(dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/big-compute.txt", dir);
+    hex_of(gfx_shader_input_id(cs), 32, hex);
+    uint64_t size = 0;
+    char *old = (char *)plat_file_read(path, &size);
+    int known = 0;
+    for (uint64_t o = 0; old && o + 64 <= size && !known; o++) known = !memcmp(old + o, hex, 64);
+    free(old);
+    if (known) return;
+    FILE *f = fopen(path, "ab");
+    if (!f) return;
+    fprintf(f, "%s %llu%s\n", hex, (unsigned long long)words, extra);
+    fclose(f);
+}
+
+void vk_pipeline_big_compute_skipped(const GfxShader *cs, uint64_t origin) {
+    static const GfxShader *told[64];   // só o replay chama
+    static int ntold;
+    uint64_t words = 0;
+    if (!cs || !P.ready || !gfx_shader_spirv(cs, &words) || words < big_cs_words()) return;
+    for (int i = 0; i < ntold; i++)
+        if (told[i] == cs) return;
+    if (ntold == 64) return;   // o arquivo não é lido a cada dispatch
+    told[ntold++] = cs;
+    char extra[48];
+    snprintf(extra, sizeof extra, " pulado %016llx", (unsigned long long)origin);
+    big_cs_note(cs, words, extra);
 }
 
 int vk_pipeline_compute_ready(const GfxShader *cs) {
@@ -3818,6 +3932,7 @@ int vk_pipeline_compute_ready(const GfxShader *cs) {
     for (int i = 0; i < n; i++)
         if (big_cs[i].cs == cs) return __atomic_load_n(&big_cs[i].done, __ATOMIC_ACQUIRE);
     if (n == BIG_CS_N) return 1;
+    big_cs_note(cs, words, "");
     if (!big_cs_thread) big_cs_thread = plat_thread_spawn(big_cs_worker, NULL, "big compute", 0) ? 1 : -1;
     if (big_cs_thread < 0) return 1;
     big_cs[n].cs = cs;
@@ -4222,6 +4337,150 @@ int vk_pipeline_warm_shaders(void) {
     }
     lb_warm_prepared(dir);
     return 0;
+}
+
+// ocarina-ps4 (frente C): ocarina --preparar-compute. Sobe o Vulkan e o vk_pipeline sem rodar o guest e cria, um de cada
+// vez, os compute gigantes (>= OOT_BIG_CS_WORDS, padrão 32768 palavras) que o jogo usa, pelo mesmo big_cs_compile do
+// big_cs_worker: mesmo layout, mesmas flags (OOT_BIG_CS_OPT), mesmo subgrupo. O RADV grava cada um no mesa-cache e o
+// P.cache vai para o pipeline-cache-<mesa_id>.bin depois de cada um; no jogo, o big_cs_worker acha os dois prontos.
+// No PS4 a memória direta que o jogo usaria fica para o ACO.
+// Candidatos: <pasta>/big-compute.txt (os que o jogo enfileirou; big_cs_note) e todo input id de shader-answers.bin
+// (os pares gravados em jogo). Ficam de fora os que não são compute, os menores que o limite, os que não estão no
+// shader-cache, os que o jogo pulou (linha "pulado" em big-compute.txt: DKB_SKIP_CS ou o blit do filme) e, com
+// OCARINA_PRECOMP_MAX_WORDS=<n> (padrão 262144; 0 sem limite), os maiores que n: a rede do filme passa de 700 mil
+// palavras e leva minutos e GBs (os gigantes da Deku Tree vão até 122 mil). A origem NVN 2 não sai do shader-answers.bin (o registro guarda o
+// código rebaixado), então um pulado só é reconhecido depois que uma execução do jogo com este runtime o anotou.
+// Termina com 0 se nenhum falhou.
+static int hex_bytes(const char *h, uint8_t *out, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        int v = 0;
+        for (int k = 0; k < 2; k++) {
+            char c = h[2 * i + k];
+            int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) return 0;
+            v = v * 16 + d;
+        }
+        out[i] = (uint8_t)v;
+    }
+    return 1;
+}
+
+typedef struct { uint8_t iid[32]; uint64_t origin; uint8_t noted, skip; } PrecompEnt;
+
+static PrecompEnt *precomp_add(PrecompEnt **v, size_t *n, size_t *cap, const uint8_t iid[32]) {
+    for (size_t i = 0; i < *n; i++)
+        if (!memcmp((*v)[i].iid, iid, 32)) return &(*v)[i];
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 64;
+        PrecompEnt *nv = realloc(*v, nc * sizeof *nv);
+        if (!nv) return NULL;
+        *v = nv, *cap = nc;
+    }
+    PrecompEnt *e = &(*v)[(*n)++];
+    memset(e, 0, sizeof *e);
+    memcpy(e->iid, iid, 32);
+    return e;
+}
+
+int vk_pipeline_prepare_big_compute(void) {
+    double t_all = now_ms();
+    if (!ensure_init()) {
+        rt_log("preparar-compute: sem dispositivo Vulkan");
+        fprintf(stderr, "preparar-compute: sem dispositivo Vulkan\n");
+        return 1;
+    }
+#ifdef __ORBIS__
+    {   // a thread ociosa do sceGnmSubmitDone (gfx_window_orbis.c): sem ela, suspender o app no meio derruba o processo
+        extern int wsys_open(void);
+        wsys_open();
+    }
+#endif
+    char dir[PLAT_PATH_MAX * 2], path[PLAT_PATH_MAX * 2 + 32];
+    big_cs_dir(dir, sizeof dir);
+    const char *mw = getenv("OCARINA_PRECOMP_MAX_WORDS");
+    uint64_t max_words = mw ? strtoull(mw, NULL, 0) : 262144;
+    PrecompEnt *c = NULL;
+    size_t n = 0, cap = 0, from_note = 0;
+    snprintf(path, sizeof path, "%s/big-compute.txt", dir);
+    uint64_t size = 0;
+    char *txt = (char *)plat_file_read(path, &size);
+    for (uint64_t o = 0; txt && o + 64 <= size;) {
+        uint8_t iid[32];
+        PrecompEnt *e;
+        uint64_t end = o;
+        while (end < size && txt[end] != '\n') end++;
+        if (hex_bytes(txt + o, iid, 32) && (e = precomp_add(&c, &n, &cap, iid))) {
+            char line[160];
+            uint64_t len = end - o < sizeof line - 1 ? end - o : sizeof line - 1;
+            memcpy(line, txt + o, len), line[len] = 0;
+            const char *sk = strstr(line, " pulado ");
+            if (sk) e->skip = 1, e->origin = strtoull(sk + 8, NULL, 16);
+            if (!e->noted) from_note++;
+            e->noted = 1;
+        }
+        o = end + 1;
+    }
+    free(txt);
+    uint8_t (*r)[32] = NULL;
+    size_t nr = gfx_shader_recorded_list(dir, &r);
+    for (size_t i = 0; i < nr; i++) precomp_add(&c, &n, &cap, r[i]);
+    free(r);
+    rt_log("preparar-compute: %zu candidatos (%zu de big-compute.txt, %zu pares gravados em jogo) em %s; limite %llu "
+           "palavras%s; cache de pipelines %s", n, from_note, nr, dir, (unsigned long long)big_cs_words(),
+           getenv("OOT_BIG_CS_OPT") ? ", com o otimizador (OOT_BIG_CS_OPT)" : ", sem o otimizador",
+           P.cache ? P.cache_path : "AUSENTE (só o mesa-cache)");
+    size_t built = 0, hits = 0, failed = 0, missing = 0, small = 0, skipped = 0, big_n = 0;
+    double built_s = 0;
+    for (size_t i = 0; i < n; i++) {
+        char hex[65];
+        hex_of(c[i].iid, 32, hex);
+        int owned = 0;
+        const GfxShader *sh = gfx_shader_load_private(c[i].iid, &owned);
+        if (!sh) {
+            missing++;
+            if (c[i].noted) rt_log("preparar-compute: %s (de big-compute.txt) não está no shader-cache", hex);
+            continue;
+        }
+        uint64_t words = 0;
+        if (gfx_shader_stage(sh) != GFX_STAGE_CS || !gfx_shader_spirv(sh, &words) || words < big_cs_words()) {
+            small++;
+            if (owned) gfx_shader_release_private(sh);
+            continue;
+        }
+        big_n++;
+        if (c[i].skip || (max_words && words > max_words)) {
+            rt_log("preparar-compute: iid %.16s %llu palavras: pulado (%s)", hex, (unsigned long long)words,
+                   c[i].skip ? "o jogo não o cria" : "OCARINA_PRECOMP_MAX_WORDS");
+            skipped++;
+            if (owned) gfx_shader_release_private(sh);
+            continue;
+        }
+        Bindings B = {0};
+        Layout *l = NULL;
+        double t0 = now_ms();
+        VkPipeline pipe = big_cs_compile(sh, &B, &l);
+        double secs = (now_ms() - t0) / 1000.0;
+        rt_log("preparar-compute: gigante %zu (candidato %zu/%zu) iid %.16s %llu palavras: %s em %.1f s%s, chave %016llx",
+               big_n, i + 1, n, hex, (unsigned long long)words, pipe ? "pronto" : "FALHOU", secs, pipe ? cs_hit_text() : "",
+               (unsigned long long)cs_last_key);
+        if (pipe) {
+            vkDestroyPipeline(P.device, pipe, NULL);
+            built++, built_s += secs, hits += cs_last_hit > 0;
+            vk_pipeline_save();   // a cada um: uma queda no seguinte não perde este
+        } else {
+            failed++;
+        }
+        if (owned) gfx_shader_release_private(sh);
+    }
+    free(c);
+    vk_pipeline_save();
+    char msg[512];
+    snprintf(msg, sizeof msg, "preparar-compute: fim em %.1f s: %zu gigantes prontos (%zu já estavam no cache, %.1f s "
+             "compilando), %zu falharam, %zu pulados, %zu fora do shader-cache, %zu menores ou não compute",
+             (now_ms() - t_all) / 1000.0, built, hits, built_s, failed, skipped, missing, small);
+    rt_log("%s", msg);
+    printf("%s\n", msg);
+    return failed ? 1 : 0;
 }
 
 // ---- dynamic state
