@@ -1079,6 +1079,7 @@ typedef struct {
     int32_t *slot;          // paginador: vaga da janela trocada no swap.bin (-1: zerada, nada gravado)
     uint32_t *zl;           // paginador: bytes gravados na vaga (== tamanho da janela: crua)
     uint8_t *wq;            // write-watch: 1 na janela que plat_mem_written já rearmou (vigiada por página)
+    uint64_t *hs;           // paginador, OCARINA_SWAP_CHECK: hash do conteúdo despejado, conferido na volta
 } Resv;
 
 static void fault_install(void);   // o tratador do write-watch (abaixo)
@@ -1139,8 +1140,19 @@ static size_t pg_cap;
 static ZSTD_CCtx *pg_cc;
 static ZSTD_DCtx *pg_dc;
 static uint64_t pg_now_bytes, pg_disk_bytes, pg_out, pg_in, pg_zero, pg_sync, pg_hits, pg_fail;
+#define PG_IO 2           // a janela já foi usada pela GPU ou por E/S do kernel (orbis_mem_prefault)
+static int pg_check, pg_nozero, pg_safe;   // OCARINA_SWAP_CHECK, OCARINA_SWAP_NOZERO, OCARINA_SWAP_SAFE
+static uint64_t pg_ck_moved, pg_ck_bad;    // verificação: escrita durante o despejo, conteúdo que voltou diferente
 static uint64_t pg_evict_locked(int maxn, int sync);
 static void pg_init(void);
+static void slot_put(int32_t s);
+
+static uint64_t win_hash(const void *p, size_t len) {
+    const uint64_t *q = p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t k = 0; k < len / 8; k++) h = (h ^ q[k]) * 1099511628211ull;
+    return h;
+}
 
 // A proteção da libkernel para a página: a pedida, reduzida a leitura enquanto vigiada e não escrita. A GPU fica com
 // RW em toda a memória mapeada: o importador do Vulkan precisa dela, e uma falta do lado da GPU trava o console.
@@ -1192,10 +1204,16 @@ static int32_t dmem_alloc(size_t len, size_t align, int64_t *off) {
 // Aloca e mapeia a janela que contém a, recortada na reserva, e a zera. vm_lock seguro. A CONFIRMAR NO CONSOLE: a sonda
 // só provou mapas de 2 MiB alinhados; uma janela recortada (janela do host de 1 MiB, fim da janela dos módulos) usa
 // alinhamento de 16 KiB.
-static int map_window(Resv *r, uint64_t a) {
+// Preenche a janela ANTES de ela aparecer no endereço do jogo (frente N, 2026-11-07): a memória nova é zerada (s < 0)
+// ou recebe a vaga s do swap.bin (zl bytes) por uma visão própria, e só então entra no endereço do jogo, sem acesso da
+// CPU; quem chama aplica as proteções (apply_range) ainda com vm_lock. Antes a janela entrava com CPU RW e era zerada
+// ou preenchida depois: outra thread que a tocasse no meio lia zeros, ou escrevia e perdia a escrita no memset/na
+// leitura da troca (no console: quedas no filme da abertura com o paginador).
+static int map_window_fill(Resv *r, uint64_t a, int32_t s, uint32_t zl) {
     uint64_t w = down(a, WIN);
     uint64_t start = w > r->base ? w : r->base, end = w + WIN < r->end ? w + WIN : r->end;
     size_t len = (size_t)(end - start), align = start % WIN == 0 && len == WIN ? WIN : KPAGE;
+    size_t i = (size_t)((w - r->win_base) / WIN);
     int64_t off = 0;
     // Paginador: acima do orçamento, ou sem memória direta livre, despeja janelas frias aqui mesmo antes de alocar.
     if (pg_on && r->pgf && __atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) + len > pg_budget) pg_evict_locked(2, 1);
@@ -1206,8 +1224,38 @@ static int map_window(Resv *r, uint64_t a) {
                 (unsigned long long)start, len);
         return 0;
     }
+    void *v = NULL;
+    if (sceKernelMapDirectMemory(&v, len, K_PROT_CPU_R | K_PROT_CPU_W, 0, off, align)) {
+        fprintf(stderr, "platform: visão da memória direta nova (%#zx) falhou\n", len);
+        sceKernelReleaseDirectMemory(off, len);
+        return 0;
+    }
+    memset(v, 0, len);   // nenhuma fonte diz que a memória direta nova vem zerada
+    if (s >= 0) {
+        off_t o = (off_t)s * (off_t)WIN;
+        int ok = zl == len ? pread(pg_fd, v, len, o) == (ssize_t)len
+                           : pread(pg_fd, pg_cbuf, zl, o) == (ssize_t)zl &&
+                                 ZSTD_decompressDCtx(pg_dc, v, len, pg_cbuf, zl) == len;
+        if (!ok) {
+            static int said;
+            if (said++ < 4) rt_log("orbis: paginador: ler a janela %#llx da troca falhou; ela volta zerada",
+                                   (unsigned long long)start);
+            memset(v, 0, len);
+        }
+    }
+    if (pg_check && r->hs && (s >= 0 || r->hs[i])) {
+        uint64_t h = win_hash(v, len);
+        if (h != r->hs[i]) {
+            pg_ck_bad++;
+            static int said;
+            if (said++ < 16) rt_log("orbis: paginador: VERIFICAÇÃO: a janela %#llx voltou diferente do que saiu (vaga %d, "
+                                    "%u bytes)", (unsigned long long)start, (int)s, zl);
+        }
+        r->hs[i] = 0;
+    }
+    sceKernelMunmap(v, len);
     void *va = (void *)(uintptr_t)start;
-    e = sceKernelMapDirectMemory(&va, len, K_PROT_CPU_R | K_PROT_CPU_W | K_PROT_GPU, K_MAP_FIXED, off, align);
+    e = sceKernelMapDirectMemory(&va, len, K_PROT_GPU, K_MAP_FIXED, off, align);
     if (e || va != (void *)(uintptr_t)start) {
         fprintf(stderr, "platform: mapear memória direta em %#llx+%#zx falhou (%#x, veio %p)\n",
                 (unsigned long long)start, len, (unsigned)e, va);
@@ -1215,12 +1263,13 @@ static int map_window(Resv *r, uint64_t a) {
         sceKernelReleaseDirectMemory(off, len);
         return 0;
     }
-    memset(va, 0, len);   // nenhuma fonte diz que a memória direta nova vem zerada
-    if (r->woff) r->woff[(w - r->win_base) / WIN] = off;
-    __atomic_store_n(&r->win[(w - r->win_base) / WIN], 1, __ATOMIC_RELEASE);
+    if (r->woff) r->woff[i] = off;
+    __atomic_store_n(&r->win[i], 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&mapped_bytes, len, __ATOMIC_RELAXED);
     return 1;
 }
+
+static int map_window(Resv *r, uint64_t a) { return map_window_fill(r, a, -1, 0); }
 
 // ---- logs na tela (ocarina-ps4, 2026-11-07, pedido do João): as fases do boot, a memória e os erros fatais viram
 // notificações do sistema (o balão no canto da tela), que aparecem por cima de tudo e não dependem da GPU do jogo, então
@@ -1363,11 +1412,12 @@ static void mem_report(const char *why) {
            (unsigned long long)(ffree >> 20), orbis_internal_free() >> 10);
     if (pg_on)
         rt_log("orbis troca: %llu MiB fora (%llu MiB no disco), saíram %llu janelas (%llu zeradas), voltaram %llu, "
-               "despejos síncronos %llu, sondas tocadas %llu, falhas %llu; orçamento %llu MiB",
+               "despejos síncronos %llu, sondas tocadas %llu, falhas %llu; verificação: mudaram no despejo %llu, voltaram "
+               "diferentes %llu; orçamento %llu MiB",
                (unsigned long long)(pg_now_bytes >> 20), (unsigned long long)(pg_disk_bytes >> 20),
                (unsigned long long)pg_out, (unsigned long long)pg_zero, (unsigned long long)pg_in,
                (unsigned long long)pg_sync, (unsigned long long)pg_hits, (unsigned long long)pg_fail,
-               (unsigned long long)(pg_budget >> 20));
+               (unsigned long long)pg_ck_moved, (unsigned long long)pg_ck_bad, (unsigned long long)(pg_budget >> 20));
 }
 static void *mem_monitor(void *arg) {
     (void)arg;
@@ -1439,6 +1489,8 @@ static int lazy_fault(uint64_t a) {
         // pega uma falta velha a cada passada da sonda e não pode acumular até cair.
         static __thread uint64_t last, last_ns;
         static __thread int n;
+        plat_mutex_lock(&vm_lock);   // espera quem está mapeando, trazendo ou tirando a sonda: depois, tabela = hardware
+        plat_mutex_unlock(&vm_lock);
         uint64_t now = plat_now_ns();
         if (a != last || now - last_ns > 1000000) n = 0;
         last = a, last_ns = now;
@@ -1547,6 +1599,7 @@ static int evict_locked(Resv *r, size_t i) {
     size_t len = (size_t)(end - at);
     int64_t off = r->woff ? r->woff[i] : -1;
     if (off < 0 || __atomic_load_n(&r->win[i], __ATOMIC_ACQUIRE) != 1) return 0;
+    if (pg_safe && (r->pgf[i] & PG_IO)) return 0;   // OCARINA_SWAP_SAFE: só o que a GPU e o kernel nunca usaram
     if (!(r->pgf[i] & PG_PROBE)) probe_locked(r, i);   // ninguém escreve enquanto copiamos: falta e espera a trava
     void *v = NULL;
     if (sceKernelMapDirectMemory(&v, len, K_PROT_CPU_R, 0, off, KPAGE)) {
@@ -1556,6 +1609,8 @@ static int evict_locked(Resv *r, size_t i) {
     const uint64_t *q = v;
     size_t k = 0, nq = len / 8;
     while (k < nq && !q[k]) k++;
+    if (pg_nozero) k = 0;   // OCARINA_SWAP_NOZERO: a zerada também vai para o arquivo
+    uint64_t h0 = pg_check ? win_hash(v, len) : 0;
     int32_t s = -1;
     size_t zn = 0;
     if (k < nq) {
@@ -1569,17 +1624,27 @@ static int evict_locked(Resv *r, size_t i) {
             return 0;
         }
     }
+    if (pg_check && win_hash(v, len) != h0) {   // alguém escreveu na janela sondada enquanto despejávamos
+        pg_ck_moved++;
+        static int said;
+        if (said++ < 16) rt_log("orbis: paginador: VERIFICAÇÃO: a janela %#llx mudou durante o despejo (GPU ou kernel "
+                                "escrevendo nela sem prefault); despejo cancelado", (unsigned long long)at);
+        slot_put(s);
+        sceKernelMunmap(v, len);
+        return 0;
+    }
     sceKernelMunmap(v, len);
     if (!map_placeholder(r, at)) {
         slot_put(s);
         pg_fail++;
         return 0;
     }
+    if (r->hs) r->hs[i] = h0;
     sceKernelReleaseDirectMemory(off, len);
     r->woff[i] = -1;
     r->slot[i] = s;
     r->zl[i] = (uint32_t)zn;
-    r->pgf[i] = 0;
+    r->pgf[i] &= PG_IO;
     __atomic_store_n(&r->win[i], WS_SWAP, __ATOMIC_RELEASE);
     __atomic_sub_fetch(&mapped_bytes, len, __ATOMIC_RELAXED);
     pg_now_bytes += len, pg_disk_bytes += zn, pg_out++;
@@ -1640,27 +1705,13 @@ static int restore_locked(Resv *r, uint64_t a) {
     size_t i = (size_t)((a - r->win_base) / WIN);
     int32_t s = r->slot[i];
     uint32_t zl = r->zl[i];
-    if (!map_window(r, a)) return 0;
+    if (!map_window_fill(r, a, s, zl)) return 0;
     uint64_t at, end;
     win_span(r, i, &at, &end);
-    size_t len = (size_t)(end - at);
-    if (s >= 0) {
-        void *dst = (void *)(uintptr_t)at;
-        off_t o = (off_t)s * (off_t)WIN;
-        int ok = zl == len ? pread(pg_fd, dst, len, o) == (ssize_t)len
-                           : pread(pg_fd, pg_cbuf, zl, o) == (ssize_t)zl &&
-                                 ZSTD_decompressDCtx(pg_dc, dst, len, pg_cbuf, zl) == len;
-        slot_put(s);
-        if (!ok) {
-            static int said;
-            if (said++ < 4) rt_log("orbis: paginador: ler a janela %#llx da troca falhou; ela volta zerada",
-                                   (unsigned long long)at);
-            memset(dst, 0, len);
-        }
-    }
+    slot_put(s);
     r->slot[i] = -1;
     r->zl[i] = 0;
-    pg_now_bytes -= len, pg_disk_bytes -= zl, pg_in++;
+    pg_now_bytes -= end - at, pg_disk_bytes -= zl, pg_in++;
     apply_range(r, at, end);
     return 1;
 }
@@ -1735,6 +1786,9 @@ static void pg_init(void) {
     uint64_t mib = 2560;
     if (plat_getenv("OCARINA_GUEST_MIB", v, sizeof v) && strtoull(v, NULL, 10) >= 256) mib = strtoull(v, NULL, 10);
     pg_budget = mib << 20;
+    pg_check = plat_getenv("OCARINA_SWAP_CHECK", v, sizeof v) && v[0] == '1';
+    pg_nozero = plat_getenv("OCARINA_SWAP_NOZERO", v, sizeof v) && v[0] == '1';
+    pg_safe = plat_getenv("OCARINA_SWAP_SAFE", v, sizeof v) && v[0] == '1';
     if (!pg_on) {
         rt_log("orbis: paginador desligado (OCARINA_SWAP=0)");
         return;
@@ -1762,7 +1816,8 @@ static void pg_init(void) {
     }
     pthread_detach(t);
     rt_log("orbis: paginador ligado: orçamento das janelas do jogo %llu MiB (OCARINA_GUEST_MIB), troca em %s "
-           "(OCARINA_SWAP=0 desliga)", (unsigned long long)mib, path);
+           "(OCARINA_SWAP=0 desliga)%s%s%s", (unsigned long long)mib, path, pg_check ? ", verificação (CHECK)" : "",
+           pg_nozero ? ", zeradas gravadas (NOZERO)" : "", pg_safe ? ", só janelas sem GPU/E/S (SAFE)" : "");
 }
 
 // Devolve a janela real em w (frente N, 2026-11-07) quando nenhuma subpágina dela segue commitada: o coringa entra por
@@ -1834,6 +1889,7 @@ void orbis_mem_prefault(uint64_t addr, uint64_t n) {
         if (!r) continue;
         size_t i = (size_t)((at - r->win_base) / WIN);
         if (r->gt) __atomic_store_n(&r->gt[i], pg_tick, __ATOMIC_RELAXED);   // uso da GPU/E/S: fica fora da sonda
+        if (r->pgf && !(__atomic_load_n(&r->pgf[i], __ATOMIC_RELAXED) & PG_IO)) __atomic_or_fetch(&r->pgf[i], PG_IO, __ATOMIC_RELAXED);
         if (win_mapped(r, at) && !(r->pgf && (__atomic_load_n(&r->pgf[i], __ATOMIC_RELAXED) & PG_PROBE))) continue;
         int fresh = 0;
         plat_mutex_lock(&vm_lock);
@@ -1865,17 +1921,17 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
             r.win = calloc(nw, 1);
             r.woff = malloc(nw * sizeof *r.woff);
             r.pgf = calloc(nw, 1), r.gt = calloc(nw, sizeof *r.gt), r.pt = calloc(nw, sizeof *r.pt);
-            r.slot = malloc(nw * sizeof *r.slot), r.zl = calloc(nw, sizeof *r.zl), r.wq = calloc(nw, 1);
+            r.slot = malloc(nw * sizeof *r.slot), r.zl = calloc(nw, sizeof *r.zl), r.wq = calloc(nw, 1), r.hs = calloc(nw, sizeof *r.hs);
             if (r.slot)
                 for (size_t k = 0; k < nw; k++) r.slot[k] = -1;
-            if (r.sub && r.win && r.woff && r.pgf && r.gt && r.pt && r.slot && r.zl && r.wq && (!watch || r.ww)) {
+            if (r.sub && r.win && r.woff && r.pgf && r.gt && r.pt && r.slot && r.zl && r.wq && r.hs && (!watch || r.ww)) {
                 memset(r.sub, SS_RESERVED, n / SUB);
                 for (size_t k = 0; k < nw; k++) r.woff[k] = -1;
                 resv[nresv] = r;
                 __atomic_store_n(&nresv, nresv + 1, __ATOMIC_RELEASE);
                 ok = 1;
             } else {
-                free(r.sub), free(r.ww), free(r.win), free(r.woff), free(r.pgf), free(r.gt), free(r.pt), free(r.slot), free(r.zl), free(r.wq);
+                free(r.sub), free(r.ww), free(r.win), free(r.woff), free(r.pgf), free(r.gt), free(r.pt), free(r.slot), free(r.zl), free(r.wq), free(r.hs);
                 sceKernelMunmap(a, n);
             }
         } else if (!e) {
