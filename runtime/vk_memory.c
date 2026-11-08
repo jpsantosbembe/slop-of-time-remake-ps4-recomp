@@ -83,6 +83,8 @@ static void mirror_retire(void *arg);    // completion thread: destroys a finali
 static void grow(void **arr, int *cap, size_t elem);
 
 static PlatMutex pool_lock = PLAT_MUTEX_INIT;
+static volatile int64_t m_live_bytes;   // VRAM mirrors (defined with the mirror code below)
+static int64_t s_live_bytes;            // shadow storage (shadow_lock)
 // Bumped under pool_lock (exclusive) by every change to the index or a page table: vk_mem_resolve's per-thread hits
 // stay valid while it is unchanged.
 static uint64_t pool_gen = 1;
@@ -562,7 +564,18 @@ int vk_mem_descriptor_key(uint64_t addr, uint64_t size, VkDescKey *out) {
     return ok;
 }
 
-#ifdef __ORBIS__
+// Frente O: the VMA memory that is not texture images, for the census (vk_texture_census_log): physical pools, VRAM
+// mirrors of imported pools, shadow storage (host-visible).
+void vk_mem_vram_parts(uint64_t *phys, uint64_t *mirror, uint64_t *shadow) {
+    uint64_t p = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    for (int i = 0; i < nphys; i++) p += phys_list[i]->size;
+    plat_mutex_unlock_shared(&pool_lock);
+    *phys = p;
+    *mirror = (uint64_t)__atomic_load_n(&m_live_bytes, __ATOMIC_RELAXED);
+    *shadow = (uint64_t)s_live_bytes;
+}
+
 // ocarina-ps4: o que o VMA usa em cada heap (o monitor de memória do PS4, platform/orbis.c).
 void vk_vma_usage(uint64_t *dev, uint64_t *host) {
     *dev = *host = 0;
@@ -576,6 +589,7 @@ void vk_vma_usage(uint64_t *dev, uint64_t *host) {
         *(mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? dev : host) += b[i].statistics.blockBytes;
 }
 
+#ifdef __ORBIS__
 // ocarina-ps4: o trecho de um pool importado que um desenho usa ganha memória real antes de a GPU tocá-lo (o resto do
 // pool pode estar no coringa: platform/orbis.c, orbis_mem_placeholder).
 extern void orbis_mem_prefault(uint64_t addr, uint64_t n);
@@ -731,6 +745,7 @@ static void vram_log(uint64_t frame);
 
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
+    vk_texture_census_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
@@ -1065,7 +1080,7 @@ static PoolRec **stouch;                          // shadow_lock: pools resolved
 static int nstouch, cstouch;
 static SRange *spend;                             // shadow_lock: GPU writes recorded and not copied back yet
 static int nspend, cspend;
-static int64_t s_live_n, s_live_bytes;            // shadow_lock
+static int64_t s_live_n;                          // shadow_lock (s_live_bytes at the top)
 static uint64_t s_syncs, s_copied, s_queries, s_untracked, s_wb_bytes, s_ticks;   // shadow_lock: since the last log
 
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
@@ -1393,7 +1408,7 @@ typedef struct {
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
 static PlatMutex mirror_stat_lock = PLAT_MUTEX_INIT;
-static volatile int64_t m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_bytes[MR_N];
+static volatile int64_t m_live_n, m_refused_n[MR_N], m_refused_bytes[MR_N];   // m_live_bytes at the top
 static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
 
 static void mirror_mode(int discrete) {

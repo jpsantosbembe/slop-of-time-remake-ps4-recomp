@@ -174,6 +174,7 @@ static int tex_mirrored(const tex_t *t) {
     return 1;
 }
 
+void vk_texture_census_log(const char *why);
 static void log_limited(volatile int32_t *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void log_limited(volatile int32_t *n, const char *fmt, ...) {
     if (plat_inc32(n) > 16) return;
@@ -290,6 +291,60 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
     }
 }
 
+// Frente O (ocarina-ps4): OCARINA_TEX_MIP_DROP=<n> (default 0, off): an ASTC texture (decoded on the host or the GPU
+// into BC3 or RGBA8) the CPU fills, whose image would take OCARINA_TEX_MIP_DROP_MIB or more (default 16), is made
+// without its n largest levels (at most levels - 1): a 1365x1365 array of 90 layers of ASTC 8x8 is 263 MiB as BC3 and
+// 66 MiB without level 0. Sampling with normalized coordinates sees the next level; textureSize reports the smaller one.
+// OCARINA_TEX_OOM_DROP=<n> (default 0): such a texture that does not get memory is tried again with one more level
+// dropped, up to n (without the size threshold). Copies, views and render targets map the level (vk_tex_level); a
+// dropped level is left out.
+static int mip_drop = -1, mip_drop_oom;
+static uint64_t mip_drop_min;
+static uint64_t n_dropped, dropped_bytes;
+
+static void mip_drop_init(void) {
+    if (mip_drop >= 0) return;
+    const char *s = cfg_get("OCARINA_TEX_MIP_DROP"), *m = cfg_get("OCARINA_TEX_MIP_DROP_MIB"),
+               *o = cfg_get("OCARINA_TEX_OOM_DROP");
+    mip_drop = s && *s ? atoi(s) : 0;
+    if (mip_drop < 0 || mip_drop > 8) mip_drop = 0;
+    mip_drop_min = (uint64_t)(m && *m ? atoi(m) : 16) << 20;
+    mip_drop_oom = o && *o ? atoi(o) : 0;
+    if (mip_drop_oom < 0 || mip_drop_oom > 8) mip_drop_oom = 0;
+    if (mip_drop || mip_drop_oom)
+        rt_log("vk: ASTC textures of %llu MiB or more lose their %d largest levels (OCARINA_TEX_MIP_DROP); without memory, "
+               "up to %d (OCARINA_TEX_OOM_DROP)", (unsigned long long)(mip_drop_min >> 20), mip_drop, mip_drop_oom);
+}
+
+// The ASTC textures the drop may apply to: CPU content only (mirrored), 2D kinds, block-linear with levels to spare.
+static int mip_drop_ok(const tex_t *t, const TexVkFormat *f, VkImageType type, uint32_t levels, uint32_t samples) {
+    return f->astc_bw && type == VK_IMAGE_TYPE_2D && samples == 1 && levels > 1 && tex_mirrored(t) &&
+           !nvn_tex_is_linear(&t->d);
+}
+
+// Frente O (ocarina-ps4): OCARINA_DEPTH_SCALE=<2|4> (default 1, off): a depth texture the GPU renders (not mirrored, one
+// sample, 2D) with a side of OCARINA_DEPTH_SCALE_MIN texels or more (default 8192), in memory of its own, is made at
+// 1/scale of its size: Ocarina's 12288x12288 D16 shadow atlas is 288 MiB, 72 MiB at 6144. Passes into it scale the
+// viewport and scissor (vk_exec.c); samples with normalized coordinates see the same picture at less detail. Copies and
+// ReadTexels of such an image are left out (the sizes differ).
+static int depth_scale = -1;
+static uint32_t depth_scale_min;
+
+static uint32_t depth_div(const tex_t *t, const TexVkFormat *f, VkImageType type, uint32_t samples, uint32_t w, uint32_t h) {
+    if (depth_scale < 0) {
+        const char *s = cfg_get("OCARINA_DEPTH_SCALE"), *m = cfg_get("OCARINA_DEPTH_SCALE_MIN");
+        depth_scale = s && *s ? atoi(s) : 1;
+        if (depth_scale != 2 && depth_scale != 4) depth_scale = 1;
+        depth_scale_min = m && *m ? (uint32_t)atoi(m) : 8192;
+        if (depth_scale > 1)
+            rt_log("vk: depth targets of %u texels or more are made at 1/%d of their size (OCARINA_DEPTH_SCALE)",
+                   depth_scale_min, depth_scale);
+    }
+    if (depth_scale <= 1 || !(f->depth || f->stencil) || samples != 1 || type != VK_IMAGE_TYPE_2D || tex_mirrored(t))
+        return 1;
+    return umax(w, h) >= depth_scale_min ? (uint32_t)depth_scale : 1;
+}
+
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound, n_thick;
@@ -390,6 +445,11 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     int fb_usage = c->feedback == VK_FEEDBACK_LAYOUT && !block_views &&
                    (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
     if (fb_usage) ci.usage = usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    uint32_t rt_div = depth_div(t, &f, type, samples, w, h);
+    mip_drop_init();
+    uint32_t drop = 0;
+    int may_drop = (mip_drop || mip_drop_oom) && mip_drop_ok(t, &f, type, levels, samples);
+    if (may_drop && mip_drop && image_size(&ci) >= mip_drop_min) drop = (uint32_t)mip_drop < levels ? (uint32_t)mip_drop : levels - 1;
     Tex *e = calloc(1, sizeof *e);
     if (!e) rt_fatal("vk: out of memory for a texture");
     e->key = *k;
@@ -407,10 +467,32 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     }
     if (!img) {
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        VkResult r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
+        VkResult r;
+        uint32_t drop_max = (uint32_t)(mip_drop > mip_drop_oom ? mip_drop : mip_drop_oom);
+        for (;;) {
+            VkImageCreateInfo dci = ci;
+            if (drop) dci.extent.width = mip(w, drop), dci.extent.height = mip(h, drop), dci.mipLevels = levels - drop;
+            if (rt_div > 1) dci.extent.width = (w + rt_div - 1) / rt_div, dci.extent.height = (h + rt_div - 1) / rt_div;
+            r = vmaCreateImage(c->vma, &dci, &ai, &img, &e->alloc, NULL);
+            if (r == VK_SUCCESS || !may_drop || !mip_drop_oom || drop >= drop_max || drop + 1 >= levels) break;
+            drop++;
+            static volatile int32_t n_oom;
+            log_limited(&n_oom, "texture fmt %#x %ux%u layers %u: no memory (%d); again without %u levels", d->format, w, h,
+                        layers, (int)r, drop);
+        }
+        if (r != VK_SUCCESS) drop = 0;
+        if (r == VK_SUCCESS && rt_div > 1) w = (w + rt_div - 1) / rt_div, h = (h + rt_div - 1) / rt_div;
+        if (r == VK_SUCCESS && drop) {
+            w = mip(w, drop), h = mip(h, drop), levels -= drop;
+            VmaAllocationInfo ainfo;
+            vmaGetAllocationInfo(c->vma, e->alloc, &ainfo);
+            n_dropped++, dropped_bytes += ainfo.size;
+        }
         if (r != VK_SUCCESS) {
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
+            static int census_done;
+            if (!census_done && cfg_get("OCARINA_VRAM_CENSUS")) census_done = 1, vk_texture_census_log("first failed image");
             free(e);
             return NULL;
         }
@@ -422,6 +504,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     p->usage = usage;
     p->aspect = aspect_of(&f);
     p->width = w, p->height = h, p->depth = depth, p->levels = levels, p->layers = layers, p->samples = samples;
+    p->lod_drop = (uint8_t)drop;
+    p->rt_div = (uint8_t)(img && e->alloc && rt_div > 1 ? rt_div : 0);
     p->view_type = type == VK_IMAGE_TYPE_1D ? (d->target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
                  : type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
                  : d->target == NVN_TEXTURE_TARGET_CUBEMAP && (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? VK_IMAGE_VIEW_TYPE_CUBE
@@ -640,19 +724,20 @@ static void upload(Tex *e) {
     if (!bpb || !t->mem) return;
     uint64_t p0 = perf_begin(), u0 = kern_now_ns();
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
-    uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
+    uint32_t drop = linear ? 0 : e->pub.lod_drop;   // the image's level 0 is the texture's level drop
+    uint32_t levels = linear ? 1 : e->pub.levels + drop, layers = linear ? 1 : e->pub.layers;
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
     int agpu = astc && vk_astc_gpu(), acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK;   // raw blocks to the GPU
-    uint32_t n = levels * layers, k = 0;
+    uint32_t n = (levels - drop) * layers, k = 0;
     VkBufferImageCopy *rg = calloc(n, sizeof *rg);
     VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
     VkDeviceSize total = 0, decoded = 0;
-    for (uint32_t lv = 0; lv < levels; lv++)
+    for (uint32_t lv = drop; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
             uint32_t w = mip(d->width, lv), h = one_d ? 1 : mip(d->height, lv), sl = is3d ? mip(d->depth, lv) : 1;
             uint64_t texels = (uint64_t)w * h * sl, raw = (uint64_t)(w + bw - 1) / bw * bpb * ((h + bh - 1) / bh) * sl;
             uint64_t out = agpu ? raw : astc ? texels * 4 : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
-            rg[k++] = (VkBufferImageCopy){.bufferOffset = total, .imageSubresource = {e->pub.aspect, lv, ly, 1},
+            rg[k++] = (VkBufferImageCopy){.bufferOffset = total, .imageSubresource = {e->pub.aspect, lv - drop, ly, 1},
                                           .imageExtent = {w, h, sl}};
             total += (out + 15) & ~15ull;
             decoded += texels * 4;
@@ -662,7 +747,7 @@ static void upload(Tex *e) {
     VmaAllocation ralloc = NULL;
     uint8_t *stg = vk_staging(total, &sb, NULL), *rmap = acheck ? vk_staging(decoded, &rbuf, &ralloc) : NULL;
     k = 0;
-    for (uint32_t lv = 0; lv < levels; lv++)
+    for (uint32_t lv = drop; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++, k++) {
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
@@ -674,7 +759,7 @@ static void upload(Tex *e) {
                 memset(tmp ? tmp : dst, 0, raw);
             }
             if (agpu) {
-                ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
+                ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv - drop, .layer = ly};
             } else if (astc) {
                 uint64_t a0 = perf_begin();
                 for (uint32_t z = 0; z < sl; z++)
@@ -813,7 +898,8 @@ static int img_block(const Tex *e, int *bw, int *bh) {
 static int alias_compatible(const Tex *e, const Tex *src) {
     const VkTexImage *p = &e->pub, *q = &src->pub;
     if (e->f.depth || e->f.stencil || src->f.depth || src->f.stencil || p->samples > 1 || q->samples > 1) return 0;
-    if (p->type != q->type || p->width != q->width || p->height != q->height || p->depth != q->depth) return 0;
+    if (p->type != q->type || p->width != q->width || p->height != q->height || p->depth != q->depth ||
+        p->lod_drop != q->lod_drop) return 0;
     if (e->t.L.size != src->t.L.size || nvn_tex_is_linear(&e->t.d) != nvn_tex_is_linear(&src->t.d)) return 0;
     int ew, eh, sw, sh, eb = img_block(e, &ew, &eh), sb = img_block(src, &sw, &sh);
     return eb && eb == sb && ew == sw && eh == sh;
@@ -1278,7 +1364,11 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         log_limited(&n_ds, "texels of packed depth-stencil format %#x are not copied", e->t.d.format);
         return 0;
     }
-    if (g->level >= e->pub.levels) return 0;
+    if (e->pub.rt_div > 1) return 0;   // made at a smaller size (OCARINA_DEPTH_SCALE): the regions do not apply
+    int have;
+    uint32_t ilevel = vk_tex_level(&e->pub, g->level, &have);
+    if (!have) return write;   // a dropped level (OCARINA_TEX_MIP_DROP): nothing to write, nothing to read
+    if (ilevel >= e->pub.levels) return 0;
     uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height;
     int rgb = e->f.expand_rgb, astc = e->f.astc_bw != 0, agpu = astc && write && vk_astc_gpu();
     size_t texels = (size_t)w * h, ib = agpu ? 0 : astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
@@ -1307,7 +1397,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
             }
         }
         rg[z] = (VkBufferImageCopy){.bufferOffset = slice * (size_t)z,
-                                    .imageSubresource = {aspect, g->level, g->is3d ? 0 : g->layer0 + (uint32_t)r->zoffset + (uint32_t)z, 1},
+                                    .imageSubresource = {aspect, ilevel, g->is3d ? 0 : g->layer0 + (uint32_t)r->zoffset + (uint32_t)z, 1},
                                     .imageOffset = {r->xoffset, r->yoffset, g->is3d ? r->zoffset + z : 0},
                                     .imageExtent = {w, h, 1}};
     }
@@ -1433,8 +1523,9 @@ void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, co
 static void write_back(Tex *e) {
     const nvn_texdesc *d = &e->t.d;
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D;
-    uint32_t levels = linear ? 1 : e->pub.levels, layers = linear || is3d ? 1 : e->pub.layers;
-    for (uint32_t lv = 0; lv < levels; lv++)
+    uint32_t drop = linear ? 0 : e->pub.lod_drop;
+    uint32_t levels = linear ? 1 : e->pub.levels + drop, layers = linear || is3d ? 1 : e->pub.layers;
+    for (uint32_t lv = drop; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
             view_t v = {.set_levels = 1, .set_layers = 1, .base_level = (uint8_t)lv, .min_layer = (uint16_t)ly};
             NVNcopyRegion r = {.width = (int)mip(d->width, lv),
@@ -1835,6 +1926,104 @@ void vk_texture_census(VkTexCensus *s) {
         else s->live++, s->own_live += e->alloc != NULL, s->bytes_live += bytes;
     }
     unlock();
+}
+
+// Frente O (ocarina-ps4, 2026-11-08): who holds the device memory. OCARINA_VRAM_CENSUS=<frames> logs, every that many
+// frames when the VMA device-local bytes grew by 64 MiB or more since the last census (and once at the first image
+// that fails to get memory), the texture images by class and the largest ones. Classes: astc (ASTC decoded on the
+// host or the GPU into the image format), rt (an image the GPU wrote: render, copy or storage target), depth, tex (any
+// other mirrored texture), other. "rel" = released entries kept for reuse (TextureFinalize).
+static int census_every = -1, census_top = 40;
+static uint64_t census_step = 64ull << 20;   // OCARINA_VRAM_CENSUS_MIB: growth that triggers a census (0: every time)
+static uint64_t census_last_dev;
+
+static const char *tex_class(const Tex *e) {
+    if (e->f.depth || e->f.stencil) return "depth";
+    if (e->f.astc_bw) return "astc";
+    if (e->pub.gpu_owned || !e->pub.mirrored) return "rt";
+    if (e->pub.mirrored) return "tex";
+    return "other";
+}
+
+static int bytes_desc(const void *a, const void *b) {
+    uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+void vk_texture_census_log(const char *why) {
+    VkCtx *c = vk_ctx();
+    if (!c) return;
+    static const char *const cls[] = {"astc", "rt", "depth", "tex", "other"};
+    uint64_t n[5][2] = {{0}}, b[5][2] = {{0}}, bound = 0, total = 0;
+    lock();
+    uint64_t (*list)[2] = malloc(sizeof *list * (size_t)(by_key.n + 1));
+    uint32_t nl = 0;
+    for (uint32_t i = 0; i < by_key.cap; i++) {
+        const Tex *e = by_key.vals[i];
+        if (!e) continue;
+        if (!e->alloc) { bound++; continue; }
+        VmaAllocationInfo ai;
+        vmaGetAllocationInfo(c->vma, e->alloc, &ai);
+        const char *k = tex_class(e);
+        int ci = 0;
+        while (ci < 4 && strcmp(cls[ci], k)) ci++;
+        n[ci][e->released != 0]++, b[ci][e->released != 0] += ai.size, total += ai.size;
+        if (list) list[nl][0] = ai.size, list[nl][1] = (uint64_t)(uintptr_t)e, nl++;
+    }
+    uint64_t dev = 0, host = 0;
+    vk_vma_usage(&dev, &host);
+    const double M = 1048576.0;
+    rt_log("vram census (%s): vma %.0f MiB local + %.0f host; own-memory texture images %.0f MiB in %u (%llu bound into "
+           "pools); made without their largest levels %llu, %.0f MiB at creation", why, dev / M, host / M, total / M, nl,
+           (unsigned long long)bound, (unsigned long long)n_dropped, dropped_bytes / M);
+    uint64_t phys, mirror, shadow;
+    vk_mem_vram_parts(&phys, &mirror, &shadow);
+    VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(c->vma, vb);
+    uint64_t la = 0, lb = 0, ln = 0, lk = 0;
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            la += vb[h].statistics.allocationBytes, lb += vb[h].statistics.blockBytes,
+                ln += vb[h].statistics.allocationCount, lk += vb[h].statistics.blockCount;
+    rt_log("vram census:   local: %.0f MiB in %llu blocks, %.0f MiB in %llu allocations (%.0f MiB free inside blocks); "
+           "pools: physical %.0f MiB, VRAM mirrors %.0f MiB, shadow storage %.0f MiB", lb / M, (unsigned long long)lk,
+           la / M, (unsigned long long)ln, (lb - la) / M, phys / M, mirror / M, shadow / M);
+    for (int i = 0; i < 5; i++)
+        if (n[i][0] || n[i][1])
+            rt_log("vram census:   %-5s live %llu %.1f MiB, released %llu %.1f MiB", cls[i], (unsigned long long)n[i][0],
+                   b[i][0] / M, (unsigned long long)n[i][1], b[i][1] / M);
+    if (list) {
+        qsort(list, nl, sizeof *list, bytes_desc);
+        for (uint32_t i = 0; i < nl && i < (uint32_t)census_top; i++) {
+            const Tex *e = (const Tex *)(uintptr_t)list[i][1];
+            const VkTexImage *p = &e->pub;
+            rt_log("vram census:   %7.1f MiB %-5s nvn %#x vk %d %ux%ux%u target %d levels %u layers %u usage %#x%s%s%s%s",
+                   list[i][0] / M, tex_class(e), e->t.d.format, (int)p->format, p->width, p->height, p->depth,
+                   e->t.d.target, p->levels, p->layers, (unsigned)p->usage, p->mirrored ? " mirrored" : "",
+                   p->gpu_owned ? " gpu-written" : "", e->released ? " released" : "",
+                   p->lod_drop ? " dropped" : p->rt_div > 1 ? " scaled" : "");
+        }
+        free(list);
+    }
+    census_last_dev = dev;
+    unlock();
+}
+
+void vk_texture_census_frame(uint64_t frame) {
+    if (census_every < 0) {
+        const char *s = cfg_get("OCARINA_VRAM_CENSUS");
+        census_every = s && *s ? atoi(s) : 0;
+        const char *t = cfg_get("OCARINA_VRAM_CENSUS_TOP"), *m = cfg_get("OCARINA_VRAM_CENSUS_MIB");
+        if (t && *t) census_top = atoi(t);
+        if (m && *m) census_step = (uint64_t)atoi(m) << 20;
+    }
+    if (census_every <= 0 || frame % (uint64_t)census_every) return;
+    uint64_t dev = 0, host = 0;
+    vk_vma_usage(&dev, &host);
+    if (census_step && dev < census_last_dev + census_step) return;
+    char why[48];
+    snprintf(why, sizeof why, "frame %llu", (unsigned long long)frame);
+    vk_texture_census_log(why);
 }
 
 void vk_texture_shutdown(void) {

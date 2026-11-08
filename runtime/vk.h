@@ -335,7 +335,16 @@ typedef struct {
     uint8_t fb_usage;              // created with ATTACHMENT_FEEDBACK_LOOP usage (VK_FEEDBACK_LAYOUT, attachable images)
     uint8_t fb_learned;            // a draw sampled it while it was a written attachment of the open pass: its passes
                                    // attach it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (vk_exec.c vk_exec_pass_begin)
+    uint8_t lod_drop;              // frente O (OCARINA_TEX_MIP_DROP): the image lacks the texture's lod_drop largest levels;
+                                   // image level k is the texture's level k + lod_drop (vk_tex_level maps)
+    uint8_t rt_div;                // frente O (OCARINA_DEPTH_SCALE): a depth target made at 1/rt_div of its size (0, 1: full);
+                                   // passes into it draw at that scale (vk_exec.c VkExec.pass_div)
 } VkTexImage;
+// The image level of a texture level (lod_drop): 0 and *ok = 0 when the image lacks it (a dropped level).
+static inline uint32_t vk_tex_level(const VkTexImage *img, uint32_t level, int *ok) {
+    *ok = level >= img->lod_drop;
+    return *ok ? level - img->lod_drop : 0;
+}
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).
 const VkTexImage *vk_texture_by_id(const dpool_ref *pool, int id, view_t *view, int *has_view);
@@ -377,6 +386,11 @@ void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
 // (images not bound into pool memory).
 typedef struct { uint64_t live, released, own_live, own_released, bytes_live, bytes_released; } VkTexCensus;
 void vk_texture_census(VkTexCensus *s);
+// Frente O: OCARINA_VRAM_CENSUS=<frames>: texture images by class and the largest ones (vk_texture.c).
+void vk_texture_census_log(const char *why);
+void vk_texture_census_frame(uint64_t frame);
+void vk_vma_usage(uint64_t *dev, uint64_t *host);
+void vk_mem_vram_parts(uint64_t *phys, uint64_t *mirror, uint64_t *shadow);
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
 uint32_t vk_texture_epoch(void);                    // the write-watch snapshot epoch vk_texture_new_submit started

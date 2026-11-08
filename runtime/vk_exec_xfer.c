@@ -395,7 +395,9 @@ static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopy
         warn_once(W_FORMAT, "copy of depth-stencil format %#x texture: skipped", t->d.format);
         return 0;
     }
-    s->level = has_v && v->set_levels ? v->base_level : 0;
+    int have_level;
+    s->level = vk_tex_level(img, has_v && v->set_levels ? v->base_level : 0, &have_level);
+    if (!have_level) return 0;   // a level the image was made without (OCARINA_TEX_MIP_DROP)
     s->layer0 = has_v && v->set_layers ? v->min_layer : 0;
     uint32_t lw = max1(img->width >> s->level), lh = max1(img->height >> s->level);
     s->x = r->xoffset, s->y = r->yoffset, s->z = r->zoffset;
@@ -534,7 +536,9 @@ static int decoded_astc_sub(const tex_t *t, const view_t *v, int has_v, const NV
     if (has_v && (v->set_format || v->set_target || v->set_swizzle || v->set_dsmode)) return 0;
     memset(s, 0, sizeof *s);
     s->img = img, s->aspect = VK_IMAGE_ASPECT_COLOR_BIT, s->f = *f;
-    s->level = has_v && v->set_levels ? v->base_level : 0;
+    int have_level;
+    s->level = vk_tex_level(img, has_v && v->set_levels ? v->base_level : 0, &have_level);
+    if (!have_level) return 0;   // a level the image was made without (OCARINA_TEX_MIP_DROP)
     s->layer0 = has_v && v->set_layers ? v->min_layer : 0;
     uint32_t levels = has_v && v->set_levels ? v->nlevels : img->levels;
     uint32_t layers = has_v && v->set_layers ? v->nlayers : img->layers;
