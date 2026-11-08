@@ -1388,6 +1388,183 @@ void plat_log_line(const char *line, size_t n) {
 extern int32_t sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t align, int64_t *out_start,
                                                   size_t *out_size);
 extern int32_t sceKernelAvailableFlexibleMemorySize(size_t *size);
+// ---- censo do malloc no PS4 (frente N, 2026-11-08). OCARINA_MALLOC_CENSUS=1: o malloc vivo do processo por pilha,
+// por amostragem proporcional aos bytes (como o tools/memprof/malloc_census.so do Linux): cada thread desconta os bytes
+// que aloca de um contador de CENSUS_SAMPLE; a alocação que o zera é amostrada e pesa max(tamanho, CENSUS_SAMPLE). A
+// pilha são os primeiros endereços de retorno candidatos (valores da pilha que caem no código do executável, como no
+// tratador de faltas), em totk+<deslocamento>, para simbolizar com o ocarina.map. A cada 10 s o monitor loga o total
+// estimado e as pilhas que mais seguram. Liga só depois do args.txt (no primeiro commit de memória do jogo); o que o
+// boot alocou antes não entra. O link do PS4 passa --wrap=malloc e as irmãs (tools/build_game.py); desligado, cada
+// chamada custa um teste.
+void *__real_malloc(size_t n);
+void __real_free(void *p);
+void *__real_calloc(size_t a, size_t b);
+void *__real_realloc(void *p, size_t n);
+void *__real_aligned_alloc(size_t al, size_t n);
+int __real_posix_memalign(void **out, size_t al, size_t n);
+void *__real_memalign(size_t al, size_t n);
+
+#define CENSUS_SAMPLE (256u << 10)
+#define CENSUS_DEPTH 8
+#define CENSUS_STACKS 4096
+#define CENSUS_PTRS (1u << 17)
+typedef struct { uint64_t h; uint32_t pc[CENSUS_DEPTH]; int n; int64_t live, peak, allocs; } CStack;
+typedef struct { void *p; int32_t st; int64_t w; } CPtr;
+static volatile int census_on;
+static CStack *c_st;
+static CPtr *c_ptr;
+static int c_nst;
+static int64_t c_live;   // estimado, todas as pilhas
+static PlatMutex c_lock = PLAT_MUTEX_INIT;
+static __thread int64_t c_left = CENSUS_SAMPLE;
+static __thread int c_in;
+
+static uint32_t cptr_slot(void *p) { return (uint32_t)(((uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull >> 47) & (CENSUS_PTRS - 1); }
+
+static int census_stack(uint32_t *pc) {
+    uintptr_t lo = (uintptr_t)__text_start, hi = (uintptr_t)__eh_frame_start;
+    if (!lo || !hi) return 0;
+    const uint64_t *sp = (const uint64_t *)__builtin_frame_address(0);
+    int lim = 256, n = 0;   // 2 KiB acima do quadro: numa pilha de thread da Sony não passamos do topo
+    int nl = __atomic_load_n(&nlstk, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nl; i++)
+        if (lstk[i].live && (uint64_t)(uintptr_t)sp >= lstk[i].base && (uint64_t)(uintptr_t)sp < lstk[i].end) {
+            uint64_t q = (lstk[i].end - (uint64_t)(uintptr_t)sp) / 8;
+            lim = q < 1024 ? (int)q : 1024;
+        }
+    for (int i = 2; i < lim && n < CENSUS_DEPTH; i++)   // [0], [1]: o quadro do próprio embrulho
+        if (sp[i] >= lo && sp[i] < hi) pc[n++] = (uint32_t)(sp[i] - lo);
+    return n;
+}
+
+static void census_note(void *p, size_t n) {
+    if (!p || c_in) return;
+    c_left -= (int64_t)n;
+    if (c_left > 0) return;
+    c_left = CENSUS_SAMPLE;
+    c_in = 1;
+    int64_t w = n > CENSUS_SAMPLE ? (int64_t)n : (int64_t)CENSUS_SAMPLE;
+    uint32_t pc[CENSUS_DEPTH] = {0};
+    int k = census_stack(pc);
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < k; i++) h = (h ^ pc[i]) * 1099511628211ull;
+    plat_mutex_lock(&c_lock);
+    int s = -1;
+    for (int i = 0; i < c_nst; i++)
+        if (c_st[i].h == h) { s = i; break; }
+    if (s < 0 && c_nst < CENSUS_STACKS) {
+        s = c_nst++;
+        c_st[s].h = h, c_st[s].n = k;
+        memcpy(c_st[s].pc, pc, sizeof pc);
+    }
+    if (s >= 0) {
+        uint32_t j = cptr_slot(p);
+        for (int t = 0; t < 64; t++, j = (j + 1) & (CENSUS_PTRS - 1))
+            if (!c_ptr[j].p || c_ptr[j].p == (void *)1) {
+                c_ptr[j].p = p, c_ptr[j].st = s, c_ptr[j].w = w;
+                c_st[s].live += w, c_st[s].allocs++;
+                if (c_st[s].live > c_st[s].peak) c_st[s].peak = c_st[s].live;
+                c_live += w;
+                break;
+            }
+    }
+    plat_mutex_unlock(&c_lock);
+    c_in = 0;
+}
+
+static void census_forget(void *p) {
+    if (!p) return;
+    uint32_t j = cptr_slot(p);
+    for (int t = 0; t < 64; t++, j = (j + 1) & (CENSUS_PTRS - 1)) {
+        void *q = __atomic_load_n(&c_ptr[j].p, __ATOMIC_RELAXED);
+        if (!q) return;
+        if (q != p) continue;
+        plat_mutex_lock(&c_lock);
+        if (c_ptr[j].p == p) {
+            c_st[c_ptr[j].st].live -= c_ptr[j].w;
+            c_live -= c_ptr[j].w;
+            c_ptr[j].p = (void *)1;   // lápide: a sonda linear segue por ela
+        }
+        plat_mutex_unlock(&c_lock);
+        return;
+    }
+}
+
+void *__wrap_malloc(size_t n) {
+    void *p = __real_malloc(n);
+    if (census_on) census_note(p, n);
+    return p;
+}
+void __wrap_free(void *p) {
+    if (census_on) census_forget(p);
+    __real_free(p);
+}
+void *__wrap_calloc(size_t a, size_t b) {
+    void *p = __real_calloc(a, b);
+    if (census_on) census_note(p, a * b);
+    return p;
+}
+void *__wrap_realloc(void *p, size_t n) {
+    if (census_on) census_forget(p);
+    void *q = __real_realloc(p, n);
+    if (census_on) census_note(q, n);
+    return q;
+}
+void *__wrap_aligned_alloc(size_t al, size_t n) {
+    void *p = __real_aligned_alloc(al, n);
+    if (census_on) census_note(p, n);
+    return p;
+}
+int __wrap_posix_memalign(void **out, size_t al, size_t n) {
+    int r = __real_posix_memalign(out, al, n);
+    if (census_on && !r) census_note(*out, n);
+    return r;
+}
+void *__wrap_memalign(size_t al, size_t n) {
+    void *p = __real_memalign(al, n);
+    if (census_on) census_note(p, n);
+    return p;
+}
+
+static void census_init(void) {
+    char v[8];
+    if (!(plat_getenv("OCARINA_MALLOC_CENSUS", v, sizeof v) && v[0] == '1')) return;
+    c_in = 1;
+    c_st = __real_calloc(CENSUS_STACKS, sizeof *c_st);
+    c_ptr = __real_calloc(CENSUS_PTRS, sizeof *c_ptr);
+    c_in = 0;
+    if (!c_st || !c_ptr) return;
+    __atomic_store_n(&census_on, 1, __ATOMIC_RELEASE);
+    rt_log("orbis malloc: censo ligado (amostra a cada %u KiB; OCARINA_MALLOC_CENSUS)", CENSUS_SAMPLE >> 10);
+}
+
+static int cst_cmp(const void *x, const void *y) {
+    int64_t a = ((const CStack *)x)->live, b = ((const CStack *)y)->live;
+    return a < b ? 1 : a > b ? -1 : 0;
+}
+
+static void census_report(void) {
+    if (!census_on) return;
+    static CStack top[CENSUS_STACKS];
+    c_in = 1;
+    plat_mutex_lock(&c_lock);
+    int n = c_nst;
+    memcpy(top, c_st, (size_t)n * sizeof *top);
+    int64_t live = c_live;
+    plat_mutex_unlock(&c_lock);
+    qsort(top, (size_t)n, sizeof *top, cst_cmp);
+    rt_log("orbis malloc: ~%lld MiB vivos desde o censo, em %d pilhas", (long long)(live >> 20), n);
+    for (int i = 0; i < n && i < 14 && top[i].live >= (4 << 20); i++) {
+        char line[300];
+        int k = snprintf(line, sizeof line, "orbis malloc:   %5lld MiB (pico %lld, %lld amostras) totk+", (long long)(top[i].live >> 20),
+                         (long long)(top[i].peak >> 20), (long long)top[i].allocs);
+        for (int j = 0; j < top[i].n && k < (int)sizeof line - 12; j++)
+            k += snprintf(line + k, sizeof line - k, "%s%x", j ? " " : "", top[i].pc[j]);
+        rt_log("%s", line);
+    }
+    c_in = 0;
+}
+
 static void mem_inventory(int blocks_too);
 static void mem_report(const char *why) {
     int64_t st = 0;
@@ -1423,8 +1600,9 @@ static void *mem_monitor(void *arg) {
     (void)arg;
     uint64_t last = 0;
     int dirty_said = 0;
-    for (;;) {
+    for (unsigned it = 1;; it++) {
         usleep(2000000);
+        if (!(it % 5)) census_report();
         if (ph_view && dirty_said < 6) {   // o coringa sujo: a GPU escreveu numa área "intocada" de um pool
             uint64_t nz = 0, first = 0;
             for (uint64_t i = 0; i < WIN / 8; i++)
@@ -1464,6 +1642,7 @@ static int lazy_commit(void) {
         on = !(plat_getenv("OCARINA_EAGER_COMMIT", v, sizeof v) && v[0] == '1');
         mem_report(on ? "início, commit preguiçoso" : "início, commit imediato");
         if (on) pg_init();
+        census_init();
         pthread_t t;
         if (!pthread_create(&t, NULL, mem_monitor, NULL)) pthread_detach(t);
     }

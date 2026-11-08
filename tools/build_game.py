@@ -808,7 +808,8 @@ def orbis_setup(args):
                      f'-Wl,--script={cmd_path(sdk / "toolchain" / "orbis-tls.ld")}', '-Wl,--eh-frame-hdr',
                      '-Wl,--no-rosegment', f'-L {cmd_path(oo / "lib")}', f'-L {cmd_path(deps / "lib")}',
                      '-Wl,--whole-archive', cmd_path(compat / 'build' / 'liborbis-compat.a'), '-Wl,--no-whole-archive',
-                     '"-Wl,-Map=$builddir/ocarina.map"']
+                     '"-Wl,-Map=$builddir/ocarina.map"'] +                     [f'-Wl,--wrap={f}' for f in ('malloc', 'free', 'calloc', 'realloc', 'aligned_alloc',
+                                                   'posix_memalign', 'memalign')]   # o censo do malloc (orbis.c)
     # O RADV inteiro (nada o abre depois por dlopen) e a zlib dele logo atrás; dav1d, opus e zstd estáticos.
     LINK_LIBS[:] = (['-Wl,--whole-archive', cmd_path(radv), '-Wl,--no-whole-archive', cmd_path(zlib[0]),
                      '-l:libdav1d.a', '-l:libopus.a', '-l:libzstd.a'] + ORBIS_SCE_LIBS +
