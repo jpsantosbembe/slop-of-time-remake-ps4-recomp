@@ -2121,7 +2121,12 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     char hex[65], code_path[PATH_CAP + 80], spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80];
     key_hex(key, hex);
 #ifdef __ORBIS__
-    if (xlate_absent()) return note_missing(r, hex, control, code, skip, a);
+    if (xlate_absent()) {
+        // tools/sync_missing.sh devolve a tradução feita no PC com o nome da chave do pedido (a que foi para missing/),
+        // não com a chave final (que depende da máscara de uso); sem tradutor, ela vale como está.
+        if (!r->final && (s = request_disk_load(r, key, r->iid))) return plat_inc64(&n_hits), mem_insert(s);
+        return note_missing(r, hex, control, code, skip, a);
+    }
 #endif
     mkdir_p(cache_dir);
     snprintf(code_path, PATH_CAP + 80, "%s/%s.code", cache_dir, hex);
