@@ -327,3 +327,4 @@ int probe_movie(void);                                     // movie_probe.c: hos
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 int gfx_shader_lower_stages(const char *pack, const char *dir);   // gfx_shader.c: --lower-stages (shader_extract.py --pack)
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
+int vk_pipeline_prepare_big_compute(void);                 // vk_pipeline.c: --preparar-compute (frente C)

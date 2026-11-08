@@ -544,6 +544,9 @@ int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics 
 // No-op without vk_pipeline_async_enable, with TOTK_PIPE_PREBUILD=0 or with TOTK_GPU=null.
 void vk_pipeline_prewarm(void);
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
+// ocarina-ps4 (frente C): um compute que o jogo deixa de criar (DKB_SKIP_CS, blit no lugar): se for gigante, fica em
+// big-compute.txt como "pulado" e o --preparar-compute não o compila.
+void vk_pipeline_big_compute_skipped(const GfxShader *cs, uint64_t origin);
 int vk_pipeline_compute_ready(const GfxShader *cs);   // LOCAL TEST (Ocarina): 0 while a big compute shader builds in the background
 // Records every dynamic state that VkPipeState determines, after binding a graphics pipeline: cull mode, front face,
 // topology, depth and stencil tests and ops, depth bias enable, rasterizer discard, vertex input, and, where the GPU

@@ -465,7 +465,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-shader-geometry | --probe-vkmem | "
-                    "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-astc-gpu | --probe-movie | --prepare-shaders | --seed-nvn2 | --warm-shaders | --lower-stages PACK DIR | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-astc-gpu | --probe-movie | --prepare-shaders | --preparar-compute | --seed-nvn2 | --warm-shaders | --lower-stages PACK DIR | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -623,6 +623,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--seed-nvn2")) return seed_nvn2();
     if (!strcmp(mode, "--lower-stages")) return gfx_shader_lower_stages(lower_pack, lower_dir);
     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
+    if (!strcmp(mode, "--preparar-compute")) return vk_pipeline_prepare_big_compute();   // frente C
     if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
     return usage(argv[0]);
 }
