@@ -65,6 +65,7 @@ import ctypes
 import ctypes.wintypes as wt   # the job-object structures below; importing it works on every OS
 import hashlib
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -823,12 +824,46 @@ def orbis_setup(args):
     print(f'build_game: alvo PS4 (bundle {sdk}, mesa {mesa}, kit {kit}, deps {deps})')
 
 
+# Membros do RADV que são o winsys/WSI do PS4: mudam o envio à GPU, não o código que o compilador gera. Ficam fora da
+# identidade do cache, para uma correção no winsys não esfriar o mesa-cache (os compute shaders gigantes custam mais de
+# 1 GiB de pico no ACO do console para recompilar). O que o winsys decide e muda os shaders (ORBIS_BIG_NIR,
+# ac_orbis_strict_vtx_align) já entra no pipelineCacheUUID do próprio RADV.
+MESA_ID_SKIP = ('ac_orbis_drm.c.o', 'wsi_orbis.c.o', 'radv_orbis_winsys.c.o')
+
+
+def ar_members(path):
+    """(nome, conteúdo) de cada membro de um arquivo .a (formato ar, com a tabela GNU de nomes longos)."""
+    d = Path(path).read_bytes()
+    if d[:8] != b'!<arch>\n':
+        sys.exit(f'build_game: {path} não é um arquivo ar')
+    i, longnames = 8, b''
+    while i + 60 <= len(d):
+        name = d[i:i + 16].decode().strip()
+        size = int(d[i + 48:i + 58].decode().strip())
+        body = d[i + 60:i + 60 + size]
+        i += 60 + size + (size & 1)
+        if name == '//':
+            longnames = body
+            continue
+        if name in ('/', '/SYM64/'):
+            continue
+        if name.startswith('/') and name[1:].isdigit():
+            o = int(name[1:])
+            name = longnames[o:longnames.index(b'/\n', o)].decode()
+        yield name.rstrip('/'), body
+
+
 def orbis_mesa_id(out):
-    """<out>/mesa_id.c com o SHA-256 (16 hex) do libvulkan_radeon.a ligado; reescrito só quando muda."""
+    """<out>/mesa_id.c com o SHA-256 (16 hex) dos membros do libvulkan_radeon.a ligado, menos o winsys do PS4
+    (MESA_ID_SKIP); reescrito só quando muda."""
     h = hashlib.sha256()
-    with open(ORBIS['link_deps'][0], 'rb') as f:
-        for b in iter(lambda: f.read(1 << 20), b''):
-            h.update(b)
+    for name, body in ar_members(ORBIS['link_deps'][0]):
+        if name in MESA_ID_SKIP:
+            continue
+        h.update(name.encode() + b'\0')
+        # o hash do commit (git_sha1.h) entra em radv_physical_device e radv_debug_hang: normalizado, para o id não mudar
+        # só porque o commit mudou
+        h.update(re.sub(rb'\(git-[0-9a-f]+\)', b'(git-)', body))
     src = out / 'mesa_id.c'
     text = f'const char ocarina_mesa_id[] = "{h.hexdigest()[:16]}";\n'
     if not src.is_file() or src.read_text() != text:
