@@ -33,7 +33,11 @@
 enum { R_NOT_READY = 0x1c266f };   // (result & 0x3fffff) - 0x1c2000 == 0x66f: "try again" for the game's wrapper
 // QUEUED: packets the decoder takes ahead of the buffers for their pictures, as Eglantine's video session does
 // (nx2_gsv.h, INx2VideoSession::MaxQueuedInputs); a submission past them answers "not ready".
-enum { SLOTS = 16, DECODERS = 4, WAITERS = 4, QUEUED = 8 };
+// HELD: imagens que o dav1d terminou antes de existir buffer para elas (OCARINA_AV1_FRAME_DELAY), da mais antiga para a
+// mais nova. Cada entrada é uma referência a uma imagem que o dav1d já alocou: mantê-la viva não custa cópia, só a
+// memória do quadro até o buffer do player pegá-la. O dav1d mantém no máximo max_frame_delay quadros em voo, então
+// delay + 1 bastaria; 16 deixa folga para um flush/reinício e para um teto de atraso acima de 8.
+enum { SLOTS = 16, DECODERS = 4, WAITERS = 4, QUEUED = 8, HELD_MAX = 16 };
 enum { S_FREE, S_WAIT, S_FILLED };   // registered; acquired with no picture yet; acquired holding a picture
 enum { FENCE_TAG = 0xc0de0000u };    // fence token: tag | decoder << 8 | buffer
 
@@ -65,6 +69,10 @@ typedef struct {
 // A packet submitted while no buffer was reserved for its picture, decoded once one is (ov_vp9_acquire).
 typedef struct { uint8_t *data; size_t size; int64_t pts; int end; } Packet;
 
+// Uma imagem que o dav1d entregou antes de o player reservar um buffer para ela (OCARINA_AV1_FRAME_DELAY). `pic` é dono
+// da referência; `end` marca a imagem do último pacote do filme depois que o dreno de fim de fluxo terminou.
+typedef struct { Dav1dPicture pic; int64_t pts; int end; } Held;
+
 typedef struct {
     uint64_t key;      // guest Vp9DecoderType; 0: unused
     vpx_codec_ctx_t vpx;
@@ -75,10 +83,16 @@ typedef struct {
     Slot last;         // the newest picture, for packets that show none
     Packet queue[QUEUED];
     int qhead, qn;
+    int delay;         // OCARINA_AV1_FRAME_DELAY quando > 0: max_frame_delay do dav1d e o caminho de decodificar à frente
+    int64_t fed_pts;   // pts do último pacote enviado: reserva quando a imagem não traz o seu
+    Held held[HELD_MAX];
+    int hhead, hn;     // imagens decodificadas antes do buffer delas, da mais antiga para a mais nova
+    int end_pending;   // o pacote de fim ainda não mostrou imagem: o próximo buffer reservado leva a última (ou preto)
 } Dec;
 
 static Dec decs[DECODERS];
-static PlatMutex lock = PLAT_MUTEX_INIT;   // every decoder call; held across a decode (one 960x540 frame, a few ms)
+// every decoder call; held across a decode (a 1080p AV1 frame takes tens of ms on the Jaguar, and so does the end drain)
+static PlatMutex lock = PLAT_MUTEX_INIT;
 
 static Dec *dec_of(uint64_t key) {
     for (int i = 0; i < DECODERS; i++)
@@ -131,17 +145,41 @@ static Slot *oldest_wait(Dec *d) {
     return s;
 }
 
-// Decodes one packet into the waiting buffer s (lock held). A packet that shows nothing leaves s waiting, except the
-// last one: the player then gets the previous picture (or black) marked as the end. Returns the number of events to
-// signal, stored in wake.
-// One AV1 packet through dav1d. Returns 1 with the newest picture as an image (8-bit; 10-bit is shifted down), which stays
-// valid until the next call. ponytail: HDR is not tone mapped, and only 4:2:0 is expected.
+// A imagem de um quadro decodificado (8 bits como está; 10 bits deslocado para baixo, em buffers reusados pela próxima
+// chamada). Com a trava do codec. ponytail: HDR não é mapeado para SDR, e só se espera 4:2:0.
+static int av1_pic_image(Dav1dPicture *pic, vpx_image_t *out) {
+    static uint8_t *conv[3];
+    static size_t conv_cap[3];
+    *out = (vpx_image_t){.d_w = (unsigned)pic->p.w, .d_h = (unsigned)pic->p.h};
+    if (pic->p.bpc == 8) {
+        for (int i = 0; i < 3; i++) out->planes[i] = pic->data[i], out->stride[i] = (int)pic->stride[i ? 1 : 0];
+        return 1;
+    }
+    int shift = pic->p.bpc - 8;
+    for (int i = 0; i < 3; i++) {
+        unsigned w = i ? (pic->p.w + 1u) / 2 : (unsigned)pic->p.w, h = i ? (pic->p.h + 1u) / 2 : (unsigned)pic->p.h;
+        if (conv_cap[i] < (size_t)w * h) {
+            free(conv[i]);
+            conv[i] = malloc((size_t)w * h);
+            if (!conv[i]) rt_fatal("codec: out of memory for an AV1 picture");
+            conv_cap[i] = (size_t)w * h;
+        }
+        for (unsigned y = 0; y < h; y++) {
+            const uint16_t *in16 =
+                (const uint16_t *)((const uint8_t *)pic->data[i] + (ptrdiff_t)y * pic->stride[i ? 1 : 0]);
+            for (unsigned x = 0; x < w; x++) conv[i][(size_t)y * w + x] = (uint8_t)(in16[x] >> shift);
+        }
+        out->planes[i] = conv[i], out->stride[i] = (int)w;
+    }
+    return 1;
+}
+
 static void av1_no_free(const uint8_t *buf, void *cookie) { (void)buf; (void)cookie; }
+// Um pacote AV1 pelo dav1d com os ajustes síncronos (max_frame_delay = 1). Devolve 1 com a imagem mais nova, que vale
+// até a próxima chamada.
 static int av1_decode(Dec *d, const uint8_t *data, size_t size, vpx_image_t *out) {
     static Dav1dPicture pic;
     static int have;
-    static uint8_t *conv[3];
-    static size_t conv_cap[3];
     Dav1dData in = {0};
     if (dav1d_data_wrap(&in, data, size, av1_no_free, NULL) < 0) return 0;
     int got = 0;
@@ -160,30 +198,181 @@ static int av1_decode(Dec *d, const uint8_t *data, size_t size, vpx_image_t *out
             pic = next, have = 1, got = 1;
         }
     }
-    if (!got) return 0;
-    *out = (vpx_image_t){.d_w = (unsigned)pic.p.w, .d_h = (unsigned)pic.p.h};
-    if (pic.p.bpc == 8) {
-        for (int i = 0; i < 3; i++) out->planes[i] = pic.data[i], out->stride[i] = (int)pic.stride[i ? 1 : 0];
-        return 1;
+    return got ? av1_pic_image(&pic, out) : 0;
+}
+
+// ---- AV1 decodificando à frente (OCARINA_AV1_FRAME_DELAY): com max_frame_delay > 1 o dav1d decodifica N imagens ao
+// mesmo tempo e as entrega N-1 pacotes atrasadas. No SDK, movie::VideoDecoder::DecodeAsync só submete o pacote (não
+// espera a imagem), e a thread de saída faz Acquire, espera o fence, copia e Release em separado: o decodificador pode
+// aceitar pacotes muito à frente do buffer que cada imagem vai ocupar, e as imagens esperam aqui (held) pelo buffer delas
+// em vez de segurar a thread do jogo em cada uma. Custo de memória: um quadro 1920x1080 8 bits 4:2:0 tem
+// 1920*1080*3/2 = 3.110.400 bytes (2,97 MiB); o dav1d mantém até N deles em voo (n_fc = min(N, threads)) mais os quadros
+// de referência, então reserve cerca de (2*N + 2) * 3 MiB: ~30 MiB com N=4, ~55 MiB com N=8, além das cópias nos slots do
+// player (até 16 * 3 MiB, que já existem hoje). As cópias dos pacotes somam no máximo N * o tamanho de um quadro
+// comprimido (algumas centenas de KiB a ~1 MiB cada, em AV1 1080p60). O knob é limitado a 8 para o decodificador não
+// surpreender a memória do PS4.
+
+static void held_drop(Dec *d) {
+    for (int i = 0; i < d->hn; i++) dav1d_picture_unref(&d->held[(d->hhead + i) % HELD_MAX].pic);
+    d->hhead = d->hn = 0;
+}
+
+// Copia uma imagem do dav1d para s como NV12, dispara o fence dela e acrescenta os eventos à espera em wake; devolve
+// quantos. Quem chama continua dono de pic. Com a trava do codec.
+static int av1_fill(Dec *d, Slot *s, Dav1dPicture *pic, int64_t pts, int end, uint64_t *wake) {
+    vpx_image_t img;
+    if (av1_pic_image(pic, &img)) {
+        put_picture(s, &img);
+        copy_slot(&d->last, s);
     }
-    int shift = pic.p.bpc - 8;
-    for (int i = 0; i < 3; i++) {
-        unsigned w = i ? (pic.p.w + 1u) / 2 : (unsigned)pic.p.w, h = i ? (pic.p.h + 1u) / 2 : (unsigned)pic.p.h;
-        if (conv_cap[i] < (size_t)w * h) {
-            free(conv[i]);
-            conv[i] = malloc((size_t)w * h);
-            if (!conv[i]) rt_fatal("codec: out of memory for an AV1 picture");
-            conv_cap[i] = (size_t)w * h;
+    s->state = S_FILLED, s->fence_done = 1, s->pts = pts, s->eos = end;
+    int n = 0;
+    for (int k = 0; k < WAITERS; k++)
+        if (s->waiter[k]) wake[n++] = s->waiter[k];
+    memset(s->waiter, 0, sizeof s->waiter);
+    return n;
+}
+
+// O fim de um filme que não mostrou imagem própria: o buffer reservado mais antigo recebe a imagem mais nova (ou preto),
+// marcada como o fim, exatamente como o caminho síncrono faz. Devolve os eventos acrescentados. Com a trava do codec.
+static int end_fill(Dec *d, Slot *s, uint64_t *wake) {
+    if (d->last.nv12) {
+        copy_slot(s, &d->last);
+    } else {
+        vpx_image_t black = {.d_w = 16, .d_h = 16};
+        static uint8_t y[16 * 16], uv[8 * 8];
+        if (!uv[0]) memset(y, 16, sizeof y), memset(uv, 128, sizeof uv);
+        black.planes[0] = y, black.planes[1] = black.planes[2] = uv;
+        black.stride[0] = 16, black.stride[1] = black.stride[2] = 8;
+        put_picture(s, &black);
+    }
+    s->state = S_FILLED, s->fence_done = 1, s->pts = d->fed_pts, s->eos = 1;
+    int n = 0;
+    for (int k = 0; k < WAITERS; k++)
+        if (s->waiter[k]) wake[n++] = s->waiter[k];
+    memset(s->waiter, 0, sizeof s->waiter);
+    return n;
+}
+
+// Passa a imagem retida mais antiga para o buffer reservado mais antigo e depois pega do dav1d toda imagem pronta do
+// mesmo jeito; a que ainda não tem buffer fica em held, da mais antiga para a mais nova. Acrescenta os eventos de fence em
+// wake; *n é a contagem. Com a trava do codec.
+static void av1_pump(Dec *d, uint64_t *wake, int *n) {
+    Slot *s;
+    if (d->end_pending && !d->hn && (s = oldest_wait(d))) {
+        *n += end_fill(d, s, wake + *n);
+        d->end_pending = 0;
+    }
+    while (d->hn && (s = oldest_wait(d))) {
+        Held h = d->held[d->hhead];
+        d->hhead = (d->hhead + 1) % HELD_MAX, d->hn--;
+        *n += av1_fill(d, s, &h.pic, h.pts, h.end, wake + *n);
+        dav1d_picture_unref(&h.pic);
+    }
+    for (;;) {
+        Dav1dPicture p = {0};
+        int r = dav1d_get_picture(d->av1, &p);
+        if (r < 0) break;
+        int64_t pts = p.m.timestamp != INT64_MIN ? p.m.timestamp : d->fed_pts;
+        s = oldest_wait(d);
+        if (s) {
+            *n += av1_fill(d, s, &p, pts, 0, wake + *n);
+            dav1d_picture_unref(&p);
+        } else if (d->hn < HELD_MAX) {
+            d->held[(d->hhead + d->hn) % HELD_MAX] = (Held){p, pts, 0};
+            d->hn++;
+        } else {   // não acontece enquanto HELD_MAX > max_frame_delay; descartar preserva a ordem do resto
+            LOG_FIRST("codec: AV1 à frente: sem lugar para uma imagem decodificada (%d retidas)", d->hn);
+            dav1d_picture_unref(&p);
+            break;
         }
-        for (unsigned y = 0; y < h; y++) {
-            const uint16_t *in16 = (const uint16_t *)((const uint8_t *)pic.data[i] + (ptrdiff_t)y * pic.stride[i ? 1 : 0]);
-            for (unsigned x = 0; x < w; x++) conv[i][(size_t)y * w + x] = (uint8_t)(in16[x] >> shift);
+    }
+}
+
+// Fim de fluxo: dav1d_get_picture até o decodificador não ter mais imagem guardada (o dreno de fim de fluxo documentado
+// do dav1d), preenchendo os buffers reservados em ordem. A última imagem drenada é a do pacote de fim e leva end = 1;
+// quando o decodificador não mostra nenhuma (filme mais curto que o atraso, ou pacote de fim vazio), o próximo buffer
+// reservado recebe a imagem anterior, ou preto. Com a trava do codec.
+static void av1_drain_eos(Dec *d, uint64_t *wake, int *n) {
+    Slot *last_slot = NULL;
+    int last_held = -1, misses = 0;
+    // O get_picture logo depois do send_data não olha as frame threads (o dav1d só as drena na segunda chamada sem dado
+    // novo); dois EAGAIN seguidos querem dizer que as imagens atrasadas já saíram todas.
+    while (misses < 2) {
+        Dav1dPicture p = {0};
+        int r = dav1d_get_picture(d->av1, &p);
+        if (r == DAV1D_ERR(EAGAIN)) {
+            misses++;
+            continue;
         }
-        out->planes[i] = conv[i], out->stride[i] = (int)w;
+        if (r < 0) break;
+        misses = 0;
+        int64_t pts = p.m.timestamp != INT64_MIN ? p.m.timestamp : d->fed_pts;
+        Slot *s = oldest_wait(d);
+        if (s) {
+            *n += av1_fill(d, s, &p, pts, 0, wake + *n);
+            dav1d_picture_unref(&p);
+            last_slot = s, last_held = -1;
+        } else if (d->hn < HELD_MAX) {
+            d->held[(d->hhead + d->hn) % HELD_MAX] = (Held){p, pts, 0};
+            d->hn++, last_held = d->hn - 1, last_slot = NULL;
+        } else {
+            dav1d_picture_unref(&p);
+            break;
+        }
+    }
+    if (last_slot) last_slot->eos = 1;
+    else if (last_held >= 0) d->held[(d->hhead + last_held) % HELD_MAX].end = 1;
+    else if ((last_slot = oldest_wait(d)))
+        *n += end_fill(d, last_slot, wake + *n);   // nenhuma imagem: entrega a anterior (ou preto) já, como o caminho síncrono
+    else d->end_pending = 1;   // sem buffer reservado: o próximo a reservar leva a marca de fim (av1_pump)
+    TRACE("av1 end: last picture %s", last_slot ? "in a buffer" : last_held >= 0 ? "held" : "not shown");
+}
+
+// Pega um pacote no caminho de decodificar à frente. Os dados são copiados para uma alocação do próprio dav1d: com frame
+// threading a biblioteca guarda a referência da entrada até o quadro terminar de decodificar, então embrulhar o buffer do
+// player o deixaria pendurado. Devolve 1 quando o pacote entrou, 0 quando não cabia mais imagem (o chamador responde
+// "not ready"). Com a trava do codec.
+static int av1_feed(Dec *d, const uint8_t *data, size_t size, int64_t pts, int end, uint64_t *wake, int *n) {
+    d->fed_pts = pts;
+    if (size) {
+        if (d->hn == HELD_MAX && !oldest_wait(d)) return 0;
+        Dav1dData in;
+        if (!dav1d_data_create(&in, size)) {
+            LOG_FIRST("codec: out of memory for a %zu-byte AV1 packet", size);
+            return 1;
+        }
+        memcpy((void *)in.data, data, size);
+        in.m.timestamp = pts;
+        int pumps = 0;
+        while (in.sz) {
+            int r = dav1d_send_data(d->av1, &in);
+            if (!r) break;
+            if (r != DAV1D_ERR(EAGAIN)) {
+                LOG_FIRST("codec: AV1 packet of %zu bytes failed: %d", size, r);
+                dav1d_data_unref(&in);
+                break;
+            }
+            if (++pumps > 64) {   // todos os buffers de saída tomados e o held cheio: deixa o player reservar um
+                dav1d_data_unref(&in);
+                return 0;
+            }
+            av1_pump(d, wake, n);
+        }
+    }
+    if (end) {
+        av1_drain_eos(d, wake, n);
+        TRACE("submit %zu bytes pts %lld end: drained the decoder (%d held)", size, (long long)pts, d->hn);
+    } else {
+        TRACE("submit %zu bytes pts %lld: decode ahead (%d held, %d delayed in dav1d)", size, (long long)pts, d->hn,
+              d->delay);
     }
     return 1;
 }
 
+// Decodes one packet into the waiting buffer s (lock held). A packet that shows nothing leaves s waiting, except the
+// last one: the player then gets the previous picture (or black) marked as the end. Returns the number of events to
+// signal, stored in wake.
 static int decode_into(Dec *d, Slot *s, const uint8_t *data, size_t size, int64_t pts, int end, uint64_t wake[WAITERS]) {
     const vpx_image_t *img = NULL, *f;
     vpx_image_t av1_img;
@@ -237,6 +426,7 @@ static void vp9_init(Cpu *c, uint64_t key, unsigned w, unsigned h) {
     if (!d) d = dec_of(0);
     if (!d) rt_fatal("codec: more than %d VP9 decoders", DECODERS);
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
+    held_drop(d);   // antes do dav1d_close: as pictures vivas seguram memória do contexto
     if (d->av1) dav1d_close(&d->av1);
     for (int i = 0; i < SLOTS; i++) free(d->slot[i].nv12);
     free(d->last.nv12);
@@ -261,6 +451,7 @@ static void ov_vp9_fini(Cpu *c) {
     Dec *d = dec_of(arg_x(c, 0));
     if (d) {
         if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
+        held_drop(d);   // antes do dav1d_close: as pictures vivas seguram memória do contexto
         if (d->av1) dav1d_close(&d->av1);
         for (int i = 0; i < SLOTS; i++) free(d->slot[i].nv12);
         free(d->last.nv12);
@@ -278,7 +469,11 @@ static void ov_vp9_flush(Cpu *c) {
     if (d)
         for (int i = 0; i < SLOTS; i++)
             if (d->slot[i].state == S_FILLED) d->slot[i].state = S_WAIT;   // still reserved; its picture is dropped
-    if (d) queue_drop(d);   // and so are the packets not decoded yet
+    if (d) {
+        queue_drop(d);   // and so are the packets not decoded yet
+        held_drop(d);    // and the pictures decoded ahead of their buffers
+        d->end_pending = 0;
+    }
     plat_mutex_unlock(&lock);
     TRACE("flush");
     ret_x(c, 0);
@@ -365,6 +560,23 @@ static void ov_vp9_submit_body(Cpu *c) {
     int end = (int)(arg_x(c, 5) & 1);
     plat_mutex_lock(&lock);
     Dec *d = dec_of(arg_x(c, 1));
+    // Decodificar à frente: o pacote entra mesmo sem buffer reservado para a sua imagem; ela sai atrasada, no buffer que
+    // o player reservar (av1_pump, no próximo Acquire). "not ready" só quando não cabe mais imagem em voo.
+    if (d && d->av1 && d->delay > 0) {
+        uint64_t wake[SLOTS * WAITERS];
+        int n = 0;
+        int taken = av1_feed(d, data, size, pts, end, wake, &n);
+        if (id) *id = d->seq;
+        plat_mutex_unlock(&lock);
+        for (int k = 0; k < n; k++) kern_signal_system_event(wake[k]);
+        if (!taken) {
+            TRACE("submit %zu bytes pts %lld: not ready (atraso cheio)", size, (long long)pts);
+            ret_x(c, R_NOT_READY);
+            return;
+        }
+        ret_x(c, 0);
+        return;
+    }
     Slot *s = d && !d->qn ? oldest_wait(d) : NULL;
     if (!s) {
         int queued = d && d->qn < QUEUED;
@@ -409,12 +621,16 @@ static void ov_vp9_acquire_body(Cpu *c) {
         memset(s->waiter, 0, sizeof s->waiter);
         *index = (uint32_t)got;
         if (fence) *fence = FENCE_TAG | (uint32_t)(d - decs) << 8 | (uint32_t)got;
-        Slot *w;
-        while (d->qn && (w = oldest_wait(d)) && n <= SLOTS * WAITERS - WAITERS) {
-            Packet q = d->queue[d->qhead];
-            d->qhead = (d->qhead + 1) % QUEUED, d->qn--;
-            n += decode_into(d, w, q.data, q.size, q.pts, q.end, wake + n);
-            free(q.data);
+        if (d->av1 && d->delay > 0) {
+            av1_pump(d, wake, &n);   // a imagem que este buffer espera já pode estar pronta (ou vem logo em seguida)
+        } else {
+            Slot *w;
+            while (d->qn && (w = oldest_wait(d)) && n <= SLOTS * WAITERS - WAITERS) {
+                Packet q = d->queue[d->qhead];
+                d->qhead = (d->qhead + 1) % QUEUED, d->qn--;
+                n += decode_into(d, w, q.data, q.size, q.pts, q.end, wake + n);
+                free(q.data);
+            }
         }
     }
     plat_mutex_unlock(&lock);
@@ -596,10 +812,35 @@ static void av1_init(Cpu *c, uint64_t key, unsigned w, unsigned h) {
 #endif
         if (set.n_threads < 1) set.n_threads = 1;
     }
-    set.max_frame_delay = 1;   // a picture per packet: the player waits for each one
+    // ocarina-ps4 (frente filme): OCARINA_AV1_FRAME_DELAY=N (2..8) liga o decodificar à frente, com o frame threading do
+    // dav1d: N quadros decodificam em paralelo e as imagens saem N-1 pacotes atrasadas, preenchendo os buffers que o
+    // player já reservou. 0/ausente/1 mantém o caminho de hoje, quadro a quadro (max_frame_delay = 1), sem mudança.
+    int delay = 0;
+    {
+        const char *fe = getenv("OCARINA_AV1_FRAME_DELAY");
+        delay = fe && *fe ? atoi(fe) : 0;
+        if (delay < 0) delay = 0;
+        if (delay == 1) delay = 0;   // 1 também é o comportamento atual; o knob começa a valer em 2
+        if (delay > 8) {
+            rt_log("codec: OCARINA_AV1_FRAME_DELAY=%d passa do teto de 8 quadros; usando 8", delay);
+            delay = 8;
+        }
+    }
+    set.max_frame_delay = delay ? delay : 1;   // sem o knob: uma picture por pacote, o player espera por cada uma
+    if (d) d->delay = delay;
     if (d && dav1d_open(&d->av1, &set) < 0) d->av1 = NULL;
+    if (d && !d->av1) d->delay = 0;
     plat_mutex_unlock(&lock);
     rt_log("codec: AV1 decoder %ux%u (dav1d %s)%s", w, h, dav1d_version(), d && d->av1 ? "" : " failed to start: pictures stay black");
+    if (delay && d && d->av1) {
+        // n_fc = min(max_frame_delay, n_threads): threads a menos do que o atraso limitam quantos quadros decodificam juntos.
+        int nfc = delay < set.n_threads ? delay : set.n_threads;
+        rt_log("codec: AV1 à frente: atraso de %d quadros, %d threads (dav1d decodifica %d quadros em paralelo)", delay,
+               set.n_threads, nfc);
+        if (nfc < delay)
+            rt_log("codec: AV1 à frente: OCARINA_AV1_THREADS=%d limita o atraso a %d; use %d ou mais", set.n_threads, nfc,
+                   delay);
+    }
 }
 static void ov_av1_init(Cpu *c) { av1_init(c, arg_x(c, 0), arg_x(c, 4) & 0xffff, arg_x(c, 5) & 0xffff); }
 static void ov_av1_init_remote(Cpu *c) { av1_init(c, arg_x(c, 0), arg_x(c, 2) & 0xffff, arg_x(c, 3) & 0xffff); }
