@@ -102,7 +102,8 @@ uint64_t res_heap_extra_bytes(void) { return ((res_heap_extra_kib() << 10) + 0x1
 
 // ---- the HeapDef table. BYML version 2..7, little endian ("YB"): a hash node is {u8 0xC1, u24 count} and count
 // entries {u24 key index, u8 type, u32 value}; an int (type 0xD1) is stored in the entry, so a size changes in place.
-typedef struct { uint8_t *p; size_t n; uint32_t keys; } Byml;
+// A string (type 0xA0) is an index into the string table, as a key is into the key table.
+typedef struct { uint8_t *p; size_t n; uint32_t keys, strs; } Byml;
 
 static int u32_at(const Byml *b, size_t off, uint32_t *v) {
     if (off + 4 > b->n) return 0;
@@ -110,13 +111,15 @@ static int u32_at(const Byml *b, size_t off, uint32_t *v) {
     return 1;
 }
 
-static const char *key_name(const Byml *b, uint32_t k) {
+static const char *table_name(const Byml *b, uint32_t tab, uint32_t k) {
     uint32_t head, at;
-    if (!u32_at(b, b->keys, &head) || (head & 0xff) != 0xc2 || k >= head >> 8 || !u32_at(b, b->keys + 4 + 4 * k, &at) ||
-        b->keys + at >= b->n || !memchr(b->p + b->keys + at, 0, b->n - b->keys - at))
+    if (!tab || !u32_at(b, tab, &head) || (head & 0xff) != 0xc2 || k >= head >> 8 ||
+        !u32_at(b, tab + 4 + 4 * (size_t)k, &at) || tab + at >= b->n || !memchr(b->p + tab + at, 0, b->n - tab - at))
         return NULL;
-    return (const char *)b->p + b->keys + at;
+    return (const char *)b->p + tab + at;
 }
+
+static const char *key_name(const Byml *b, uint32_t k) { return table_name(b, b->keys, k); }
 
 // The offset of the value of hash node `node`'s entry `name`, which must have type `type`; 0 when there is none.
 static size_t field(const Byml *b, uint32_t node, const char *name, uint8_t type) {
@@ -137,54 +140,183 @@ static size_t heap_size_field(const Byml *b, uint32_t heaps, const char *heap) {
     return at && u32_at(b, at, &node) ? field(b, node, "Size", 0xd1) : 0;
 }
 
-int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
+// The name of a heap's parent ("Parent", a string), or NULL for a root heap.
+static const char *heap_parent(const Byml *b, uint32_t heaps, const char *heap) {
+    size_t at = field(b, heaps, heap, 0xc1);
+    uint32_t node, s;
+    size_t p = at && u32_at(b, at, &node) ? field(b, node, "Parent", 0xa0) : 0;
+    return p && u32_at(b, p, &s) ? table_name(b, b->strs, s) : NULL;
+}
+
+// ---- heap sizes by setting (frente N, ocarina-ps4 2026-11-07). OCARINA_HEAPDEF = "<heap>=<MiB>[,<heap>=<MiB>...]"
+// sets heaps of the HeapDef table to the given sizes; each ancestor of a heap set here (its "Parent" chain) changes by
+// the same amount, as the resolution growth does with the texture heap and its parent, unless the setting names it
+// too. Heaps of size 0 (off) or -1 (the rest of their parent) keep it. The point is the PS4: its memory commit never
+// gives a page back, so a heap the game fills like a cache (its texture heap, the resource memory it maps through
+// MapPhysicalMemory) ends up costing its whole size there, more than the console has. The heap names are the game's
+// own (UTF-8), read from its table; nothing here names one.
+static const char *heapdef_setting(void) {
+    const char *s = cfg_get("OCARINA_HEAPDEF");
+    return s && *s && strcmp(s, "0") ? s : NULL;
+}
+
+int res_heapdef_wanted(void) { return res_heap_extra_kib() || heapdef_setting(); }
+
+// Whether the setting names heap `name`.
+static int heapdef_named(const char *set, const char *name) {
+    size_t n = strlen(name);
+    for (const char *p = set; p && *p; p = strchr(p, ',')) {
+        while (*p == ',' || *p == ' ') p++;
+        if (!strncmp(p, name, n) && p[n] == '=') return 1;
+    }
+    return 0;
+}
+
+// Adds delta KiB to the ancestors of heap `name` that the setting does not name and that have a size (> 0).
+static void heapdef_parents(Byml *b, uint32_t heaps, const char *set, const char *name, int32_t delta) {
+    for (int depth = 0; depth < 16; depth++) {
+        const char *p = heap_parent(b, heaps, name);
+        size_t at = p ? heap_size_field(b, heaps, p) : 0;
+        if (!at) return;
+        int32_t v, v2;
+        memcpy(&v, b->p + at, 4);
+        if (!heapdef_named(set, p) && v > 0) {
+            v2 = v + delta < 0 ? 0 : v + delta;
+            memcpy(b->p + at, &v2, 4);
+            rt_log("resolution: HeapDef %s %d -> %d KiB (follows %s)", p, v, v2, name);
+        }
+        name = p;
+    }
+}
+
+static void heapdef_apply_setting(Byml *b, uint32_t heaps) {
+    const char *set = heapdef_setting();
+    if (!set) return;
+    char item[256];
+    for (const char *p = set; *p;) {
+        while (*p == ',' || *p == ' ') p++;
+        size_t n = strcspn(p, ",");
+        if (!n) break;
+        snprintf(item, sizeof item, "%.*s", (int)(n < sizeof item ? n : sizeof item - 1), p);
+        p += n;
+        char *eq = strrchr(item, '='), *end = NULL;
+        long mib = eq ? strtol(eq + 1, &end, 10) : -1;
+        if (!eq || end == eq + 1 || *end || mib < 0 || mib > 0x7fffffff / 1024) {
+            rt_log("resolution: OCARINA_HEAPDEF item \"%s\" is not <heap>=<MiB>; skipped", item);
+            continue;
+        }
+        *eq = 0;
+        size_t at = heap_size_field(b, heaps, item);
+        int32_t v, v2 = (int32_t)mib * 1024;
+        if (!at) {
+            rt_log("resolution: OCARINA_HEAPDEF: the HeapDef table has no heap %s with a size; skipped", item);
+            continue;
+        }
+        memcpy(&v, b->p + at, 4);
+        if (v <= 0) {
+            rt_log("resolution: OCARINA_HEAPDEF: heap %s has size %d (off, or the rest of its parent); kept", item, v);
+            continue;
+        }
+        memcpy(b->p + at, &v2, 4);
+        rt_log("resolution: HeapDef %s %d -> %d KiB (OCARINA_HEAPDEF)", item, v, v2);
+        heapdef_parents(b, heaps, set, item, v2 - v);
+    }
+}
+
+// The zstd dictionary with id `id` from the RomFS dictionary pack (a SARC, zstd compressed without a dictionary), in
+// a new buffer; NULL when there is none.
+static void *zs_dict(const void *pack, size_t pack_n, unsigned id, size_t *dict_n) {
+    if (!pack || !pack_n) return NULL;
+    unsigned long long raw = ZSTD_getFrameContentSize(pack, pack_n);
+    if (raw == ZSTD_CONTENTSIZE_UNKNOWN || raw == ZSTD_CONTENTSIZE_ERROR || raw < 0x20 || raw > (64u << 20)) return NULL;
+    uint8_t *s = malloc((size_t)raw);
+    if (!s || ZSTD_decompress(s, (size_t)raw, pack, pack_n) != raw || memcmp(s, "SARC", 4)) {
+        free(s);
+        return NULL;
+    }
+    uint16_t hl, count = 0;
+    uint32_t data;
+    memcpy(&hl, s + 4, 2);
+    memcpy(&data, s + 12, 4);
+    void *d = NULL;
+    if ((size_t)hl + 12 <= raw && !memcmp(s + hl, "SFAT", 4)) memcpy(&count, s + hl + 6, 2);
+    for (uint32_t i = 0; i < count && !d; i++) {
+        size_t node = (size_t)hl + 12 + 16 * (size_t)i;
+        uint32_t a, e;
+        if (node + 16 > raw) break;
+        memcpy(&a, s + node + 8, 4);
+        memcpy(&e, s + node + 12, 4);
+        if (a >= e || (size_t)data + e > raw || ZSTD_getDictID_fromDict(s + data + a, e - a) != id) continue;
+        if ((d = malloc(e - a))) {
+            memcpy(d, s + data + a, e - a);
+            *dict_n = e - a;
+        }
+    }
+    free(s);
+    return d;
+}
+
+int res_heapdef_build(const void *in, size_t n, const void *dicts, size_t dicts_n, void **out, size_t *out_n) {
     uint64_t extra = res_heap_extra_kib();
     *out = NULL;
-    if (!extra) return 0;
-    if (ZSTD_getDictID_fromFrame(in, n)) {
-        rt_log("resolution: the HeapDef table needs a zstd dictionary; the game keeps its own resolution");
+    if (!res_heapdef_wanted()) return 0;
+    unsigned id = ZSTD_getDictID_fromFrame(in, n);
+    size_t dict_n = 0;
+    void *dict = id ? zs_dict(dicts, dicts_n, id, &dict_n) : NULL;
+    if (id && !dict) {
+        rt_log("resolution: the HeapDef table needs zstd dictionary %#x, which the RomFS dictionary pack lacks; the "
+               "game keeps its own heap sizes", id);
         return 0;
     }
     unsigned long long raw = ZSTD_getFrameContentSize(in, n);
     if (raw == ZSTD_CONTENTSIZE_UNKNOWN || raw == ZSTD_CONTENTSIZE_ERROR || raw > (64u << 20)) {
-        rt_log("resolution: the HeapDef table is not a zstd frame with a size; the game keeps its own resolution");
+        rt_log("resolution: the HeapDef table is not a zstd frame with a size; the game keeps its own heap sizes");
+        free(dict);
         return 0;
     }
-    Byml b = {malloc((size_t)raw), (size_t)raw, 0};
-    if (!b.p) return 0;
-    size_t got = ZSTD_decompress(b.p, b.n, in, n);
+    Byml b = {malloc((size_t)raw), (size_t)raw, 0, 0};
+    ZSTD_DCtx *dc = ZSTD_createDCtx();
+    size_t got = b.p && dc ? ZSTD_decompress_usingDict(dc, b.p, b.n, in, n, dict, dict_n) : 0;
+    ZSTD_freeDCtx(dc);
     uint32_t root, heaps = 0;
     uint16_t ver = 0;
-    if (!ZSTD_isError(got) && got == b.n && b.n >= 16) memcpy(&ver, b.p + 2, 2);
+    if (b.p && !ZSTD_isError(got) && got == b.n && b.n >= 16) memcpy(&ver, b.p + 2, 2);
     size_t heaps_at = 0, dta_at = 0, gfx_at = 0;
-    if (ver >= 2 && ver <= 7 && !memcmp(b.p, "YB", 2) && u32_at(&b, 4, &b.keys) && u32_at(&b, 12, &root) &&
-        (heaps_at = field(&b, root, "Heaps", 0xc1)) && u32_at(&b, heaps_at, &heaps)) {
+    if (ver >= 2 && ver <= 7 && !memcmp(b.p, "YB", 2) && u32_at(&b, 4, &b.keys) && u32_at(&b, 8, &b.strs) &&
+        u32_at(&b, 12, &root) && (heaps_at = field(&b, root, "Heaps", 0xc1)) && u32_at(&b, heaps_at, &heaps)) {
         dta_at = heap_size_field(&b, heaps, "DynamicTextureAllocatorMem");
         gfx_at = heap_size_field(&b, heaps, "Graphics");
     }
-    if (!dta_at || !gfx_at) {
-        rt_log("resolution: the HeapDef table has no DynamicTextureAllocatorMem / Graphics sizes; the game keeps its own "
-               "resolution");
-        free(b.p);
+    if (!heaps || (extra && (!dta_at || !gfx_at))) {
+        rt_log("resolution: the HeapDef table has no %s; the game keeps its own heap sizes",
+               heaps ? "DynamicTextureAllocatorMem / Graphics sizes" : "heaps");
+        free(b.p), free(dict);
         return 0;
     }
-    int32_t dta, gfx;
-    memcpy(&dta, b.p + dta_at, 4);
-    memcpy(&gfx, b.p + gfx_at, 4);
-    int32_t dta2 = dta + (int32_t)extra, gfx2 = gfx + (int32_t)extra;
-    memcpy(b.p + dta_at, &dta2, 4);
-    memcpy(b.p + gfx_at, &gfx2, 4);
-    size_t cap = ZSTD_compressBound(b.n);
+    if (extra) {
+        int32_t dta, gfx;
+        memcpy(&dta, b.p + dta_at, 4);
+        memcpy(&gfx, b.p + gfx_at, 4);
+        int32_t dta2 = dta + (int32_t)extra, gfx2 = gfx + (int32_t)extra;
+        memcpy(b.p + dta_at, &dta2, 4);
+        memcpy(b.p + gfx_at, &gfx2, 4);
+        rt_log("resolution: HeapDef DynamicTextureAllocatorMem %d -> %d KiB, Graphics %d -> %d KiB", dta, dta2, gfx, gfx2);
+    }
+    heapdef_apply_setting(&b, heaps);
+    // With the same dictionary, so the frame names the dictionary id the game's reader expects.
+    size_t cap = ZSTD_compressBound(b.n), zn = 0;
     void *z = malloc(cap);
-    size_t zn = z ? ZSTD_compress(z, cap, b.p, b.n, 9) : 0;
-    free(b.p);
-    if (!z || ZSTD_isError(zn)) {
+    ZSTD_CCtx *cc = ZSTD_createCCtx();
+    if (z && cc) zn = ZSTD_compress_usingDict(cc, z, cap, b.p, b.n, dict, dict_n, 9);
+    int ok = z && cc && !ZSTD_isError(zn);
+    ZSTD_freeCCtx(cc);
+    free(b.p), free(dict);
+    if (!ok) {
         free(z);
         return 0;
     }
     *out = z;
     *out_n = zn;
-    rt_log("resolution: HeapDef DynamicTextureAllocatorMem %d -> %d KiB, Graphics %d -> %d KiB", dta, dta2, gfx, gfx2);
     return 1;
 }
 

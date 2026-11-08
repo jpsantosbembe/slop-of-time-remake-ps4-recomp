@@ -317,39 +317,82 @@ static void added_init(void) {
     rt_log("RomFS overlay: %zu files added to the RomFS", nadded);
 }
 
-// The HeapDef table a bigger game resolution needs (resolution.c): its texture heap and that heap's parent grow. The
-// base is an overlay that replaces the table (a mod's heap sizes stay), else the RomFS original; the grown table is
-// written to <profile>/resolution/ and served in the base's place.
-#define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
-static void heapdef_overlay(void) {
-    if (!res_heap_extra_kib()) return;
-    uint64_t i = lower(HEAPDEF);
-    if (i >= file_count || strcmp(entry_name(entry(i)), HEAPDEF)) {
-        rt_log("RomFS: %s missing; the game keeps its own resolution", HEAPDEF);
-        return;
+// The HeapDef table with other heap sizes (resolution.c): a bigger game resolution grows the texture heap and its
+// parent, OCARINA_HEAPDEF sets heaps by name. The base is an overlay that replaces the table (a mod's heap sizes stay),
+// else the RomFS original; the new table is written to <profile>/resolution/ and served in the base's place.
+// The table is the RomFS's System/HeapSize/Product.*.HeapDef.byml.zs (OCARINA_HEAPDEF_FILE names another); a table
+// compressed with a zstd dictionary takes it from the RomFS dictionary pack (*ZsDic.pack.zs).
+#define HEAPDEF_DIR "System/HeapSize/"
+static uint64_t heapdef_index(void) {
+    const char *want = cfg_get("OCARINA_HEAPDEF_FILE");
+    if (want && *want) {
+        uint64_t i = lower(want);
+        return i < file_count && !strcmp(entry_name(entry(i)), want) ? i : UINT64_MAX;
     }
-    Overlay *base = NULL;
-    for (size_t k = 0; k < noverlay; k++)
-        if (overlays[k].index == i) base = &overlays[k];
+    static const char pre[] = HEAPDEF_DIR "Product.", suf[] = ".HeapDef.byml.zs";
+    for (uint64_t i = lower(pre); i < file_count; i++) {
+        const char *s = entry_name(entry(i));
+        size_t n = strlen(s);
+        if (strncmp(s, pre, sizeof pre - 1)) break;
+        if (n >= sizeof suf - 1 && !strcmp(s + n - (sizeof suf - 1), suf)) return i;
+    }
+    return UINT64_MAX;
+}
+
+// A whole RomFS file (index i, or its replacing overlay base) in a new buffer of at most 16 MiB; NULL on failure.
+static void *read_whole(uint64_t i, const Overlay *base, size_t *n_out) {
     PlatFile *f = base ? open_read(base->path) : image;
     uint64_t off = base ? 0 : entry(i).offset, n = base ? base->size : entry(i).size;
     void *in = n && n < (16u << 20) && f ? malloc((size_t)n) : NULL;
     int ok = in && read_at(f, in, (uint32_t)n, off) == (int64_t)n;
     if (base && f) plat_file_close(f);
+    if (!ok) {
+        free(in);
+        return NULL;
+    }
+    *n_out = (size_t)n;
+    return in;
+}
+
+static void *zs_dict_pack(size_t *n) {
+    static const char suf[] = "ZsDic.pack.zs";
+    for (uint64_t i = 0; i < file_count; i++) {
+        const char *s = entry_name(entry(i));
+        size_t k = strlen(s);
+        if (k >= sizeof suf - 1 && !strcmp(s + k - (sizeof suf - 1), suf)) return read_whole(i, NULL, n);
+    }
+    return NULL;
+}
+
+static void heapdef_overlay(void) {
+    if (!res_heapdef_wanted()) return;
+    uint64_t i = heapdef_index();
+    if (i >= file_count) {
+        rt_log("RomFS: no HeapDef table (%sProduct.*.HeapDef.byml.zs or OCARINA_HEAPDEF_FILE); the game keeps its own "
+               "heap sizes", HEAPDEF_DIR);
+        return;
+    }
+    const char *name = entry_name(entry(i)), *slash = strrchr(name, '/');
+    Overlay *base = NULL;
+    for (size_t k = 0; k < noverlay; k++)
+        if (overlays[k].index == i) base = &overlays[k];
+    size_t n = 0, dn = 0;
+    void *in = read_whole(i, base, &n), *dicts = in ? zs_dict_pack(&dn) : NULL;
     void *out = NULL;
     size_t out_n = 0;
-    ok = ok && res_heapdef_build(in, (size_t)n, &out, &out_n);
+    int ok = in && res_heapdef_build(in, n, dicts, dn, &out, &out_n);
     free(in);
+    free(dicts);
     if (!ok) return;
-    char dir[2100], file[2200];
+    char dir[2100], file[2400];
     need(snprintf(dir, sizeof dir, "%s/resolution", rt_config()->profile) < (int)sizeof dir, "resolution path");
-    need(snprintf(file, sizeof file, "%s/Product.Nin_NX_NVN.HeapDef.byml.zs", dir) < (int)sizeof file, "resolution path");
+    need(snprintf(file, sizeof file, "%s/%s", dir, slash ? slash + 1 : name) < (int)sizeof file, "resolution path");
     plat_file_mkdir_p(dir);
     ok = plat_file_write(file, out, out_n);
     free(out);
     PlatFile *r = ok ? open_read(file) : NULL;
     if (!r) {
-        rt_log("RomFS: cannot write %s; the game keeps its own resolution", file);
+        rt_log("RomFS: cannot write %s; the game keeps its own heap sizes", file);
         return;
     }
     Identity id = identity_of(r);
@@ -367,11 +410,11 @@ static void heapdef_overlay(void) {
             overlays = realloc(overlays, overlay_cap * sizeof *overlays);
             need(overlays != NULL, "overlay table");
         }
-        char *rel = strdup(HEAPDEF);
+        char *rel = strdup(name);
         need(rel != NULL, "overlay path copy");
         overlays[noverlay++] = (Overlay){i, out_n, copy, rel, id};
     }
-    rt_log("RomFS overlay: %s (%zu bytes, grown heaps) replaces %s", file, out_n, base ? "the mod's table" : "the original");
+    rt_log("RomFS overlay: %s (%zu bytes, other heap sizes) replaces %s", file, out_n, base ? "the mod's table" : name);
     res_heapdef_served();
 }
 
