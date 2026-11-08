@@ -1031,6 +1031,7 @@ typedef struct {
     uint8_t *sub;           // estado de cada subpágina
     uint8_t *ww;            // estado de escrita de cada página de 16 KiB; NULL sem watch
     uint8_t *win;           // 1 por janela já mapeada
+    int64_t *woff;          // memória direta de cada janela real (-1 sem); NULL: plat_mem_alloc, nunca devolvida
 } Resv;
 
 static void fault_install(void);   // o tratador do write-watch (abaixo)
@@ -1042,6 +1043,7 @@ static PlatMutex vm_lock = PLAT_MUTEX_INIT;
 static uint64_t mapped_bytes;   // memória direta mapeada nas reservas (plat_commit_info)
 static const volatile uint64_t *ph_view;   // o mesmo bloco, só leitura para a CPU: o monitor confere se segue zerado
 static uint64_t mapped_by_fault, mapped_by_prefault;   // janelas de 2 MiB mapeadas por cada caminho (monitor)
+static uint64_t released_bytes;   // janelas devolvidas por decommit (monitor)
 
 static uint64_t down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
 static uint64_t up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
@@ -1105,6 +1107,21 @@ static int apply_range(const Resv *r, uint64_t a, uint64_t end) {
     return ok;
 }
 
+// Memória direta para as janelas do jogo (frente N, 2026-11-07): primeiro na metade de cima, depois em qualquer lugar.
+// As janelas de 2 MiB entram e saem (commit preguiçoso, devolução no decommit) e espalhariam buracos pela memória
+// direta; quem pede trechos grandes e contíguos (os carve-outs de 128 MiB do mmap do overlay, o VMA do Vulkan) acha a
+// metade de baixo inteira. OCARINA_DMEM_HIGH=0 volta a procurar do início.
+static int32_t dmem_alloc(size_t len, size_t align, int64_t *off) {
+    static int high = -1;
+    if (high < 0) {
+        char v[8];
+        high = !(plat_getenv("OCARINA_DMEM_HIGH", v, sizeof v) && v[0] == '0');
+    }
+    int64_t total = (int64_t)sceKernelGetDirectMemorySize();
+    if (high && !sceKernelAllocateDirectMemory(total / 2, total, len, align, K_WB_ONION, off)) return 0;
+    return sceKernelAllocateDirectMemory(0, total, len, align, K_WB_ONION, off);
+}
+
 // Aloca e mapeia a janela que contém a, recortada na reserva, e a zera. vm_lock seguro. A CONFIRMAR NO CONSOLE: a sonda
 // só provou mapas de 2 MiB alinhados; uma janela recortada (janela do host de 1 MiB, fim da janela dos módulos) usa
 // alinhamento de 16 KiB.
@@ -1113,7 +1130,7 @@ static int map_window(Resv *r, uint64_t a) {
     uint64_t start = w > r->base ? w : r->base, end = w + WIN < r->end ? w + WIN : r->end;
     size_t len = (size_t)(end - start), align = start % WIN == 0 && len == WIN ? WIN : KPAGE;
     int64_t off = 0;
-    int32_t e = sceKernelAllocateDirectMemory(0, (int64_t)sceKernelGetDirectMemorySize(), len, align, K_WB_ONION, &off);
+    int32_t e = dmem_alloc(len, align, &off);
     if (e) {
         fprintf(stderr, "platform: memória direta esgotada (%#x) ao commitar %#llx+%#zx\n", (unsigned)e,
                 (unsigned long long)start, len);
@@ -1129,6 +1146,7 @@ static int map_window(Resv *r, uint64_t a) {
         return 0;
     }
     memset(va, 0, len);   // nenhuma fonte diz que a memória direta nova vem zerada
+    if (r->woff) r->woff[(w - r->win_base) / WIN] = off;
     __atomic_store_n(&r->win[(w - r->win_base) / WIN], 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&mapped_bytes, len, __ATOMIC_RELAXED);
     return 1;
@@ -1260,12 +1278,13 @@ static void mem_report(const char *why) {
     extern void vk_vma_usage(uint64_t *dev, uint64_t *host) __attribute__((weak));
     uint64_t vdev = 0, vhost = 0;
     if (vk_vma_usage) vk_vma_usage(&vdev, &vhost);
-    rt_log("orbis mem (%s): jogo mapeou %llu MiB (toque da CPU %llu, uso da GPU/pread %llu); VMA %llu MiB local + %llu "
+    rt_log("orbis mem (%s): jogo mapeou %llu MiB (toque da CPU %llu, uso da GPU/pread %llu, devolvidas %llu); VMA %llu MiB local + %llu "
            "MiB host; pilhas %llu (%llu MiB); memória direta: maior trecho livre %llu MiB de %llu MiB; flexível livre "
            "%llu MiB; pool interno da libkernel livre %llu KiB", why,
            (unsigned long long)(__atomic_load_n(&mapped_bytes, __ATOMIC_RELAXED) >> 20),
            (unsigned long long)(__atomic_load_n(&mapped_by_fault, __ATOMIC_RELAXED) >> 20),
            (unsigned long long)(__atomic_load_n(&mapped_by_prefault, __ATOMIC_RELAXED) >> 20),
+           (unsigned long long)(__atomic_load_n(&released_bytes, __ATOMIC_RELAXED) >> 20),
            (unsigned long long)(vdev >> 20), (unsigned long long)(vhost >> 20),
            (unsigned long long)__atomic_load_n(&stack_count, __ATOMIC_RELAXED),
            (unsigned long long)(__atomic_load_n(&stack_bytes, __ATOMIC_RELAXED) >> 20),
@@ -1367,6 +1386,37 @@ static int map_placeholder(Resv *r, uint64_t a) {
     return 1;
 }
 
+// Devolve a janela real em w (frente N, 2026-11-07) quando nenhuma subpágina dela segue commitada: o coringa entra por
+// cima com K_MAP_FIXED (o mesmo mapa que a importação de pool usa) e a memória direta volta ao sistema. No PS4 a
+// janela ficava mapeada para sempre: o OoT mapeia e desmapeia memória física no alias (MapPhysicalMemory) e, no New
+// Game, a união das janelas que ele já tocou passa em ~400 MiB as que seguem vivas (medido no Linux). Um toque depois
+// volta pelo lazy_fault, zerada, como qualquer janela nova. vm_lock tomado. A CONFIRMAR NO CONSOLE: o coringa FIXED
+// por cima de um mapa de memória direta (o caminho inverso, real por cima do coringa, já roda). OCARINA_WIN_KEEP=1 desliga.
+static int map_placeholder(Resv *r, uint64_t a);
+static void release_window_locked(Resv *r, uint64_t w) {
+    static int keep = -1;
+    if (keep < 0) {
+        char v[8];
+        keep = plat_getenv("OCARINA_WIN_KEEP", v, sizeof v) && v[0] == '1';
+    }
+    uint64_t at = w > r->base ? w : r->base, end = w + WIN < r->end ? w + WIN : r->end;
+    size_t i = (size_t)((w - r->win_base) / WIN);
+    if (keep || !r->woff || r->woff[i] < 0 || win_state(r, at) != 1) return;
+    for (uint64_t x = at; x < end; x += SUB)
+        if (r->sub[(x - r->base) / SUB] >= SS_NONE) return;
+    int64_t off = r->woff[i];
+    if (!map_placeholder(r, at)) {
+        static int said;
+        if (!said) said = 1, rt_log("orbis: devolver a janela %#llx: o coringa por cima falhou; a janela fica",
+                                    (unsigned long long)at);
+        return;
+    }
+    sceKernelReleaseDirectMemory(off, (size_t)(end - at));
+    r->woff[i] = -1;
+    __atomic_sub_fetch(&mapped_bytes, end - at, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&released_bytes, end - at, __ATOMIC_RELAXED);
+}
+
 void orbis_mem_placeholder(uint64_t addr, uint64_t n) {
     static int off = -1;
     if (off < 0) {
@@ -1412,17 +1462,20 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
         void *a = (void *)(uintptr_t)addr;
         int32_t e = sceKernelReserveVirtualRange(&a, n, K_MAP_FIXED | K_MAP_NO_OVERWRITE, 0);
         if (!e && a == (void *)(uintptr_t)addr) {
-            Resv r = {addr, addr + n, down(addr, WIN), NULL, NULL, NULL};
+            Resv r = {addr, addr + n, down(addr, WIN), NULL, NULL, NULL, NULL};
+            size_t nw = (up(addr + n, WIN) - r.win_base) / WIN;
             r.sub = malloc(n / SUB);
             r.ww = watch ? calloc(n / KPAGE, 1) : NULL;
-            r.win = calloc((up(addr + n, WIN) - r.win_base) / WIN, 1);
-            if (r.sub && r.win && (!watch || r.ww)) {
+            r.win = calloc(nw, 1);
+            r.woff = malloc(nw * sizeof *r.woff);
+            if (r.sub && r.win && r.woff && (!watch || r.ww)) {
                 memset(r.sub, SS_RESERVED, n / SUB);
+                for (size_t k = 0; k < nw; k++) r.woff[k] = -1;
                 resv[nresv] = r;
                 __atomic_store_n(&nresv, nresv + 1, __ATOMIC_RELEASE);
                 ok = 1;
             } else {
-                free(r.sub), free(r.ww), free(r.win);
+                free(r.sub), free(r.ww), free(r.win), free(r.woff);
                 sceKernelMunmap(a, n);
             }
         } else if (!e) {
@@ -1450,7 +1503,7 @@ void *plat_mem_alloc(size_t n) {
     uint64_t base = (uint64_t)(uintptr_t)va;
     plat_mutex_lock(&vm_lock);
     if (nresv < MAX_RESV) {
-        Resv r = {base, base + len, down(base, WIN), malloc(len / SUB), NULL, NULL};
+        Resv r = {base, base + len, down(base, WIN), malloc(len / SUB), NULL, NULL, NULL};
         r.win = calloc((up(base + len, WIN) - r.win_base) / WIN, 1);
         if (r.sub && r.win) {
             memset(r.sub, SS_RW, len / SUB);
@@ -1514,6 +1567,7 @@ int plat_mem_decommit(uint64_t addr, uint64_t n) {
             if (r->sub[(x - r->base) / SUB] >= SS_NONE) memset((void *)(uintptr_t)x, 0, SUB);
     }
     memset(r->sub + (s - r->base) / SUB, SS_RESERVED, (size_t)((se - s) / SUB));
+    for (uint64_t w = down(a, WIN); w < end; w += WIN) release_window_locked(r, w);
     if (r->ww)
         for (uint64_t pg = a; pg < end; pg += KPAGE) {
             // Página sem subpágina commitada: volta a limpa (no Linux, uma página descartada não conta como escrita).
@@ -1761,6 +1815,15 @@ typedef struct {
 
 static int range_readable(uint64_t addr, uint64_t n) {
     uint64_t end = addr + (n ? n : 1);
+    // Nas reservas vale a tabela (frente N): uma subpágina commitada com leitura é legível mesmo com a janela ainda
+    // sem mapa ou no coringa (a leitura falta e o lazy_fault a mapeia); o VirtualQuery diria que não.
+    for (Resv *r; (r = resv_of(addr)) && addr < end;) {
+        uint64_t lim = end < r->end ? end : r->end;
+        for (uint64_t x = down(addr, SUB); x < lim; x += SUB)
+            if (r->sub[(x - r->base) / SUB] < SS_READ) return 0;
+        addr = lim;
+    }
+    if (addr >= end) return 1;
     for (uint64_t a = addr; a < end;) {
         KVQuery q;
         memset(&q, 0, sizeof q);
