@@ -174,6 +174,7 @@ static int tex_mirrored(const tex_t *t) {
     return 1;
 }
 
+void vk_texture_census_log(const char *why);
 static void log_limited(volatile int32_t *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void log_limited(volatile int32_t *n, const char *fmt, ...) {
     if (plat_inc32(n) > 16) return;
@@ -411,6 +412,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         if (r != VK_SUCCESS) {
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
+            static int census_done;
+            if (!census_done && cfg_get("OCARINA_VRAM_CENSUS")) census_done = 1, vk_texture_census_log("first failed image");
             free(e);
             return NULL;
         }
@@ -1835,6 +1838,88 @@ void vk_texture_census(VkTexCensus *s) {
         else s->live++, s->own_live += e->alloc != NULL, s->bytes_live += bytes;
     }
     unlock();
+}
+
+// Frente O (ocarina-ps4, 2026-11-08): who holds the device memory. OCARINA_VRAM_CENSUS=<frames> logs, every that many
+// frames when the VMA device-local bytes grew by 64 MiB or more since the last census (and once at the first image
+// that fails to get memory), the texture images by class and the largest ones. Classes: astc (ASTC decoded on the
+// host or the GPU into the image format), rt (an image the GPU wrote: render, copy or storage target), depth, tex (any
+// other mirrored texture), other. "rel" = released entries kept for reuse (TextureFinalize).
+static int census_every = -1, census_top = 40;
+static uint64_t census_last_dev;
+
+static const char *tex_class(const Tex *e) {
+    if (e->f.depth || e->f.stencil) return "depth";
+    if (e->f.astc_bw) return "astc";
+    if (e->pub.gpu_owned || !e->pub.mirrored) return "rt";
+    if (e->pub.mirrored) return "tex";
+    return "other";
+}
+
+static int bytes_desc(const void *a, const void *b) {
+    uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+void vk_texture_census_log(const char *why) {
+    VkCtx *c = vk_ctx();
+    if (!c) return;
+    static const char *const cls[] = {"astc", "rt", "depth", "tex", "other"};
+    uint64_t n[5][2] = {{0}}, b[5][2] = {{0}}, bound = 0, total = 0;
+    lock();
+    uint64_t (*list)[2] = malloc(sizeof *list * (size_t)(by_key.n + 1));
+    uint32_t nl = 0;
+    for (uint32_t i = 0; i < by_key.cap; i++) {
+        const Tex *e = by_key.vals[i];
+        if (!e) continue;
+        if (!e->alloc) { bound++; continue; }
+        VmaAllocationInfo ai;
+        vmaGetAllocationInfo(c->vma, e->alloc, &ai);
+        const char *k = tex_class(e);
+        int ci = 0;
+        while (ci < 4 && strcmp(cls[ci], k)) ci++;
+        n[ci][e->released != 0]++, b[ci][e->released != 0] += ai.size, total += ai.size;
+        if (list) list[nl][0] = ai.size, list[nl][1] = (uint64_t)(uintptr_t)e, nl++;
+    }
+    uint64_t dev = 0, host = 0;
+    vk_vma_usage(&dev, &host);
+    const double M = 1048576.0;
+    rt_log("vram census (%s): vma %.0f MiB local + %.0f host; own-memory texture images %.0f MiB in %u (%llu bound into "
+           "pools)", why, dev / M, host / M, total / M, nl, (unsigned long long)bound);
+    for (int i = 0; i < 5; i++)
+        if (n[i][0] || n[i][1])
+            rt_log("vram census:   %-5s live %llu %.1f MiB, released %llu %.1f MiB", cls[i], (unsigned long long)n[i][0],
+                   b[i][0] / M, (unsigned long long)n[i][1], b[i][1] / M);
+    if (list) {
+        qsort(list, nl, sizeof *list, bytes_desc);
+        for (uint32_t i = 0; i < nl && i < (uint32_t)census_top; i++) {
+            const Tex *e = (const Tex *)(uintptr_t)list[i][1];
+            const VkTexImage *p = &e->pub;
+            rt_log("vram census:   %7.1f MiB %-5s nvn %#x vk %d %ux%ux%u target %d levels %u layers %u usage %#x%s%s%s",
+                   list[i][0] / M, tex_class(e), e->t.d.format, (int)p->format, p->width, p->height, p->depth,
+                   e->t.d.target, p->levels, p->layers, (unsigned)p->usage, p->mirrored ? " mirrored" : "",
+                   p->gpu_owned ? " gpu-written" : "", e->released ? " released" : "");
+        }
+        free(list);
+    }
+    census_last_dev = dev;
+    unlock();
+}
+
+void vk_texture_census_frame(uint64_t frame) {
+    if (census_every < 0) {
+        const char *s = cfg_get("OCARINA_VRAM_CENSUS");
+        census_every = s && *s ? atoi(s) : 0;
+        const char *t = cfg_get("OCARINA_VRAM_CENSUS_TOP");
+        if (t && *t) census_top = atoi(t);
+    }
+    if (census_every <= 0 || frame % (uint64_t)census_every) return;
+    uint64_t dev = 0, host = 0;
+    vk_vma_usage(&dev, &host);
+    if (dev < census_last_dev + (64ull << 20)) return;
+    char why[48];
+    snprintf(why, sizeof why, "frame %llu", (unsigned long long)frame);
+    vk_texture_census_log(why);
 }
 
 void vk_texture_shutdown(void) {

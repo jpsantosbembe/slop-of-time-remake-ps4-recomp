@@ -562,7 +562,6 @@ int vk_mem_descriptor_key(uint64_t addr, uint64_t size, VkDescKey *out) {
     return ok;
 }
 
-#ifdef __ORBIS__
 // ocarina-ps4: o que o VMA usa em cada heap (o monitor de memória do PS4, platform/orbis.c).
 void vk_vma_usage(uint64_t *dev, uint64_t *host) {
     *dev = *host = 0;
@@ -576,6 +575,7 @@ void vk_vma_usage(uint64_t *dev, uint64_t *host) {
         *(mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? dev : host) += b[i].statistics.blockBytes;
 }
 
+#ifdef __ORBIS__
 // ocarina-ps4: o trecho de um pool importado que um desenho usa ganha memória real antes de a GPU tocá-lo (o resto do
 // pool pode estar no coringa: platform/orbis.c, orbis_mem_placeholder).
 extern void orbis_mem_prefault(uint64_t addr, uint64_t n);
@@ -731,6 +731,7 @@ static void vram_log(uint64_t frame);
 
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
+    vk_texture_census_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)

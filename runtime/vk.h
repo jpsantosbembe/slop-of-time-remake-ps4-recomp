@@ -377,6 +377,10 @@ void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
 // (images not bound into pool memory).
 typedef struct { uint64_t live, released, own_live, own_released, bytes_live, bytes_released; } VkTexCensus;
 void vk_texture_census(VkTexCensus *s);
+// Frente O: OCARINA_VRAM_CENSUS=<frames>: texture images by class and the largest ones (vk_texture.c).
+void vk_texture_census_log(const char *why);
+void vk_texture_census_frame(uint64_t frame);
+void vk_vma_usage(uint64_t *dev, uint64_t *host);
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
 uint32_t vk_texture_epoch(void);                    // the write-watch snapshot epoch vk_texture_new_submit started
