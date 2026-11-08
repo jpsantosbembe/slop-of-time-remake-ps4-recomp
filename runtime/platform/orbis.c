@@ -1429,8 +1429,23 @@ static int lazy_fault(uint64_t a) {
     Resv *r = resv_of(a);
     if (!r || __atomic_load_n(&r->sub[(a - r->base) / SUB], __ATOMIC_RELAXED) < SS_NONE) return 0;
     if (win_mapped(r, a) &&
-        !(r->pgf && (__atomic_load_n(&r->pgf[(a - r->win_base) / WIN], __ATOMIC_RELAXED) & PG_PROBE)))
+        !(r->pgf && (__atomic_load_n(&r->pgf[(a - r->win_base) / WIN], __ATOMIC_RELAXED) & PG_PROBE))) {
+        // Janela real sem sonda: ou a falta é de verdade (write-watch, gancho, crash), ou é velha: entre a falta e
+        // este tratador, outra thread mapeou, trouxe da troca ou tirou a sonda da janela (console, 2026-11-07: leitura
+        // do TLR em 0x7010000110 caiu assim). Página liberada para leitura e escrita agora: só pode ser velha, repete.
+        // Só leitura: repete até 2 vezes no mesmo endereço (pode ser uma escrita vigiada, que segue para o
+        // write-watch na terceira); sem acesso: falta de verdade.
+        static __thread uint64_t last;
+        static __thread int n;
+        if (a != last) last = a, n = 0;
+        int32_t p = page_kprot(r, down(a, KPAGE));
+        if (((p & K_PROT_CPU_W) && n < 8) || ((p & K_PROT_CPU_R) && n < 2)) {
+            n++;
+            return 1;
+        }
+        n = 0;
         return 0;
+    }
     int fresh = 0;
     plat_mutex_lock(&vm_lock);
     int ok = touch_locked(r, a, &fresh);
