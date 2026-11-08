@@ -357,7 +357,7 @@ static void ov_vp9_ready_event(Cpu *c) {
 // packets wait. After the end of a guide movie the player flushes and starts over with the buffers it still holds,
 // submitting its third packet before it releases one: without the queue that packet was refused, nothing released a
 // buffer again, and the window kept the movie's first picture, a flat yellow card.
-static void ov_vp9_submit(Cpu *c) {
+static void ov_vp9_submit_body(Cpu *c) {
     uint64_t *id = arg_p(c, 0);
     const uint8_t *data = arg_p(c, 2);
     size_t size = arg_x(c, 3);
@@ -393,7 +393,7 @@ static void ov_vp9_submit(Cpu *c) {
 // Result AcquireVp9DecoderOutputBuffer(u32 *index, NativeSyncHandle *fence, Vp9DecoderType *): reserves a free buffer
 // for the next picture, decodes queued packets into the waiting buffers; the fence carries the token
 // RequestSyncPointEvent waits on
-static void ov_vp9_acquire(Cpu *c) {
+static void ov_vp9_acquire_body(Cpu *c) {
     uint32_t *index = arg_p(c, 0), *fence = arg_p(c, 1);
     uint64_t key = arg_x(c, 2);
     uint64_t wake[SLOTS * WAITERS];
@@ -425,6 +425,22 @@ static void ov_vp9_acquire(Cpu *c) {
     // ready submission. Without this, the tutorial's guide movies stopped at their second picture.
     if (got >= 0) kern_signal_system_event(event_for(c, key));
     ret_x(c, got < 0 ? R_NOT_READY : 0);
+}
+
+// ocarina-ps4: no Switch 2 a decodificação é do hardware e a thread do filme solta o núcleo enquanto espera; aqui o
+// dav1d/libvpx decodifica dentro da chamada (centenas de ms num quadro-chave 1080p no Jaguar). Segurando o núcleo
+// virtual, as threads presas ao mesmo núcleo esperavam a decodificação inteira (TOTK_CORE_DIAG: espera "host" de
+// 100 ms/quadro, quadros de 750 ms na tela de título). O núcleo sai antes da trava do codec e volta depois dela.
+static void ov_vp9_submit(Cpu *c) {
+    int away = kern_core_away();
+    ov_vp9_submit_body(c);
+    kern_core_back(&away);
+}
+
+static void ov_vp9_acquire(Cpu *c) {
+    int away = kern_core_away();
+    ov_vp9_acquire_body(c);
+    kern_core_back(&away);
 }
 
 // Result ReleaseVp9DecoderOutputBuffer(Vp9DecoderType *, u32 index, NativeSyncHandle)
