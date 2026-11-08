@@ -78,6 +78,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         operand(24);
         break;
     case 0xa24:
+    case 0xc24: // IMAD with a uniform multiplier: Rd, Ra and the addend Rc are registers
     case 0xa23:
     case 0x623:
     case 0x423:
@@ -101,6 +102,18 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     case 0x927:
         operand(24);
         operand(32);
+        break;
+    case 0x9a8: // ATOMG: result in Rd, data operand at bit 32.
+        operand(16);
+        operand(32);
+        break;
+    case 0xb6c:
+    case 0xf6c: // TXD: results in Rd/Rd+1 and the second pair, coordinates in Ra (Ra+2 is the layer
+                // of ARRAY_2D), gradients in Rb..Rb+3.
+        operand(16, 2);
+        operand(24, input.Bits(61, 3) == 5 ? 3 : 2);
+        operand(32, 4);
+        operand(64, 2);
         break;
     case 0x224:
     case 0x223:

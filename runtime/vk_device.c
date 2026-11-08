@@ -142,6 +142,7 @@ static int pick_device(void) {
     int want = e && *e ? atoi(e) : -1;
     const char *name = cfg_get("TOTK_GPU_NAME");
     int best = -1, best_score = -1;
+    VkPhysicalDeviceProperties best_p = {0};
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
@@ -161,7 +162,11 @@ static int pick_device(void) {
         if (fam == UINT32_MAX) { rt_log("vk: gpu %u skipped: no graphics+compute+present queue family", i); continue; }
         int score = (int)i == want ? 100 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
                   : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
-        if (score > best_score) { best_score = score; best = (int)i; }
+        // The same GPU listed twice (a leftover driver's ICD next to the current one): the newer driver wins,
+        // as in Hookshot ef4c2b0.
+        int newer = score == best_score && p.vendorID == best_p.vendorID && p.deviceID == best_p.deviceID &&
+                    p.driverVersion > best_p.driverVersion;
+        if (score > best_score || newer) { best_score = score; best = (int)i; best_p = p; }
     }
     if (best < 0) {
         if (want >= 0) rt_log("vk: TOTK_GPU_INDEX=%d is not usable (see above)", want);

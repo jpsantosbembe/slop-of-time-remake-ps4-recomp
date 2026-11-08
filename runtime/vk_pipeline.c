@@ -908,11 +908,13 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
     struct { uint32_t id, comp, count; } vec[64];
     struct { uint32_t id, type; } ptr[64];
     int nvec = 0, nptr = 0;
+    uint32_t mesh_verts = 0;   // MeshEXT entry point: its outputs are arrays of OutputVertices
     for (uint64_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) return NULL;
         const uint32_t *a = w + i + 1;
-        if (op == SPV_OP_ENTRY_POINT && !ep_at) ep_at = i;
+        if (op == SPV_OP_ENTRY_POINT && !ep_at) ep_at = i, mesh_verts = a[0] == 5365 ? 1 : 0;
+        else if (op == 16 && len >= 4 && a[1] == 26) mesh_verts = mesh_verts ? a[2] : 0;   // OpExecutionMode OutputVertices
         else if (op == SPV_OP_DECORATE || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632 || op == 5633)
             ann_end = i + len;
         else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[1] == 32) scalar[GFX_TYPE_FLOAT] = a[0];
@@ -923,8 +925,17 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
         i += len;
     }
     if (!ep_at || !ann_end || !fn_at || ann_end < ep_at || fn_at < ann_end) return NULL;
-    uint32_t types[32 * 40], decs[32 * 4], vars[32], zero[3] = {0, 0, 0}, one[3] = {0, 0, 0};
+    if (mesh_verts == 1 || mesh_verts > 256) return NULL;   // a mesh module without a vertex count
+    uint32_t types[32 * 300], decs[32 * 4], vars[32], zero[3] = {0, 0, 0}, one[3] = {0, 0, 0}, vlen = 0;
     int nt = 0, nd = 0, nv = 0;
+    if (mesh_verts) {   // the array length: a u32 constant
+        if (!scalar[GFX_TYPE_UINT]) {
+            scalar[GFX_TYPE_UINT] = bound++;
+            types[nt++] = 4u << 16 | SPV_OP_TYPE_INT, types[nt++] = scalar[GFX_TYPE_UINT], types[nt++] = 32, types[nt++] = 0;
+        }
+        vlen = bound++;
+        types[nt++] = 4u << 16 | SPV_OP_CONSTANT, types[nt++] = scalar[GFX_TYPE_UINT], types[nt++] = vlen, types[nt++] = mesh_verts;
+    }
     for (int l = 0; l < 32; l++) {
         if (!(missing >> l & 1)) continue;
         int t = io[l].type <= GFX_TYPE_UINT ? io[l].type : GFX_TYPE_FLOAT;
@@ -946,11 +957,13 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
             type = vec[k].id;
         }
         int k = 0;
-        while (k < nptr && ptr[k].type != type) k++;
-        if (k == nptr) {
-            if (nptr == 64) return NULL;
-            ptr[nptr].id = bound++, ptr[nptr++].type = type;
-            types[nt++] = 4u << 16 | SPV_OP_TYPE_POINTER, types[nt++] = ptr[k].id, types[nt++] = SPV_SC_OUTPUT, types[nt++] = type;
+        if (!mesh_verts) {
+            while (k < nptr && ptr[k].type != type) k++;
+            if (k == nptr) {
+                if (nptr == 64) return NULL;
+                ptr[nptr].id = bound++, ptr[nptr++].type = type;
+                types[nt++] = 4u << 16 | SPV_OP_TYPE_POINTER, types[nt++] = ptr[k].id, types[nt++] = SPV_SC_OUTPUT, types[nt++] = type;
+            }
         }
         uint32_t init = bound++, var = bound++;
         if (comps == 4) {
@@ -964,8 +977,17 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
         } else {
             types[nt++] = 3u << 16 | SPV_OP_CONSTANT_NULL, types[nt++] = type, types[nt++] = init;
         }
-        types[nt++] = 5u << 16 | SPV_OP_VARIABLE, types[nt++] = ptr[k].id, types[nt++] = var, types[nt++] = SPV_SC_OUTPUT,
-        types[nt++] = init;
+        uint32_t var_ptr = ptr[k].id, var_init = init;
+        if (mesh_verts) {   // MeshEXT outputs are per-vertex arrays: the initial value repeats for every vertex
+            uint32_t arr = bound++, arr_ptr = bound++, arr_init = bound++;
+            types[nt++] = 4u << 16 | 28 /* OpTypeArray */, types[nt++] = arr, types[nt++] = type, types[nt++] = vlen;
+            types[nt++] = 4u << 16 | SPV_OP_TYPE_POINTER, types[nt++] = arr_ptr, types[nt++] = SPV_SC_OUTPUT, types[nt++] = arr;
+            types[nt++] = (3u + mesh_verts) << 16 | SPV_OP_CONSTANT_COMPOSITE, types[nt++] = arr, types[nt++] = arr_init;
+            for (uint32_t v = 0; v < mesh_verts; v++) types[nt++] = init;
+            var_ptr = arr_ptr, var_init = arr_init;
+        }
+        types[nt++] = 5u << 16 | SPV_OP_VARIABLE, types[nt++] = var_ptr, types[nt++] = var, types[nt++] = SPV_SC_OUTPUT,
+        types[nt++] = var_init;
         decs[nd++] = 4u << 16 | SPV_OP_DECORATE, decs[nd++] = var, decs[nd++] = SPV_DEC_LOCATION, decs[nd++] = (uint32_t)l;
         vars[nv++] = var;
     }
@@ -983,6 +1005,75 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
     memcpy(p, w + ann_end, (fn_at - ann_end) * 4), p += fn_at - ann_end;
     memcpy(p, types, (size_t)nt * 4), p += nt;
     memcpy(p, w + fn_at, (n - fn_at) * 4), p += n - fn_at;
+    *out_n = (uint64_t)(p - o);
+    return o;
+}
+
+// LOCAL TEST (Ocarina): the Locations a mesh module writes per primitive (Output variables decorated PerPrimitiveEXT, 5271).
+static uint32_t spirv_prim_mask(const uint32_t *w, uint64_t n) {
+    uint32_t bound = w[3] < (1u << 22) ? w[3] : (1u << 22), mask = 0;
+    uint8_t *prim = calloc(bound, 1);
+    int32_t *loc = malloc((size_t)bound * 4);
+    if (!prim || !loc) { free(prim), free(loc); return 0; }
+    for (uint32_t i = 0; i < bound; i++) loc[i] = -1;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == SPV_OP_DECORATE && len >= 3 && w[i + 1] < bound) {
+            if (w[i + 2] == 5271) prim[w[i + 1]] = 1;
+            else if (w[i + 2] == SPV_DEC_LOCATION && len >= 4) loc[w[i + 1]] = (int32_t)w[i + 3];
+        }
+        if (op == SPV_OP_FUNCTION) break;
+        i += len;
+    }
+    for (uint32_t id = 0; id < bound; id++)
+        if (prim[id] && loc[id] >= 0 && loc[id] < 32) mask |= 1u << loc[id];
+    free(prim), free(loc);
+    return mask;
+}
+
+// LOCAL TEST (Ocarina): marks the Input variables of a fragment module at the Locations of `mask` PerPrimitiveEXT, with the
+// MeshShadingEXT capability and SPV_EXT_mesh_shader (what a mesh stage's per-primitive outputs need on the consumer). NULL when
+// nothing changes.
+static uint32_t *spirv_mark_prim_inputs(const uint32_t *w, uint64_t n, uint32_t mask, uint64_t *out_n) {
+    if (!mask || n < 6) return NULL;
+    uint32_t bound = w[3] < (1u << 22) ? w[3] : (1u << 22);
+    int32_t *loc = malloc((size_t)bound * 4);
+    uint32_t vars[64];
+    int nv = 0, has_cap = 0, has_ext = 0;
+    uint64_t cap_end = 0, ext_end = 0, ann_end = 0;
+    if (!loc) return NULL;
+    for (uint32_t i = 0; i < bound; i++) loc[i] = -1;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == 17) { cap_end = i + len; if (w[i + 1] == 5283) has_cap = 1; }
+        else if (op == 10) { ext_end = i + len; if (len >= 6 && !memcmp(&w[i + 1], "SPV_EXT_mesh_shader", 20)) has_ext = 1; }
+        else if (op == SPV_OP_DECORATE || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632 || op == 5633) {
+            ann_end = i + len;
+            if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_LOCATION && w[i + 1] < bound) loc[w[i + 1]] = (int32_t)w[i + 3];
+        } else if (op == 59 && len >= 4 && w[i + 3] == 1 && w[i + 2] < bound && loc[w[i + 2]] >= 0 && loc[w[i + 2]] < 32 &&
+                   (mask >> loc[w[i + 2]] & 1) && nv < 64) vars[nv++] = w[i + 2];
+        if (op == SPV_OP_FUNCTION) break;
+        i += len;
+    }
+    free(loc);
+    if (!nv || !cap_end || !ann_end) return NULL;
+    if (!ext_end) ext_end = cap_end;
+    uint32_t *o = malloc((n + 2 + 6 + 3 * 64) * 4), *p = o;
+    if (!o) return NULL;
+    memcpy(p, w, cap_end * 4), p += cap_end;
+    if (!has_cap) *p++ = 2u << 16 | 17, *p++ = 5283;
+    memcpy(p, w + cap_end, (ext_end - cap_end) * 4), p += ext_end - cap_end;
+    if (!has_ext) {
+        *p++ = 6u << 16 | 10;
+        uint32_t name[5] = {0};
+        memcpy(name, "SPV_EXT_mesh_shader", 19);
+        memcpy(p, name, sizeof name), p += 5;
+    }
+    memcpy(p, w + ext_end, (ann_end - ext_end) * 4), p += ann_end - ext_end;
+    for (int k = 0; k < nv; k++) *p++ = 3u << 16 | SPV_OP_DECORATE, *p++ = vars[k], *p++ = 5271;
+    memcpy(p, w + ann_end, (n - ann_end) * 4), p += n - ann_end;
     *out_n = (uint64_t)(p - o);
     return o;
 }
@@ -2333,6 +2424,12 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             uint32_t *d = spirv_dual_source(fcode, fw, &n2);
             if (d) free(fpatched), fcode = fpatched = d, fw = n2;
             else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
+        }
+        if (fcode && mesh_vs(s)) {   // LOCAL TEST (Ocarina): the mesh stage's per-primitive outputs
+            uint64_t mwn = 0, n2 = 0;
+            const uint32_t *mw = gfx_shader_spirv(s->vs, &mwn);
+            uint32_t *pm = mw ? spirv_mark_prim_inputs(fcode, fw, spirv_prim_mask(mw, mwn), &n2) : NULL;
+            if (pm) free(fpatched), fcode = fpatched = pm, fw = n2;
         }
         if (l->set1 || fs_off) {
             uint32_t *r = !fcode ? NULL : l->set1 ? spirv_set(fcode, fw, 1) : spirv_rebind(fcode, fw, fs_off);

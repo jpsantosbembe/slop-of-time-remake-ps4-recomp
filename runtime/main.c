@@ -502,13 +502,16 @@ static void portable_paths(RtConfig *c) {
 }
 
 // What Ocarina needs, so opening the executable directly behaves as jogar/jogar-ocarina.ps1 did (the environment still overrides).
-// TOTK_GPL=0: bindless set 2 with an allocated vertex set in an independent layout loses the device. DKB_SKIP_CS: the game's
-// upscaler, giant shaders that take many minutes to compile.
+// TOTK_GPL=0: bindless set 2 with an allocated vertex set in an independent layout loses the device. DKB_SKIP_CS: two giant
+// compute programs. 3f6f2b1d671badcd is the game's last upscale pass. dec1feb3c7fa967a (635 K words) made Kokiri's vegetation
+// vanish and the scene wash white. The other eight skipped before (giant when HMMA was inlined, minutes to compile) now
+// translate to 53-350 K words and build in under a minute in the background; one of them moves the falling leaves, which hung
+// still in the air while they were skipped. Each enabled alone left the Deku Tree frame as before.
 static void game_defaults(void) {
     static const char *const d[][2] = {
         {"TOTK_GPL", "0"},
         {"TOTK_ASYNC_PREEMPT", "0"},
-        {"DKB_SKIP_CS", "3bdfe449de832903,909139c13b510f1f,753f8ab880fe7923,c968ad44272dcbb4,785a41d2df6dc095,db8c39bdb420e068,dec1feb3c7fa967a,09931d0c57c6b67f,13cab66ee383c4f4,3f6f2b1d671badcd"},
+        {"DKB_SKIP_CS", "dec1feb3c7fa967a,3f6f2b1d671badcd"},
     };
     for (size_t i = 0; i < sizeof d / sizeof *d; i++) {
         if (getenv(d[i][0])) continue;
@@ -528,6 +531,14 @@ int probe_orbis(void);                          // probe_orbis.c: --probe-orbis,
 #ifdef __ORBIS__
 #define main rt_main   // platform/orbis.c tem o main de verdade: o PS4 não pode retornar do main (SIGSYS)
 #endif
+
+#ifdef _WIN32
+// Hybrid-graphics laptops (NVIDIA Optimus, AMD PowerXpress) run the game on the dedicated GPU, as Hookshot
+// does in host/hos_main.c.
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#endif
+
 int main(int argc, char **argv) {
 #ifdef __ORBIS__
     orbis_boot_args(&argc, &argv);   // antes de tudo: as variáveis do args.txt valem para o mem_init e o totk.ini

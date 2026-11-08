@@ -40,6 +40,8 @@ typedef struct PoolRec {
     uint32_t flags;
     uint64_t lo, size;                 // GPU address range of the pool
     uint64_t import_lo, import_hi;     // POOL_IMPORT: the imported host range (aligned outwards)
+    uint64_t use_lo, use_hi;           // replay: min/max guest offset resolved as a buffer (for a partial mirror)
+    uint64_t mirror_lo, mirror_hi;     // MS_ON: the mirrored window as guest offsets from import_lo (0..full for a full mirror)
     // POOL_IMPORT larger than the device's maxBufferSize (import_pool): nwin buffers of wlen bytes over the one import,
     // window w at byte w * wstep (wstep = wlen / 2), so a range of up to wstep bytes always lies inside one of them.
     // wbuf[0] is also buf. nwin 0: one buffer, as before.
@@ -126,6 +128,7 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
     r->import_lo = addr & ~(al - 1);
     r->import_hi = (addr + size + al - 1) & ~(al - 1);
+    r->use_lo = UINT64_MAX, r->use_hi = 0;
     uint64_t n = r->import_hi - r->import_lo;
 #ifdef __ORBIS__
     // ocarina-ps4: com o commit preguiçoso (platform/orbis.c), páginas do pool podem ainda não estar mapeadas
@@ -597,6 +600,17 @@ void vk_vma_usage(uint64_t *dev, uint64_t *host) {
         *(mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? dev : host) += b[i].statistics.blockBytes;
 }
 
+// The window of the pool a resolve touched, for a partial mirror (TOTK_MIRROR_PARTIAL). Atomics: resolvers run on more
+// than the replay thread.
+static void span_used(PoolRec *r, uint64_t addr, uint64_t size) {
+    uint64_t a = addr - r->import_lo, b = a + size, old;
+    if (a >= (1ull << 62)) return;
+    old = __atomic_load_n(&r->use_lo, __ATOMIC_RELAXED);
+    while (a < old && !__atomic_compare_exchange_n(&r->use_lo, &old, a, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    old = __atomic_load_n(&r->use_hi, __ATOMIC_RELAXED);
+    while (b > old && !__atomic_compare_exchange_n(&r->use_hi, &old, b, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
 #ifdef __ORBIS__
 // ocarina-ps4: o trecho de um pool importado que um desenho usa ganha memória real antes de a GPU tocá-lo (o resto do
 // pool pode estar no coringa: platform/orbis.c, orbis_mem_placeholder).
@@ -622,6 +636,12 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->cls = h->cls;
         out->pool = h->pool;
         if (h->alloc) out->alloc_offset = out->offset;
+        if (h->pool) {
+            PoolRec *r = h->pool;
+            out->guest_offset = addr - r->import_lo;
+            out->guest_size = size;
+            span_used(r, addr, size);
+        }
         if (shadow_on && h->pool && !((PoolRec *)h->pool)->stouched) shadow_touch(h->pool);
         if (resolve_check_on()) {
             VkMemSpan s;
@@ -667,6 +687,8 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->buffer = r->buf;
         out->offset = addr - r->import_lo;
         out->avail = r->import_hi - addr;
+        out->guest_offset = addr - r->import_lo;
+        out->guest_size = size;
         if (r->nwin) {
             uint64_t ws, we;
             uint32_t w = import_window(r, out->offset, &ws, &we);
@@ -675,6 +697,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
             out->avail = r->import_lo + we - addr;
         }
         if (r->smap && !r->stouched) shadow_touch(r);
+        span_used(r, addr, size);
         // A range that crosses its window's end is not contiguous in any one buffer: like a virtual pool range that
         // runs into another page, it does not resolve, and callers that resolve one byte clamp to avail themselves.
         ok = out->avail >= size;
@@ -825,6 +848,17 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
         if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             *used += vb[h].statistics.blockBytes, *budget += mp->memoryHeaps[h].size;
     return *budget != 0;
+}
+
+uint64_t vk_mem_target_bytes(void) {
+    static int64_t mib = -1;
+    if (mib < 0) {
+        const char *e = cfg_get("TOTK_VRAM_TARGET_MIB");
+        mib = e && *e ? atoll(e) : 0;
+        if (mib < 0) mib = 0;
+        if (mib) rt_log("mem: VRAM target %lld MiB (TOTK_VRAM_TARGET_MIB): textures, mirrors and headroom stay under it", (long long)mib);
+    }
+    return (uint64_t)mib << 20;
 }
 
 // ---------------------------------------------------------------- page write generations
@@ -1475,7 +1509,7 @@ static int copy_ranges(VkCommandBuffer cb, MRange *a, int n, int to_mirror, uint
     int rec = 0;
     for (int i = 0; i < n;) {
         PoolRec *r = a[i].r;
-        uint64_t lim = r->import_hi - r->import_lo;
+        uint64_t lim = r->mirror_hi - r->mirror_lo;
         int k = 0;
         for (; i < n && a[i].r == r; i++) {
             uint64_t lo = a[i].off, hi = a[i].off + a[i].size;
@@ -1490,6 +1524,10 @@ static int copy_ranges(VkCommandBuffer cb, MRange *a, int n, int to_mirror, uint
             mregions[k++] = (VkBufferCopy){lo, lo, hi - lo};
         }
         if (!k) continue;
+        for (int j = 0; j < k; j++) {   // mregions hold the mirror offset; the guest side is shifted by mirror_lo
+            if (to_mirror) mregions[j].srcOffset += r->mirror_lo;
+            else mregions[j].dstOffset += r->mirror_lo;
+        }
         if (to_mirror) vkCmdCopyBuffer(cb, r->buf, r->mbuf, (uint32_t)k, mregions);
         else vkCmdCopyBuffer(cb, r->mbuf, r->buf, (uint32_t)k, mregions);
         rec++;
@@ -1522,8 +1560,28 @@ static void refuse(PoolRec *r, int why, const char *what) {
 // Replay thread: the pool's mirror on its first buffer use.
 static void mirror_create(PoolRec *r) {
     VkCtx *c = vk_ctx();
-    uint64_t n = r->import_hi - r->import_lo;
+    uint64_t full = r->import_hi - r->import_lo, n = full, wlo = 0, whi = full;
+    // Partial mirror (TOTK_MIRROR_PARTIAL, on by default for pools of 256 MiB or more): only the window the game
+    // resolved as a buffer goes to VRAM. The 2.4 GiB pool of OoT uses a single ~0.1 MiB range at ~1 GiB; mirroring it
+    // whole wasted 2.4 GiB. Bindings outside the window stay on the imported buffer.
+    static int partial = -1;
+    if (partial < 0) {
+        const char *e = cfg_get("TOTK_MIRROR_PARTIAL");
+        partial = !(e && *e == '0');
+        if (partial) rt_log("mem: partial mirrors on: large pools mirror only the window the game uses");
+    }
+    if (partial && full >= (256ull << 20)) {
+        uint64_t lo = __atomic_load_n(&r->use_lo, __ATOMIC_RELAXED), hi = __atomic_load_n(&r->use_hi, __ATOMIC_RELAXED);
+        if (hi > lo && hi <= full) {
+            const uint64_t A = 1ull << 21;   // 2 MiB, the write-watch region
+            lo &= ~(A - 1), hi = (hi + A - 1) & ~(A - 1);
+            if (hi > full) hi = full;
+            if (hi > lo && hi - lo < full) wlo = lo, whi = hi, n = hi - lo;
+        }
+    }
+    r->mirror_lo = wlo, r->mirror_hi = whi;
     r->mstate = MS_REFUSED;
+    if (r->nwin) return refuse(r, MR_OVERLAP, "it is a windowed import");
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     if (r->kind != POOL_IMPORT || !r->buf || !n) return;
     // A mirror past maxBufferSize would be an oversized buffer (VUID-VkBufferCreateInfo-size-06409), and a windowed
@@ -1537,15 +1595,19 @@ static void mirror_create(PoolRec *r) {
     plat_mutex_unlock_shared(&pool_lock);
     if (i < 0) return;   // finalized meanwhile
     if (!alone) return refuse(r, MR_OVERLAP, "it overlaps another pool");
-    uint64_t r0 = r->import_lo >> SNAP_SHIFT, r1 = (r->import_hi - 1) >> SNAP_SHIFT;
+    uint64_t r0 = (r->import_lo + wlo) >> SNAP_SHIFT, r1 = (r->import_lo + whi - 1) >> SNAP_SHIFT;
     if (r1 >= SNAP_REGIONS) return refuse(r, MR_UNTRACKED, "outside the write-watched address space");
     uint64_t used, budget;
     int exact;
-    if (vk_mem_vram(&used, &budget, &exact) && used + n + budget / 8 > budget) {
-        char why[128];
-        snprintf(why, sizeof why, "its %.1f MiB mirror does not fit the VRAM budget (%.0f of %.0f MiB in use)",
-                 n / 1048576.0, used / 1048576.0, budget / 1048576.0);
-        return refuse(r, MR_BUDGET, why);
+    if (vk_mem_vram(&used, &budget, &exact)) {
+        uint64_t target = vk_mem_target_bytes();
+        if (target && budget > target) budget = target;
+        if (used + n + budget / 8 > budget) {
+            char why[128];
+            snprintf(why, sizeof why, "its %.1f MiB mirror does not fit the VRAM budget (%.0f of %.0f MiB in use)",
+                     n / 1048576.0, used / 1048576.0, budget / 1048576.0);
+            return refuse(r, MR_BUDGET, why);
+        }
     }
     // Cards of 8 GiB or less give at most an eighth of the device-local heap to mirrors (after NotRexed/Hookshot
     // c02f290d4): on an RTX 4060 Ti 8 GB mirrors reached 2.8 GiB, the textures spilled to system memory, 2-12 fps
@@ -1640,7 +1702,7 @@ static void mirror_retire(void *arg) {
 static void mirror_sync(PoolRec *r) {
     uint64_t t0 = qpc();
     r->acc_sub = msub;
-    uint64_t lo = r->import_lo, hi = r->import_hi;
+    uint64_t lo = r->import_lo + r->mirror_lo, hi = r->import_lo + r->mirror_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     int excl = 0;
     plat_mutex_lock_shared(&gen_lock);
@@ -1679,19 +1741,40 @@ static void mirror_sync(PoolRec *r) {
     mrep.sync_t += qpc() - t0;
 }
 
+static int span_in_mirror(const PoolRec *r, const VkMemSpan *sp) {
+    return r->mstate == MS_ON && sp->guest_size && sp->guest_offset >= r->mirror_lo &&
+           sp->guest_offset + sp->guest_size <= r->mirror_hi;
+}
+
 void vk_mem_use(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (r->mstate == MS_NONE) mirror_create(r);
     if (r->mstate != MS_ON) return;
     if (r->acc_sub != msub) mirror_sync(r);
-    sp->buffer = r->mbuf;
+    if (r->nwin) return;   // windowed imports name window buffers, not offsets into a mirror
+    if (span_in_mirror(r, sp)) {
+        sp->buffer = r->mbuf;
+        sp->offset = sp->guest_offset - r->mirror_lo;
+        sp->avail = r->mirror_hi - sp->guest_offset;
+    } else {
+        sp->buffer = r->buf;
+        sp->offset = sp->guest_offset;
+    }
 }
 
 void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON) return;
     if (r->acc_sub != msub) mirror_sync(r);
-    sp->buffer = r->mbuf;
+    if (r->nwin) return;
+    if (span_in_mirror(r, sp)) {
+        sp->buffer = r->mbuf;
+        sp->offset = sp->guest_offset - r->mirror_lo;
+        sp->avail = r->mirror_hi - sp->guest_offset;
+    } else {
+        sp->buffer = r->buf;
+        sp->offset = sp->guest_offset;
+    }
 }
 
 int vk_mem_mirror_probe(uint64_t addr) {
@@ -1763,7 +1846,7 @@ void vk_mem_mirror_begin(void) {
     for (int i = 0; i < nm; i++) {
         const PoolRec *r = mlist[i];
         if (r->acc_sub != prev) continue;
-        uint64_t a = r->import_lo >> SNAP_SHIFT, b = (r->import_hi - 1) >> SNAP_SHIFT;
+        uint64_t a = (r->import_lo + r->mirror_lo) >> SNAP_SHIFT, b = (r->import_lo + r->mirror_hi - 1) >> SNAP_SHIFT;
         if (have && a <= run1 + 1 + (uint64_t)mirror_gap) {
             if (b > run1) run1 = b;
             continue;
@@ -1972,6 +2055,50 @@ static void vram_log(uint64_t frame) {
            alloc_bytes / M, (unsigned long long)t.live, (unsigned long long)t.own_live, t.bytes_live / M,
            (unsigned long long)t.released, (unsigned long long)t.own_released, t.bytes_released / M, (long long)m_live_n,
            m_live_bytes / M, dead_pending());
+    {   // host pages the pool importers pinned (VK_EXT_external_memory_host): they cannot be paged out
+        uint64_t pinned = 0;
+        int np = 0;
+        plat_mutex_lock_shared(&pool_lock);
+        for (int i = 0; i < pool_index.n; i++) {
+            const PoolRec *r = pool_index.e[i].buf;
+            if (!r || r->kind != POOL_IMPORT || !r->buf) continue;
+            pinned += r->import_hi - r->import_lo;
+            np++;
+        }
+        plat_mutex_unlock_shared(&pool_lock);
+        rt_log("mem: guest import: %d pools, %.2f GiB pinned by VK_EXT_external_memory_host", np, pinned / 1073741824.0);
+    }
+    {   // TOTK_VMA_DUMP=<path>: the allocator's blocks and allocations (VMA JSON), once at frame 1200+
+        static int dumped;
+        const char *vd = cfg_get("TOTK_VMA_DUMP");
+        if (vd && *vd && !dumped && frame >= 1200) {
+            dumped = 1;
+            char *json = NULL;
+            vmaBuildStatsString(c->vma, &json, 1);
+            if (json) {
+                char path[512];
+                snprintf(path, sizeof path, "%s", strcmp(vd, "1") ? vd : "/tmp/ocarina-vma.json");
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(json, 1, strlen(json), f);
+                    fclose(f);
+                    rt_log("mem: VMA stats written to %s (%zu bytes)", path, strlen(json));
+                }
+                vmaFreeStatsString(c->vma, json);
+            }
+        }
+    }
+    {   // the used range of the large pools: the input of a partial mirror
+        plat_mutex_lock_shared(&pool_lock);
+        for (int i = 0; i < nm; i++) {
+            const PoolRec *r = mlist[i];
+            if (r->size < (256ull << 20) || !r->use_hi || r->use_lo >= r->use_hi) continue;
+            rt_log("mem:   pool %#llx size %.0f MiB, used [%.1f, %.1f] MiB (%.1f%%)", (unsigned long long)r->lo,
+                   r->size / 1048576.0, r->use_lo / 1048576.0, r->use_hi / 1048576.0,
+                   100.0 * (double)(r->use_hi - r->use_lo) / (double)r->size);
+        }
+        plat_mutex_unlock_shared(&pool_lock);
+    }
 }
 
 // Device class: INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a

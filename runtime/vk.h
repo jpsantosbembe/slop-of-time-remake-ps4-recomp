@@ -154,6 +154,7 @@ void vk_guest_written(uint64_t addr, uint64_t size);   // a host write write-wat
 typedef struct {
     VkBuffer buffer;
     VkDeviceSize offset, avail;
+    uint64_t guest_offset, guest_size;   // imported pools: the request's offset from import_lo and size (partial mirror)
     VmaAllocation alloc;
     VkDeviceSize alloc_offset;
     int cls;
@@ -240,6 +241,7 @@ void vk_mem_census(uint64_t frame);               // at each present: pool censu
 // VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
 // 0: this allocator's own allocations against the heap sizes. 0 when unknown.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
+uint64_t vk_mem_target_bytes(void);   // TOTK_VRAM_TARGET_MIB: budget used by texture pressure and mirrors (0 = driver budget)
 // VRAM headroom (vk_headroom.c): the VMA callbacks that see new device memory, and the thread that allocates the next
 // block of each memory type in use ahead of the render thread.
 const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);
@@ -286,7 +288,8 @@ enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
 int vk_astc_native(VkFormat astc_fmt);  // 1: images of this ASTC format are created as such and get the raw blocks
 int vk_astc_gpu(void);                  // 1: ASTC images decoded to RGBA8 by the compute decoder (vk_astc_record)
-int vk_astc_bc(void);                   // 1: those images are BC3 instead, encoded after the decode (TOTK_ASTC_BC=1)
+int vk_astc_bc(void);                   // 1: those images are BC instead, encoded after the decode (TOTK_ASTC_BC=1)
+int vk_astc_bc1(void);                  // 1: the BC1 encoder is available (ASTC source >=5x5 uses it)
 // One image region decoded from raw blocks: tight rows of 16-byte blocks at byte src of the source buffer (slices one
 // after the other), w x h texels and slices deep, written at offset of level / layer.
 typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset3D offset; } VkAstcRegion;
@@ -294,7 +297,8 @@ typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset
 // bytes of blocks) goes to a device-local scratch buffer, a dispatch per region decodes it, and the texels are copied
 // into img (VK_IMAGE_LAYOUT_GENERAL). The caller records its usual barriers around an image copy before and after the
 // call. readback (optional, host-visible, TRANSFER_DST): also gets the decoded texels, the regions one after the other.
-// bc: img is BC3 (TexVkFormat.astc_bc); the texels are encoded to BC3 blocks before the copy, and readback is ignored.
+// bc: 1 = img is BC3, 2 = img is BC1 (TexVkFormat.astc_bc/astc_bc1); the texels are encoded to blocks before the
+// copy, and readback is ignored.
 // 0 when the decoder is unavailable or the scratch buffer cannot be allocated (nothing recorded).
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
                    uint32_t bh, int srgb, int bc, VkImage img, VkImageAspectFlags aspect, VkBuffer readback);
@@ -391,6 +395,7 @@ void vk_texture_census_log(const char *why);
 void vk_texture_census_frame(uint64_t frame);
 void vk_vma_usage(uint64_t *dev, uint64_t *host);
 void vk_mem_vram_parts(uint64_t *phys, uint64_t *mirror, uint64_t *shadow);
+
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
 uint32_t vk_texture_epoch(void);                    // the write-watch snapshot epoch vk_texture_new_submit started
